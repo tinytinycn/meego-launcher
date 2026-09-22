@@ -1,6 +1,6 @@
 # MeeGo Harmattan 风格 Android 启动器 (MeeGo Launcher) 技术方案
 
-> **版本**：v1.2.0  
+> **版本**：v1.3.0  
 > **文档位置**：`MEEGO_LAUNCHER_TECH_SPEC.md`（项目根目录）  
 > **维护规范**：全程在 DSH 环境中进行自主开发，每次会话针对架构、需求、实现的任何调整，均需即时同步更新此文档。
 
@@ -13,11 +13,22 @@
 ### 1.1 MeeGo Harmattan 核心交互精髓
 - **三屏无限水平滑动架构（Three-Screen Swipe Architecture）**：
   1. **Events Feed（事件与通知流）**：时间、天气、日历提醒、系统聚合通知与未读消息。
-  2. **Application Grid（应用网格/启动器）**：标志性 Squircle（连续曲率圆角）图标、纯黑背景、纵向流畅惯性滑动、长按编辑管理（抖动与快速卸载/隐藏）。
-  3. **Multitasking View（多任务/运行中应用）**：**真实后台卡片实时预览**（由 Root 特权链路赋能）、双列大卡片（详尽视图）与三/四列紧凑视图平滑无级切换、单卡片上划即刻终结任务、点击卡片秒级切回前台、底部一键关闭所有任务。
+  2. **Application Grid（应用网格/启动器）**：
+     - 标志性 Squircle（连续曲率圆角）图标、纯黑背景、纵向流畅惯性滑动。
+     - **动态网格密度**：支持一行 4 个（经典）或一行 5 个（紧凑）自由切换。
+     - **启动器设置中心**：桌面常驻“MeeGo Settings”图标，直达启动器设置面板配置列数及手势偏好。
+     - 长按编辑管理（图标抖动、快速卸载/隐藏）。
+  3. **Multitasking View（多任务/运行中应用）**：
+     - **真实后台卡片实时预览**（由 Root 特权链路直连渲染硬件位图）。
+     - **双指无级缩放（Pinch-to-zoom）**：在 2×2（大卡片视图）与 3×3（紧凑卡片视图）后台卡片网格间平滑无级过渡，动画无缝插值。
+     - **长按删除角标**：长按卡片进入编辑模式，各卡片右上角出现删除角标，点击即刻销毁后台任务。
+     - 单卡片上划终结、点击秒切前台、底部一键“全部关闭”浮动按键。
 - **Swipe UI 手势核心**：
   - **Quick Launch Bar（快速启动底栏）**：屏幕底部轻微上划呼出 4 个常驻核心图标（电话、短信、相机、浏览器）。
-  - **边缘滑动直达**：屏幕边缘手势无界切换屏。
+  - **全局应用内边缘滑回（In-App Edge Swipe-to-Switch-Back）**：
+    - 在运行任意第三方应用时，手指从手机屏幕上半部分（左/右侧边缘）划入超过屏幕宽度的 1/2 松手，切出应用并精准回溯返回启动器。
+    - **来源感知路由（Origin-Aware Return）**：若应用从 Application Grid 启动，则滑回返回 Application Grid；若从 Multitasking View 启动，则滑回返回 Multitasking View！
+  - **桌面边缘滑动直达**：桌面三屏之间无界手势滑动。
 - **视觉与美学规范（Nokia Pure & Harmattan Design）**：
   - 纯黑（OLED Deep Black `#000000`）背景与超高对比度。
   - MeeGo Squircle 连续曲率超椭圆图标裁切与高保真光泽反射效果。
@@ -108,9 +119,11 @@
 | **开发语言** | Kotlin 1.9+ | 官方首选、协程支持、与现代 Android 库高度契合 |
 | **UI 框架** | Jetpack Compose + Material 3 (底层定制) | 声明式动画系统最适合实现 MeeGo 复杂的动态多任务缩放、物理弹簧阻尼与 Squircle 实时着色 |
 | **异步流驱动** | Kotlin Coroutines + StateFlow / Flow | 高性能响应式状态流，无缝驱动事件聚合与图标装载 |
+| **配置持久化** | Jetpack DataStore Preferences | 响应式持久化存储启动器配置（如网格 4/5 列模式、手势灵敏度） |
 | **依赖注入** | 手工轻量级 DI 或 Hilt | 保证启动速度极快，启动器（Launcher）对冷启动耗时有极致严苛要求（< 300ms） |
 | **系统交互能力** | `LauncherApps` + `NotificationListenerService` + `UsageStatsManager` | 遵循 Android 原生标准接口，兼顾安全与权限最小化 |
 | **后台实时快照与任务调度** | Root / `ActivityTaskManager` 特权调用 + `am task` 管道 | 突破 Android 原生沙盒隔离，1:1 还原 MeeGo 后台多任务真实卡片预览，支持低延迟切回与任务销毁 |
+| **全局边缘划回手势** | `AccessibilityService` / Root 特权 Overlay 悬浮手势条 | 跨任意第三方应用捕获屏幕上半区左右边缘划入，实现切出应用返回对应启动源 |
 
 ### 3.2 模块化架构设计
 ```
@@ -146,14 +159,17 @@ test-android-launcher/
 │           │       │   ├── FeedScreen.kt
 │           │       │   └── components/ClockWeatherCard.kt, NotificationItem.kt
 │           │       ├── grid/                    # 屏2：应用网格启动器
-│           │       │   ├── AppGridScreen.kt
+│           │       │   ├── AppGridScreen.kt     # 支持 4 列 / 5 列动态切换
 │           │       │   └── components/AppGridItem.kt, EditModeOverlay.kt
-│           │       └── recents/                 # 屏3：多任务动态卡片视图
-│           │           ├── RecentsScreen.kt
-│           │           └── components/
-│           │               ├── TaskCard.kt      # 包含真实 TaskSnapshot 的圆角卡片
-│           │               ├── DensityToggle.kt # 双列/多列无缝无级缩放
-│           │               └── CloseAllButton.kt# 底部圆形“关闭全部”浮动按键
+│           │       ├── recents/                 # 屏3：多任务动态卡片视图
+│           │       │   ├── RecentsScreen.kt
+│           │       │   └── components/
+│           │       │       ├── TaskCard.kt      # 包含真实 TaskSnapshot、长按右上角删除角标
+│           │       │       ├── PinchZoomGrid.kt # 双指 2×2 / 3×3 无级缩放控制器
+│           │       │       └── CloseAllButton.kt# 底部圆形“关闭全部”浮动按键
+│           │       └── settings/                # 启动器设置中心
+│           │           ├── SettingsScreen.kt    # 列数（4/5列）配置、手势偏好设置
+│           │           └── components/SettingItem.kt
 │           ├── core/
 │           │   ├── apps/                        # 应用列表加载、缓存与过滤 (LauncherApps)
 │           │   ├── notification/                # 通知捕获与同步管理
@@ -163,7 +179,14 @@ test-android-launcher/
 │           │   │   ├── FallbackSnapshotProvider.kt # 无特权降级方案（图标与色板占位）
 │           │   │   ├── TaskSnapshotCache.kt     # LRU 高性能位图缓存与生命周期复用
 │           │   │   └── RecentTaskController.kt  # 任务切换 (am switch-to-task) 与终结控制
-│           │   └── gestures/                    # 全局边缘手势与惯性滑动控制器
+│           │   ├── gestures/                    # 手势系统
+│           │   │   ├── MeeGoEdgeSwipeService.kt # 全局应用内上半屏边缘划回监听服务
+│           │   │   └── SwipeGestureDetector.kt  # 桌面内多指/边缘滑动算法
+│           │   └── navigation/
+│           │       └── LaunchOriginTracker.kt   # 启动来源追踪器 (GRID vs RECENTS)
+│           ├── data/
+│           │   └── preferences/
+│           │       └── LauncherPreferences.kt   # DataStore 偏好存储（4/5列设置）
 │           └── service/
 │               └── MeeGoNotificationListener.kt # 系统通知监听服务
 ```
@@ -179,9 +202,17 @@ $$\left|\frac{x}{a}\right|^n + \left|\frac{y}{b}\right|^n = 1 \quad (n \approx 5
 - 自带微妙的暗调外边缘微光与下边缘极细投影，在纯黑背景上呈现立体浮凸质感。
 - 对于第三方非规范方形图标，采用动态背景提取或统一承载在黑/灰调 Squircle 容器中，实现一致性视觉呈现。
 
-### 4.2 三屏联动与手势体系
+### 4.2 三屏联动、手势体系与应用网格配置
 - **三屏顺序**：`[屏0: Events Feed]` $\longleftrightarrow$ `[屏1: Application Grid]` $\longleftrightarrow$ `[屏2: Multitasking]`
 - **水平视差与循环**：支持高帧率流畅手势跟随，无死区，具备边界阻尼回弹效果。
+- **Application Grid 动态网格与设置入口**：
+  - **4 列 / 5 列动态切换**：
+    - 4 列模式（默认经典）：Squircle 图标更大（约 64dp），留白舒适，还原 N9 原汁原味比例。
+    - 5 列模式（紧凑长屏）：图标略微紧缩（约 54dp），充分利用现代 20:9 物理机长屏纵深，一屏容纳更多应用。
+  - **启动器设置入口（MeeGo Settings Icon）**：
+    - 启动器自带内置“设置”Squircle 独立图标，点击打开原生 Jetpack Compose 设置页。
+    - 提供“网格列数配置（4 列 / 5 列）”、“手势灵敏度”、“关于 MeeGo Launcher”等直观开关。
+    - 配置通过 `LauncherPreferences (DataStore)` 实时响应式驱动重绘，无需重启应用。
 - **Quick Launch Bar**：
   - 无论处于哪一屏，从屏幕底部边缘向上轻推 $\approx 32\text{dp}$，呼出毛玻璃渐隐底栏。
   - 4 个标准快捷槽位：电话、短信、相机、浏览器。手指拖动即可直达释放，松手回弹收起。
@@ -191,13 +222,22 @@ $$\left|\frac{x}{a}\right|^n + \left|\frac{y}{b}\right|^n = 1 \quad (n \approx 5
   - 在 Android 原生架构中，普通 Launcher 只能展示静态应用 Icon。本项目通过 Root 特权管道直接获取系统的 `TaskSnapshot` 真实硬件快照（HardwareBitmap）或高精度视图流。
   - 真正实现诺基亚 N9 标志性的“当前后台界面所见即所得”效果，动态捕捉浏览器网页、聊天消息、播放器卡片的实时状态。
   - **优雅降级策略（Graceful Degradation）**：若无 Root 权限时，自动平滑回退为带有应用大图标与主色调微渐变的 Squircle 卡片，保证系统高鲁棒性。
-- **动态双模视图与手势缩放**：
-  - **双列详尽视图（2-Column Detailed View）**：卡片以大比例呈现，清晰辨识应用实时内容。
-  - **三列/四列紧凑视图（3/4-Column Grid View）**：双指捏合（Pinch）或顶部/底部密度切换按键触发平滑缩放，一屏浏览更多后台任务。
+- **双指缩放无级切换（2×2 $\longleftrightarrow$ 3×3 Pinch-to-Zoom）**：
+  - **交互手势**：支持在多任务屏幕上使用双指张开（Spread）或捏合（Pinch）进行动态缩放。
+  - **视图连续插值**：缩放不是突变的生硬跳帧，而是跟随双指间距的实时连续比例变换（Scale 因子从 1.0f 到 0.67f 线性插值）。
+  - **双模形态**：
+    - **2×2 详尽大卡片**：每行 2 列，卡片面积大，内部应用文字和图形细节清晰可辨。
+    - **3×3 紧凑多任务**：每行 3 列，卡片缩小，全局掌控后台多应用概貌。
+  - 松手时自动通过弹簧物理动效（Spring Animation）吸附至最近的标准布局。
+- **长按进入编辑模式与右上角删除角标**：
+  - **长按激活**：长按任意后台卡片（$\approx 400\text{ms}$），配合线性马达触发短震动反馈，所有卡片进入“编辑/清理模式”（可伴有极轻微的微幅抖动）。
+  - **右上角删除角标（Delete Badge）**：每个卡片右上角浮现 MeeGo 经典红色圆形关闭角标（白色交叉叉号）。
+  - **点击删除任务**：直接点击该角标，卡片伴随缩放淡出动效从网格中移除，底层立即调用 `RecentTaskController.removeTask(taskId)` 终结该任务后台进程。
+  - **退出编辑模式**：点击卡片之外的空白暗色背景，或再次轻触卡片，即可平滑退出编辑模式。
 - **任务控制与生命周期同步**：
-  - **单卡片上划**：卡片附带加速度飞出屏幕，触发 `RecentTaskController.removeTask(taskId)`，同步从系统任务栈中彻底清理。
-  - **点击卡片**：直接触发 `RecentTaskController.switchToTask(taskId)`（调用 `am switch-to-task`），实现零冷启动时延的秒级切回。
-  - **一键清理所有（Close All）**：底部常驻 MeeGo 经典圆形浮动按键，点击后伴随卡片序列依次渐隐飞出动效，并释放后台内存。
+  - **单卡片上划**：非编辑模式下单卡片向上甩动，伴随物理加速度飞出屏幕，彻底杀死后台任务。
+  - **点击卡片**：直接触发 `RecentTaskController.switchToTask(taskId)`，秒级无缝切回应用前台。
+  - **一键清理所有（Close All）**：底部常驻 MeeGo 经典圆形浮动按键，点击后伴随卡片序列依次渐隐飞出动效，一键释放后台内存。
 
 ### 4.4 现代物理机特性与手势冲突避让策略（Physical Device Adaptation）
 1. **全面屏手势冲突避让（Gesture Exclusion）**：
@@ -212,6 +252,22 @@ $$\left|\frac{x}{a}\right|^n + \left|\frac{y}{b}\right|^n = 1 \quad (n \approx 5
    - 接入物理机振动马达（`VibrationEffect.createPredefined(VibrationEffect.EFFECT_CLICK)` / `EFFECT_HEAVY_CLICK`）。
    - 在滑动分屏吸附、长按图标抖动编辑、底栏弹出就位时提供微秒级触觉反馈。
 
+### 4.5 全局应用内上半屏边缘划回交互与来源回溯机制（In-App Edge Swipe & Origin Routing）
+1. **交互行为规范（Nokia N9 经典跨应用切出手势 1:1 还原）**：
+   - **手势热区划分**：屏幕高度的上半部分（$0 \le Y \le \text{ScreenHeight} / 2$）左右两侧边缘（宽度约 $20\sim 24\text{dp}$ 隐形捕获区）。下半部完全保留给宿主应用原生手势与输入法键盘，彻底杜绝打字与常规操作误触。
+   - **滑动行程与阈值**：从左右边缘向屏幕中心划入，实时追踪滑动位移：
+     - 当横向位移 $\Delta X < \text{ScreenWidth} / 2$ 时：松手取消切出，平滑回弹。
+     - 当横向位移 $\Delta X \ge \text{ScreenWidth} / 2$ 时：触发触觉震动提示，进入切出就绪态。
+   - **松手切出**：在满足阈值后抬起手指（`ACTION_UP`），立即平滑切出当前前台应用，返回 MeeGo 启动器。
+2. **来源感知定向回溯（Origin-Aware Contextual Routing）**：
+   - 应用启动时，通过 `LaunchOriginTracker` 精准记录进入路径：
+     - **Path A**：若应用最初由 **Application Grid（屏1 应用网格）** 点击拉起 $\implies$ 滑回后桌面直接停留在 **Application Grid**；
+     - **Path B**：若应用由 **Multitasking View（屏2 多任务卡片）** 点击切换拉起 $\implies$ 滑回后桌面直接停留在 **Multitasking View**。
+   - **无缝过渡**：滑回拉起启动器时通过 Intent 携带 `EXTRA_TARGET_PAGE`，Activity 启动后即刻平滑定位到对应主屏，实现端到端的沉浸穿梭感。
+3. **底层实现架构**：
+   - 依托 Root 特权与系统 Overlay 权限，启动 `MeeGoEdgeSwipeService`，在上半屏边缘注入触摸捕获监听；
+   - 支持高精度位移计算与快速 `ActivityManager` 前台栈唤醒。
+
 ---
 
 ## 5. DSH 全程自主开发实施路线图
@@ -220,11 +276,11 @@ $$\left|\frac{x}{a}\right|^n + \left|\frac{y}{b}\right|^n = 1 \quad (n \approx 5
 flowchart TD
     M1["阶段 1：环境基础设施搭建\n(JDK/SDK/Gradle 自动化配置)"] --> M2["阶段 2：Android 工程骨架搭建\n(声明 Home Intent、Gradle 构建闭环)"]
     M2 --> M3["阶段 3：MeeGo 设计系统与 Squircle 引擎\n(超椭圆算法、色彩系统、字体与图标渲染)"]
-    M3 --> M4["阶段 4：三屏手势联动器与主屏应用网格\n(LauncherApps 集成、平滑滚动、编辑模式)"]
-    M4 --> M5["阶段 5：经典 Quick Launch Bar 快捷底栏\n(全局底部滑动手势、快捷应用唤醒)"]
+    M3 --> M4["阶段 4：应用网格(4/5列切换)+设置中心+三屏手势\n(LauncherApps、DataStore配置、平滑滚动)"]
+    M4 --> M5["阶段 5：Quick Launch Bar 与全局应用内划回服务\n(底栏快捷唤醒、上半屏边缘划回、来源路由)"]
     M5 --> M6["阶段 6：事件流与通知中心屏 (Events Feed)\n(NotificationListenerService、时间天气、未读中心)"]
-    M6 --> M7["阶段 7：多任务实时卡片屏 (Recents Screen)\n(Root 实时快照抓取、双模缩放、任务快速调度)"]
-    M7 --> M8["阶段 8：真机调试、自动化截图与动效打磨\n(ADB 部署、手势冲突调优、真机截屏闭环)"]
+    M6 --> M7["阶段 7：多任务实时卡片屏 (Recents Screen)\n(Root实时快照、双指2x2/3x3缩放、长按删除角标)"]
+    M7 --> M8["阶段 8：真机全面调试、自动化截图与像素打磨\n(ADB 部署、手势冲突调优、真机截屏闭环)"]
 ```
 
 ### 具体开发阶段拆解：
@@ -239,19 +295,21 @@ flowchart TD
   - 在 Jetpack Compose 中实现精准 Superellipse (Squircle) 算法 Canvas 渲染。
   - 建立 Nokia Pure 视觉调色板、图标自适应遮罩与质感光泽层。
   - 利用 `scripts/screenshot.sh` 抓取物理机实机渲染效果。
-- **Phase 4: 应用网格与主屏手势**
+- **Phase 4: 应用网格、设置中心与主屏手势**
   - 调用 Android `LauncherApps` 异步加载已安装应用。
-  - 实现 4 列经典网格，带有平滑物理动效、应用字母索引或自由拖拽排序。
-- **Phase 5: 经典上滑底栏 (Quick Launch Bar)**
+  - 实现 4 列 / 5 列自适应网格，支持 DataStore 响应式动态配置。
+  - 桌面内置“MeeGo Settings”启动器设置入口与设置页面。
+- **Phase 5: Quick Launch Bar 与全局应用内边缘划回服务**
   - 实现全局底层手势识别器，底部上划展开 4 个主打快捷图标。
   - 针对物理机系统手势冲突进行排除区域适配。
+  - 实现 `MeeGoEdgeSwipeService` 与 `LaunchOriginTracker`，在第三方 App 运行期间捕获上半屏边缘滑动（划入 1/2 屏宽松手），精准回退到 Grid 或 Recents。
 - **Phase 6: Events Feed 屏**
   - 实现时间、天气面板。
   - 接入 `NotificationListenerService`，聚合展示来自微信、短信、未接电话等通知。
-- **Phase 7: 多任务实时卡片屏（Root 实时快照与调度）**
+- **Phase 7: 多任务实时卡片屏（Root 实时快照 + 双指缩放 + 删除角标）**
   - 接入 `RootTaskSnapshotProvider`，实时提取后台 TaskSnapshot 硬件位图。
-  - 接入 `RecentTaskController`，支持单卡片上划杀进程与点击秒切回。
-  - 实现 2 列/3 列/4 列密度平滑手势缩放与底部“全部清除”按键动效。
+  - 实现双指缩放无级手势（2×2 $\longleftrightarrow$ 3×3 卡片网格平滑无级过渡）。
+  - 实现长按卡片进入编辑模式，右上角浮现红色删除角标，点击终结后台进程；支持底部“一键全部关闭”。
 - **Phase 8: 物理机全面联调与性能打磨**
   - 通过 ADB 持续进行真机 UI 验证、高刷手势掉帧排查（120Hz 满帧调优）与触觉反馈对齐。
 
@@ -270,6 +328,7 @@ flowchart TD
 
 | 日期 | 版本 | 变更内容概述 | 操作者 |
 | :--- | :--- | :--- | :--- |
+| 2026-09-22 | v1.3.0 | 增加应用网格 4 列 / 5 列动态配置并提供启动器设置入口；多任务屏增加双指 Pinch-to-zoom 2×2 与 3×3 无级缩放，以及长按右上角删除角标任务终结交互；增加全局应用内上半屏边缘划回交互规范（划入 1/2 松手切出）与来源回溯机制（Grid 启动回 Grid，Recents 启动回 Recents） | Coding Agent |
 | 2026-09-22 | v1.2.0 | 实测检测 Redmi K40 (alioth, Android 16) 物理机就绪且具备 ADB Root (`uid=0`) 权限；架构新增 `RootTaskSnapshotProvider` 与 `RecentTaskController`，将多任务屏从静态占位升级为 1:1 真实后台应用实时硬件位图预览与特权秒切/强杀调度；完善优雅降级设计 | Coding Agent |
 | 2026-09-22 | v1.1.0 | 增加物理机测试支持方案：明确 ADB 调试通道、非破坏性调试与安全回退策略、真机截屏/日志反馈闭环；补充现代物理机全面屏手势冲突避让（`systemGestureExclusionRects`）、长屏比例自适应与线性马达触觉反馈规范；更新路线图各阶段真机验证环节 | Coding Agent |
 | 2026-09-22 | v1.0.0 | 初始技术方案建立：确定 MeeGo Harmattan 1:1 还原目标、三屏架构、环境诊断（复用本地 JDK17）、无 sudo 依赖的 SDK 方案与阶段路线图 | Coding Agent |

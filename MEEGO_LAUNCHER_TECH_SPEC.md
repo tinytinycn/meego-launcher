@@ -1,6 +1,6 @@
 # MeeGo Harmattan 风格 Android 启动器 (MeeGo Launcher) 技术方案
 
-> **版本**：v1.1.0  
+> **版本**：v1.2.0  
 > **文档位置**：`MEEGO_LAUNCHER_TECH_SPEC.md`（项目根目录）  
 > **维护规范**：全程在 DSH 环境中进行自主开发，每次会话针对架构、需求、实现的任何调整，均需即时同步更新此文档。
 
@@ -14,7 +14,7 @@
 - **三屏无限水平滑动架构（Three-Screen Swipe Architecture）**：
   1. **Events Feed（事件与通知流）**：时间、天气、日历提醒、系统聚合通知与未读消息。
   2. **Application Grid（应用网格/启动器）**：标志性 Squircle（连续曲率圆角）图标、纯黑背景、纵向流畅惯性滑动、长按编辑管理（抖动与快速卸载/隐藏）。
-  3. **Multitasking View（多任务/运行中应用）**：实时卡片预览、双列大卡片与三/四列紧凑视图平滑无级切换、单卡片上划/侧滑关闭、点击快速切换。
+  3. **Multitasking View（多任务/运行中应用）**：**真实后台卡片实时预览**（由 Root 特权链路赋能）、双列大卡片（详尽视图）与三/四列紧凑视图平滑无级切换、单卡片上划即刻终结任务、点击卡片秒级切回前台、底部一键关闭所有任务。
 - **Swipe UI 手势核心**：
   - **Quick Launch Bar（快速启动底栏）**：屏幕底部轻微上划呼出 4 个常驻核心图标（电话、短信、相机、浏览器）。
   - **边缘滑动直达**：屏幕边缘手势无界切换屏。
@@ -85,6 +85,18 @@
    - **一键构建并部署**：执行 `scripts/deploy.sh`，在编译后自动推送到已连接的物理机，并拉起前台界面。
    - **真机视觉截屏回传**：通过 `scripts/screenshot.sh`（底层为 `adb exec-out screencap -p`）捕获渲染画面至本地，Agent 可即时分析 UI 还原度与布局贴合度。
    - **日志与崩溃诊断**：通过 `adb logcat -d | grep MeeGoLauncher` 实时追踪生命周期、掉帧、ANR 与异常堆栈。
+4. **已验证真机规格与 Root 特权通道（Root Privileged Channel）**：
+   - **实测物理机基准**：
+     - 型号：Redmi K40 / POCO F3 (`alioth` / `M2012K11AC`)
+     - 系统：LineageOS (Android 16 / SDK 36)
+     - 屏幕规格：1080×2400 (20:9)，密度 440 DPI
+     - Root 状态：`adbd root` 已就绪（`uid=0(root) gid=0(root) context=u:r:su:s0`）
+   - **Root 赋能多任务实时预览的技术链路**：
+     - 普通 Android 应用受沙盒机制限制，无法直接调用 `ActivityTaskManager.getTaskSnapshot` 或跨应用捕获窗口内容。
+     - 依托已就绪的 Root 特权，采用双层架构：
+       1. **特权权限注入与系统接口直连**：启动器安装时通过 Root 脚本赋予系统特权权限（`pm grant com.meego.launcher android.permission.REAL_GET_TASKS` 等），或通过私有反射调用 `ActivityTaskManager` / `IActivityTaskManager` 提取真实 HardwareBitmap 快照。
+       2. **Root Companion 守护管道**：通过 `su` 管道启动轻量级伴侣进程，提供高效的任务列表与缩略图抓取 RPC 服务，向 Compose 提供流式位图更新。
+       3. **硬核任务控制**：通过特权执行 `am switch-to-task <taskId>`（零延迟切回前台应用）与 `am task remove <taskId>`（单卡片上划干净销毁进程）。
 
 ---
 
@@ -98,6 +110,7 @@
 | **异步流驱动** | Kotlin Coroutines + StateFlow / Flow | 高性能响应式状态流，无缝驱动事件聚合与图标装载 |
 | **依赖注入** | 手工轻量级 DI 或 Hilt | 保证启动速度极快，启动器（Launcher）对冷启动耗时有极致严苛要求（< 300ms） |
 | **系统交互能力** | `LauncherApps` + `NotificationListenerService` + `UsageStatsManager` | 遵循 Android 原生标准接口，兼顾安全与权限最小化 |
+| **后台实时快照与任务调度** | Root / `ActivityTaskManager` 特权调用 + `am task` 管道 | 突破 Android 原生沙盒隔离，1:1 还原 MeeGo 后台多任务真实卡片预览，支持低延迟切回与任务销毁 |
 
 ### 3.2 模块化架构设计
 ```
@@ -109,7 +122,9 @@ test-android-launcher/
 ├── scripts/
 │   ├── setup_env.sh             # 环境变量与 SDK 自动化就绪脚本
 │   ├── build.sh                 # 一键编译脚本
-│   └── deploy.sh                # 部署安装脚本
+│   ├── deploy.sh                # 部署安装脚本
+│   ├── check_device.sh          # 物理机连接与 Root 诊断脚本
+│   └── screenshot.sh            # 物理机屏幕快速回传脚本
 ├── app/
 │   ├── build.gradle.kts
 │   └── src/main/
@@ -135,11 +150,19 @@ test-android-launcher/
 │           │       │   └── components/AppGridItem.kt, EditModeOverlay.kt
 │           │       └── recents/                 # 屏3：多任务动态卡片视图
 │           │           ├── RecentsScreen.kt
-│           │           └── components/TaskCard.kt, DensityToggle.kt
+│           │           └── components/
+│           │               ├── TaskCard.kt      # 包含真实 TaskSnapshot 的圆角卡片
+│           │               ├── DensityToggle.kt # 双列/多列无缝无级缩放
+│           │               └── CloseAllButton.kt# 底部圆形“关闭全部”浮动按键
 │           ├── core/
 │           │   ├── apps/                        # 应用列表加载、缓存与过滤 (LauncherApps)
 │           │   ├── notification/                # 通知捕获与同步管理
-│           │   ├── recents/                     # 运行中应用与任务栈监听
+│           │   ├── recents/                     # 运行中应用与多任务核心
+│           │   │   ├── TaskSnapshotProvider.kt  # 快照提供者统一接口
+│           │   │   ├── RootTaskSnapshotProvider.kt # Root 特权提取 TaskSnapshot 硬件位图
+│           │   │   ├── FallbackSnapshotProvider.kt # 无特权降级方案（图标与色板占位）
+│           │   │   ├── TaskSnapshotCache.kt     # LRU 高性能位图缓存与生命周期复用
+│           │   │   └── RecentTaskController.kt  # 任务切换 (am switch-to-task) 与终结控制
 │           │   └── gestures/                    # 全局边缘手势与惯性滑动控制器
 │           └── service/
 │               └── MeeGoNotificationListener.kt # 系统通知监听服务
@@ -163,10 +186,18 @@ $$\left|\frac{x}{a}\right|^n + \left|\frac{y}{b}\right|^n = 1 \quad (n \approx 5
   - 无论处于哪一屏，从屏幕底部边缘向上轻推 $\approx 32\text{dp}$，呼出毛玻璃渐隐底栏。
   - 4 个标准快捷槽位：电话、短信、相机、浏览器。手指拖动即可直达释放，松手回弹收起。
 
-### 4.3 多任务（Recents）动态双模交互
-- 支持双列模式（每列展示大预览卡片，显示清晰内容）与三列/紧凑模式（展示更多后台应用）。
-- 卡片右上角关闭按钮，或向上滑动手势即时关闭任务。
-- 底部常驻“关闭所有任务”的 MeeGo 经典圆形浮动按键。
+### 4.3 多任务（Recents）动态双模交互与真实后台快照体系
+- **Root 赋能的真实后台卡片实时预览（Live Task Snapshot）**：
+  - 在 Android 原生架构中，普通 Launcher 只能展示静态应用 Icon。本项目通过 Root 特权管道直接获取系统的 `TaskSnapshot` 真实硬件快照（HardwareBitmap）或高精度视图流。
+  - 真正实现诺基亚 N9 标志性的“当前后台界面所见即所得”效果，动态捕捉浏览器网页、聊天消息、播放器卡片的实时状态。
+  - **优雅降级策略（Graceful Degradation）**：若无 Root 权限时，自动平滑回退为带有应用大图标与主色调微渐变的 Squircle 卡片，保证系统高鲁棒性。
+- **动态双模视图与手势缩放**：
+  - **双列详尽视图（2-Column Detailed View）**：卡片以大比例呈现，清晰辨识应用实时内容。
+  - **三列/四列紧凑视图（3/4-Column Grid View）**：双指捏合（Pinch）或顶部/底部密度切换按键触发平滑缩放，一屏浏览更多后台任务。
+- **任务控制与生命周期同步**：
+  - **单卡片上划**：卡片附带加速度飞出屏幕，触发 `RecentTaskController.removeTask(taskId)`，同步从系统任务栈中彻底清理。
+  - **点击卡片**：直接触发 `RecentTaskController.switchToTask(taskId)`（调用 `am switch-to-task`），实现零冷启动时延的秒级切回。
+  - **一键清理所有（Close All）**：底部常驻 MeeGo 经典圆形浮动按键，点击后伴随卡片序列依次渐隐飞出动效，并释放后台内存。
 
 ### 4.4 现代物理机特性与手势冲突避让策略（Physical Device Adaptation）
 1. **全面屏手势冲突避让（Gesture Exclusion）**：
@@ -192,7 +223,7 @@ flowchart TD
     M3 --> M4["阶段 4：三屏手势联动器与主屏应用网格\n(LauncherApps 集成、平滑滚动、编辑模式)"]
     M4 --> M5["阶段 5：经典 Quick Launch Bar 快捷底栏\n(全局底部滑动手势、快捷应用唤醒)"]
     M5 --> M6["阶段 6：事件流与通知中心屏 (Events Feed)\n(NotificationListenerService、时间天气、未读中心)"]
-    M6 --> M7["阶段 7：多任务卡片屏 (Recents Screen)\n(最近任务感知、双列/紧凑列无缝缩放、卡片清理)"]
+    M6 --> M7["阶段 7：多任务实时卡片屏 (Recents Screen)\n(Root 实时快照抓取、双模缩放、任务快速调度)"]
     M7 --> M8["阶段 8：真机调试、自动化截图与动效打磨\n(ADB 部署、手势冲突调优、真机截屏闭环)"]
 ```
 
@@ -217,9 +248,10 @@ flowchart TD
 - **Phase 6: Events Feed 屏**
   - 实现时间、天气面板。
   - 接入 `NotificationListenerService`，聚合展示来自微信、短信、未接电话等通知。
-- **Phase 7: 多任务屏幕**
-  - 接入 `UsageStatsManager`，展示最近活跃应用卡片。
-  - 允许 2 列/3 列密度切换，支持左右/上划移除。
+- **Phase 7: 多任务实时卡片屏（Root 实时快照与调度）**
+  - 接入 `RootTaskSnapshotProvider`，实时提取后台 TaskSnapshot 硬件位图。
+  - 接入 `RecentTaskController`，支持单卡片上划杀进程与点击秒切回。
+  - 实现 2 列/3 列/4 列密度平滑手势缩放与底部“全部清除”按键动效。
 - **Phase 8: 物理机全面联调与性能打磨**
   - 通过 ADB 持续进行真机 UI 验证、高刷手势掉帧排查（120Hz 满帧调优）与触觉反馈对齐。
 
@@ -238,5 +270,6 @@ flowchart TD
 
 | 日期 | 版本 | 变更内容概述 | 操作者 |
 | :--- | :--- | :--- | :--- |
+| 2026-09-22 | v1.2.0 | 实测检测 Redmi K40 (alioth, Android 16) 物理机就绪且具备 ADB Root (`uid=0`) 权限；架构新增 `RootTaskSnapshotProvider` 与 `RecentTaskController`，将多任务屏从静态占位升级为 1:1 真实后台应用实时硬件位图预览与特权秒切/强杀调度；完善优雅降级设计 | Coding Agent |
 | 2026-09-22 | v1.1.0 | 增加物理机测试支持方案：明确 ADB 调试通道、非破坏性调试与安全回退策略、真机截屏/日志反馈闭环；补充现代物理机全面屏手势冲突避让（`systemGestureExclusionRects`）、长屏比例自适应与线性马达触觉反馈规范；更新路线图各阶段真机验证环节 | Coding Agent |
 | 2026-09-22 | v1.0.0 | 初始技术方案建立：确定 MeeGo Harmattan 1:1 还原目标、三屏架构、环境诊断（复用本地 JDK17）、无 sudo 依赖的 SDK 方案与阶段路线图 | Coding Agent |

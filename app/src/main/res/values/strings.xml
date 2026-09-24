@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">MeeGo</string>
+    <string name="accessibility_service_description">MeeGo 全局边缘侧滑感知服务，从上半屏边缘划入手势切回启动器</string>
+</resources>

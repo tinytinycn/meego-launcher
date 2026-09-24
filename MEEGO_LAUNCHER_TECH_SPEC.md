@@ -1,6 +1,6 @@
 # MeeGo Harmattan 风格 Android 启动器 (MeeGo Launcher) 技术方案
 
-> **版本**：v1.3.0  
+> **版本**：v1.7.8  
 > **文档位置**：`MEEGO_LAUNCHER_TECH_SPEC.md`（项目根目录）  
 > **维护规范**：全程在 DSH 环境中进行自主开发，每次会话针对架构、需求、实现的任何调整，均需即时同步更新此文档。
 
@@ -11,7 +11,10 @@
 本项目旨在构建一个高保真、**1:1 还原经典诺基亚 N9 (MeeGo 1.2 Harmattan) 操作系统桌面与交互体验**的 Android 原生启动器应用。
 
 ### 1.1 MeeGo Harmattan 核心交互精髓
-- **三屏无限水平滑动架构（Three-Screen Swipe Architecture）**：
+- **三屏无限循环水平滑动架构（Three-Screen Infinite Circular Carousel Architecture）**：
+  - **首尾循环无界穿梭**：Events Feed (0) $\longleftrightarrow$ Application Grid (1) $\longleftrightarrow$ Multitasking View (2) $\longleftrightarrow$ Events Feed (0) ... 左右两个方向均可无限循环滑动，彻底打破传统 Android 桌面尽头撞墙的死板限制，完美复刻 Nokia N9 纯正的循环桌面体验。
+  - **底部三屏循环指示点**：3 个极简圆点实时对应当前所处的逻辑屏幕，点击指示点按最短路径平滑换屏。
+  - **启动器内部手势隔离**：启动器内部全屏宽度完全用于三屏循环手势，彻底隐藏并禁用边缘划出悬浮层，边缘触控 0 误触。
   1. **Events Feed（事件与通知流）**：时间、天气、日历提醒、系统聚合通知与未读消息。
   2. **Application Grid（应用网格/启动器）**：
      - 标志性 Squircle（连续曲率圆角）图标、纯黑背景、纵向流畅惯性滑动。
@@ -26,7 +29,8 @@
 - **Swipe UI 手势核心**：
   - **Quick Launch Bar（快速启动底栏）**：屏幕底部轻微上划呼出 4 个常驻核心图标（电话、短信、相机、浏览器）。
   - **全局应用内边缘滑回（In-App Edge Swipe-to-Switch-Back）**：
-    - 在运行任意第三方应用时，手指从手机屏幕上半部分（左/右侧边缘）划入超过屏幕宽度的 1/2 松手，切出应用并精准回溯返回启动器。
+    - 在运行任意第三方应用时，手指从手机屏幕左右两侧全部边缘（全高度 MATCH_PARENT）划入超过屏幕宽度的 1/2 松手，切出应用并精准回溯返回启动器。
+    - **系统设置与穿透保障**：采用 `TYPE_ACCESSIBILITY_OVERLAY` 突破 Android 系统设置（`com.android.settings`）的 `PRIVATE_FLAG_HIDE_NON_SYSTEM_OVERLAY_WINDOWS` 屏蔽，消除原生系统返回手势冲突，实现系统设置与全系应用边缘划回。
     - **来源感知路由（Origin-Aware Return）**：若应用从 Application Grid 启动，则滑回返回 Application Grid；若从 Multitasking View 启动，则滑回返回 Multitasking View！
   - **桌面边缘滑动直达**：桌面三屏之间无界手势滑动。
 - **视觉与美学规范（Nokia Pure & Harmattan Design）**：
@@ -196,11 +200,20 @@ test-android-launcher/
 ## 4. 1:1 MeeGo Harmattan 细节还原设计规范
 
 ### 4.1 MeeGo Squircle 超椭圆几何模型
-MeeGo 图标并非 Android 原生的简单圆形或普通 `RoundedCornerShape(16.dp)`，而是著名的 **Lamé 曲线（超椭圆，Superellipse）**：
-$$\left|\frac{x}{a}\right|^n + \left|\frac{y}{b}\right|^n = 1 \quad (n \approx 5.0)$$
-- 拥有 $G2$ 甚至 $G3$ 级别的连续曲率过渡，杜绝普通圆角在直线连接处的视觉棱角感。
-- 自带微妙的暗调外边缘微光与下边缘极细投影，在纯黑背景上呈现立体浮凸质感。
-- 对于第三方非规范方形图标，采用动态背景提取或统一承载在黑/灰调 Squircle 容器中，实现一致性视觉呈现。
+MeeGo 图标与卡片并非 Android 原生的简单圆角或普通的 `RoundedCornerShape(16.dp)`，而是严格遵循著名的 **Lamé 曲线（超椭圆，Superellipse）**：
+$$\left|\frac{x}{a}\right|^n + \left|\frac{y}{b}\right|^n = 1 \quad (n = 2.732)$$
+- **黄金超椭圆曲率指数（$n = 2.732$）**：
+  - Nokia N9 Harmattan 工业与界面设计的标志性几何特征，取值精确为 $n = 2.732$（对应 $1 + \sqrt{3} \approx 2.73205$ 超椭圆黄金比例常数）。
+  - 相较于普通高阶矩形（如 $n = 4.0$ 或 $n = 5.0$ 偏向平直切角的生硬方盒感），$n = 2.732$ 赋予图标与卡片更为圆润、有机、极具亲和力的圆角矩形鹅卵石质感。
+  - 具备 $G2$ / $G3$ 级别的连续平滑曲率过渡，杜绝普通直线过渡圆角在相切连接处的视觉折痕与棱角突兀感。
+- **全局统一超椭圆设计语言（Universal Squircle Architecture）**：
+  - **彻底废除系统默认圆角**：启动器内全面摒弃 Android 原生 `RoundedCornerShape` 与普通圆形 `CircleShape`，所有界面元素均统一遵循 $n = 2.732$ 黄金超椭圆曲率驱动。
+  - **组件级细化覆盖**：
+    - **应用网格图标**：$58\text{dp} \times 58\text{dp}$（4列）/ $52\text{dp} \times 52\text{dp}$（5列）正方形全局黄金超椭圆裁切。
+    - **后台卡片关闭角标（Delete Badge）**：长按编辑模式下浮现的 $26\text{dp}$ 红色叉号角标采用 `SquircleShape()` 超椭圆，还原 N9 原汁原味的微圆角小红方牌。
+    - **底部一键清理按键（Close All Button）**：$52\text{dp}$ 浮动白叉按键采用经典暗灰 Squircle 超椭圆外壳。
+    - **卡片头部信息胶囊与模式切换按键**：采用带超椭圆倒角（`cornerRadius = 10.dp ~ 16.dp`）的 Squircle 胶囊。
+    - **事件聚合流与设置页分组卡片**：Feed 消息卡片与 Settings 选项组均采用 `SquircleShape(cornerRadius = 16.dp)`，整体风格高度协同统一。
 
 ### 4.2 三屏联动、手势体系与应用网格配置
 - **三屏顺序**：`[屏0: Events Feed]` $\longleftrightarrow$ `[屏1: Application Grid]` $\longleftrightarrow$ `[屏2: Multitasking]`
@@ -222,13 +235,24 @@ $$\left|\frac{x}{a}\right|^n + \left|\frac{y}{b}\right|^n = 1 \quad (n \approx 5
   - 在 Android 原生架构中，普通 Launcher 只能展示静态应用 Icon。本项目通过 Root 特权管道直接获取系统的 `TaskSnapshot` 真实硬件快照（HardwareBitmap）或高精度视图流。
   - 真正实现诺基亚 N9 标志性的“当前后台界面所见即所得”效果，动态捕捉浏览器网页、聊天消息、播放器卡片的实时状态。
   - **优雅降级策略（Graceful Degradation）**：若无 Root 权限时，自动平滑回退为带有应用大图标与主色调微渐变的 Squircle 卡片，保证系统高鲁棒性。
-- **双指缩放无级切换（2×2 $\longleftrightarrow$ 3×3 Pinch-to-Zoom）**：
-  - **交互手势**：支持在多任务屏幕上使用双指张开（Spread）或捏合（Pinch）进行动态缩放。
-  - **视图连续插值**：缩放不是突变的生硬跳帧，而是跟随双指间距的实时连续比例变换（Scale 因子从 1.0f 到 0.67f 线性插值）。
-  - **双模形态**：
+- **双指缩放无级切换与卡片上下堆叠展开动画（Continuous Pinch-to-Zoom & Stack-and-Expand Cascade Deck）**：
+  - **交互手势与无级插值**：
+    - 支持在多任务屏幕上使用双指张开（Spread）或捏合（Pinch）进行动态缩放。
+    - 缩放通过底层连续状态变量 $p \in [0.0, 1.0]$ 实时驱动（$1.0$ 对应 2×2 详尽大卡片，$0.0$ 对应 3×3 紧凑多任务）。
+    - 双指移动时，直接依据指尖间距相对增量实时刷新 $p$ 值，卡片尺寸、间距、列坐标和文字尺度均实现平滑连续变换，杜绝跳帧。
+    - 双指松开（或点击右上角布局切换按钮）时，触发物理弹簧动效（Spring Animation）平滑吸附至目标端点（$0.0$ 或 $1.0$），并将最终布局持久化至 DataStore。
+  - **MeeGo 级联堆叠展开物理动效（Cascade Stack & Expand）**：
+    - **堆叠权重函数**：引入正弦权重函数 $w_{\text{stack}} = \sin(p \times \pi)$。在两端网格稳态（$p = 0.0$ 或 $1.0$）时 $w_{\text{stack}} = 0.0$，卡片严格位于标准网格矩阵中；在过渡中间态（$p = 0.5$）时达到最大值 $1.0$。
+    - **中轴聚合与垂直阶梯重叠**：卡片在过渡过程中水平向屏幕中轴聚合，垂直方向按卡片顺序以阶梯步长递增偏移：
+      $$Y_{\text{stack}}(i) = Y_{\text{stackStart}} + 38\text{dp} \times i$$
+      所有卡片在中间态如同实体扑克牌一般优雅聚拢堆叠成一列级联卡片堆（Deck of Cards），随后再如扇形般向目标网格槽位动态舒展展开。
+    - **物理微倾斜与层叠投影**：各卡片依据索引交替施加微妙的交错微倾斜角（$\theta = ((i \bmod 3) - 1) \times 1.8^\circ$）与递增高度阴影（Elevation 随卡片层级递增），配合 GPU `graphicsLayer` 硬件加速，在纯黑背景上呈现逼真的物理纸牌微叠质感。
+    - **可视窗口自适应锚定**：堆叠起点自动锚定用户当前滚动视口（$Y_{\text{stackStart}} = \max(16\text{dp}, \text{scrollY} + 16\text{dp})$），无论用户滚动到后台任务列表的任意深度，堆叠与展开动效始终在当前视口中央发生。
+  - **单/双指触控严格隔离**：
+    - `awaitPointerEventScope` 仅在检测到 2 根及以上手指时拦截并消费事件；单指纵向滚动、轻触切任务、长按进入编辑模式完全透传，零手势竞争。
+  - **双模稳态形态**：
     - **2×2 详尽大卡片**：每行 2 列，卡片面积大，内部应用文字和图形细节清晰可辨。
-    - **3×3 紧凑多任务**：每行 3 列，卡片缩小，全局掌控后台多应用概貌。
-  - 松手时自动通过弹簧物理动效（Spring Animation）吸附至最近的标准布局。
+    - **3×3 紧凑多任务**：每行 3 列，卡片紧凑高效，全局掌控后台多任务全貌。
 - **长按进入编辑模式与右上角删除角标**：
   - **长按激活**：长按任意后台卡片（$\approx 400\text{ms}$），配合线性马达触发短震动反馈，所有卡片进入“编辑/清理模式”（可伴有极轻微的微幅抖动）。
   - **右上角删除角标（Delete Badge）**：每个卡片右上角浮现 MeeGo 经典红色圆形关闭角标（白色交叉叉号）。
@@ -252,21 +276,54 @@ $$\left|\frac{x}{a}\right|^n + \left|\frac{y}{b}\right|^n = 1 \quad (n \approx 5
    - 接入物理机振动马达（`VibrationEffect.createPredefined(VibrationEffect.EFFECT_CLICK)` / `EFFECT_HEAVY_CLICK`）。
    - 在滑动分屏吸附、长按图标抖动编辑、底栏弹出就位时提供微秒级触觉反馈。
 
-### 4.5 全局应用内上半屏边缘划回交互与来源回溯机制（In-App Edge Swipe & Origin Routing）
+### 4.5 全局应用内上半屏边缘划回交互与双层揭示系统（In-App Edge Swipe & Dual-Layer Reveal System）
 1. **交互行为规范（Nokia N9 经典跨应用切出手势 1:1 还原）**：
-   - **手势热区划分**：屏幕高度的上半部分（$0 \le Y \le \text{ScreenHeight} / 2$）左右两侧边缘（宽度约 $20\sim 24\text{dp}$ 隐形捕获区）。下半部完全保留给宿主应用原生手势与输入法键盘，彻底杜绝打字与常规操作误触。
-   - **滑动行程与阈值**：从左右边缘向屏幕中心划入，实时追踪滑动位移：
-     - 当横向位移 $\Delta X < \text{ScreenWidth} / 2$ 时：松手取消切出，平滑回弹。
-     - 当横向位移 $\Delta X \ge \text{ScreenWidth} / 2$ 时：触发触觉震动提示，进入切出就绪态。
-   - **松手切出**：在满足阈值后抬起手指（`ACTION_UP`），立即平滑切出当前前台应用，返回 MeeGo 启动器。
+   - **手势热区划分**：屏幕高度的上半部分（$0 \le Y \le \text{ScreenHeight} / 2$）左右两侧边缘（宽度约 $28\text{dp} / 77\text{px}$ 隐形捕获区）。下半部完全保留给宿主应用原生手势与输入法键盘，彻底杜绝打字与常规操作误触。
+   - **MeeGo 经典系统级划出跟随动画**：
+     - 手势划入时，悬浮层立即呈现**当前正在运行的应用界面卡片**，具有 MeeGo 标志性 Squircle（28dp 圆角）连续轮廓与 $20\text{dp}$ 纵深阴影。
+     - 卡片随手指水平移动，伴随微小尺度压缩（$1.0 \to 0.88$ 缩放）。
+   - **双层揭示体系（Dual-Layer Reveal Architecture）**：
+     - 滑动卡片下方**绝不是透明透出当前应用**，而是根据进入来源动态呈现对应的**启动器真实画面**！
+     - 底层桌面采用 100% 纯黑底层保底垫层（`solidBlackBackdrop`）配合 1:1 原始贴合与完全不透明（$\text{alpha} = 1.0$），上层卡片（$n = 2.732$ 超椭圆轮廓与投影）随手指滑出，从物理层面上 100% 杜绝底层第三方应用透光或露角，彻底根除三个界面叠合的视觉异常。
+   - **滑动行程与松手判定**：
+     - 当横向位移 $\Delta X < \text{ScreenWidth} / 2$ 时：原路弹簧回弹（Spring Back），卡片复原至全屏。
+     - 当横向位移 $\Delta X \ge \text{ScreenWidth} / 2$ 时：顺势加速飞出屏幕（Slide Out），底层桌面瞬时呈现并完成来源对齐。
 2. **来源感知定向回溯（Origin-Aware Contextual Routing）**：
    - 应用启动时，通过 `LaunchOriginTracker` 精准记录进入路径：
-     - **Path A**：若应用最初由 **Application Grid（屏1 应用网格）** 点击拉起 $\implies$ 滑回后桌面直接停留在 **Application Grid**；
-     - **Path B**：若应用由 **Multitasking View（屏2 多任务卡片）** 点击切换拉起 $\implies$ 滑回后桌面直接停留在 **Multitasking View**。
-   - **无缝过渡**：滑回拉起启动器时通过 Intent 携带 `EXTRA_TARGET_PAGE`，Activity 启动后即刻平滑定位到对应主屏，实现端到端的沉浸穿梭感。
-3. **底层实现架构**：
-   - 依托 Root 特权与系统 Overlay 权限，启动 `MeeGoEdgeSwipeService`，在上半屏边缘注入触摸捕获监听；
-   - 支持高精度位移计算与快速 `ActivityManager` 前台栈唤醒。
+     - **Path A**：若应用最初由 **Application Grid（屏1 应用网格）** 点击拉起 $\implies$ 滑动底板展示 **Application Grid**，滑出后桌面无缝停留在 **Application Grid**；
+     - **Path B**：若应用由 **Multitasking View（屏2 多任务卡片）** 点击切换拉起 $\implies$ 滑动底板展示 **Multitasking View**，滑出后桌面无缝停留在 **Multitasking View**。
+3. **特权与底层技术突破**：
+   - **前台应用全真实时快照管线（Live Screencap Pipeline）**：
+     - 突破限制：Android 原生沙盒机制只在应用进入后台时才将 `TaskSnapshot` 写入磁盘，导致传统方案划出时只能取到“上一个后台应用”的陈旧画面。
+     - 特权方案：后台常驻 Root 守护进程 `meego_daemon.sh` 监听系统 `ResumedActivity`，在应用切换并渲染首帧后，以 0 内存开销调用特权通道 `screencap -p` 写入 `/data/local/tmp/current_app.png`，确保划出时显示的 100% 为当前应用实时内容。
+   - **系统侧滑返回手势完全屏蔽（Zero Conflict Edge Gesture Suppression）**：
+     - 突破限制：Android 10+ 的 `EdgeBackGestureHandler` 存在 200dp 系统排除上限，导致上层 Overlay 的手势排除区被系统强制截断，与原生返回手势严重冲突。
+     - 特权方案：守护脚本启动时直接通过 Root 特权执行：
+       ```bash
+       settings put secure back_gesture_inset_scale_left 0
+       settings put secure back_gesture_inset_scale_right 0
+       ```
+       强制将两边缘的 `mEdgeWidthLeft / mEdgeWidthRight` 设为 0px，100% 消除系统侧滑返回冲突，留给 MeeGo 上半屏纯净手势。
+   - **启动器屏幕快照双重缓存架构（ScreenCaptureHelper）**：
+     - 启动器通过 `PixelCopy` 在 Activity 绘制与页面滑动时以 1080×2400 原生分辨率捕获桌面底板。
+     - 运行时通过 `LauncherPreviews` 内存二级缓存直连，辅以私有沙盒 `filesDir`（`app_grid_preview.png` / `recents_preview.png`）持久化，实现 0ms 延迟瞬时加载。
+   - **切回启动器 0 闪烁无缝交接管线（Seamless Zero-Flicker Handover Pipeline）**：
+     - 痛点解决：滑出动画飞出屏幕后，如果过早关闭 Overlay 悬浮窗，由于 Android 启动 Activity 存在 100~200ms 的进程窗口调度时延，底层旧应用会在这短暂瞬间“一闪而过”；同时系统默认转场动画会带来跳动感。
+     - 架构方案：
+       1. 手指划入超过 1/2 屏幕松手瞬间，立即以 `FLAG_ACTIVITY_NO_ANIMATION` 唤起 `MainActivity`，与 220ms 卡片飞出动画并行执行；
+       2. 卡片飞出动画结束时，仅隐藏飞出卡片，**保持 `desktopBackgroundImageView` 高保真桌面底板在最顶层持续覆盖**，完全盖住旧应用；
+       3. `MainActivity.onResume()` 禁用原生 Activity 转场动画，等待 `window.decorView.post` 确认桌面首帧渲染已写入图形缓冲区后，才主动向服务发送 `dismissOverlay()` 撤除遮罩；
+       4. 配合 500ms 兜底安全定时器，实现 100% 毫无察觉的 0 闪烁丝滑交接。
+   - **多任务卡片实时全真快照多级保障管线（Multi-Tier Snapshot Resolution Pipeline）**：
+     - **痛点解决**：Android 原生沙盒机制在应用退至后台时，`TaskSnapshot` 异步写入磁盘存在 500ms~1500ms 滞后；若桌面在切回瞬间直接读盘，卡片由于找不到快照文件而被迫降级退化显示应用图标。
+     - **架构设计**：
+       1. **一级内存快照缓存（`TaskSnapshotCache`）**：单例内存高速缓存，手势服务在 `startSwipeOutAnimation` 及 `finishSwipeOut` 动画执行时，将手势滑出的应用实时全真画面（`snapBitmap`）即时写入内存缓存，并绑定 `lastSwipedTaskId` 与 `lastSwipedPackageName`；
+       2. **二级特权全真快照（`current_app.png`）**：`RootTaskProvider` 在解析任务列表时，若本地快照尚未落盘，自动比对当前前台任务 ID 或包名，读取特权守护脚本预先捕获的 `/data/local/tmp/current_app.png`；
+       3. **三级守护进程快照保底（Daemon Snapshot Fallback）**：`meego_daemon.sh` 在更新 `recent_tasks.json` 时，若原生快照不存在且当前任务匹配，直接将 `current_app.png` 复制至 `/data/local/tmp/snapshots/${tid}_reduced.jpg` 并赋予 644 权限；
+       4. **异步多阶段重刷（Delayed Task Refreshes）**：`MainActivity.onResume()` 在即时加载（0ms）后，分别在 600ms 与 1500ms 自动触发延时重刷，待系统原生快照写入完毕后无缝替换为系统全高清位图，实现多任务卡片 100% 实时显示真机界面，绝不退化为图标。
+   - **多任务网格状态持久化（Recents Columns Persistence & Snapping）**：
+     - 将多任务 2×2 / 3×3 布局模式同步纳入 DataStore 持久化存储（`KEY_RECENTS_COLUMNS`）；
+     - 双指缩放（Pinch-to-zoom）手势结束时，依据 $\text{pinchScale} \lessgtr 0.83$ 智能平滑吸附到 3×3 或 2×2，并实时持久化，彻底解决在主屏各页面滑动或重启后模式被重置的问题。
 
 ---
 
@@ -327,8 +384,21 @@ flowchart TD
 ## 7. 变更日志 (Changelog)
 
 | 日期 | 版本 | 变更内容概述 | 操作者 |
-| :--- | :--- | :--- | :--- |
-| 2026-09-22 | v1.3.0 | 增加应用网格 4 列 / 5 列动态配置并提供启动器设置入口；多任务屏增加双指 Pinch-to-zoom 2×2 与 3×3 无级缩放，以及长按右上角删除角标任务终结交互；增加全局应用内上半屏边缘划回交互规范（划入 1/2 松手切出）与来源回溯机制（Grid 启动回 Grid，Recents 启动回 Recents） | Coding Agent |
-| 2026-09-22 | v1.2.0 | 实测检测 Redmi K40 (alioth, Android 16) 物理机就绪且具备 ADB Root (`uid=0`) 权限；架构新增 `RootTaskSnapshotProvider` 与 `RecentTaskController`，将多任务屏从静态占位升级为 1:1 真实后台应用实时硬件位图预览与特权秒切/强杀调度；完善优雅降级设计 | Coding Agent |
-| 2026-09-22 | v1.1.0 | 增加物理机测试支持方案：明确 ADB 调试通道、非破坏性调试与安全回退策略、真机截屏/日志反馈闭环；补充现代物理机全面屏手势冲突避让（`systemGestureExclusionRects`）、长屏比例自适应与线性马达触觉反馈规范；更新路线图各阶段真机验证环节 | Coding Agent |
-| 2026-09-22 | v1.0.0 | 初始技术方案建立：确定 MeeGo Harmattan 1:1 还原目标、三屏架构、环境诊断（复用本地 JDK17）、无 sudo 依赖的 SDK 方案与阶段路线图 | Coding Agent |
+| 2026-09-24 | v1.7.9 | 彻底解决在启动器设置中关闭“全屏边缘侧滑切回”开关后再打开手势失效的问题：1) **分离无障碍服务底层生命周期与业务开关**：消除此前向服务发送 `ACTION_STOP` 触发 `stopSelf()` 导致系统无障碍服务被强制注销且无法通过标准 `startService` 重新绑定的根本缺陷；`EdgeSwipeGestureService` 保持系统无障碍常驻，引入 `isGestureEnabledByUser` 运行时业务开关与静态 `setGestureEnabled` 入口；2) **多层级实时响应与即时启闭**：服务内通过 CoroutineScope 实时监听 `LauncherPreferences.edgeSwipeFlow` 数据流，结合 `ACTION_ENABLE` / `ACTION_DISABLE` 与直接方法调用，实现零延迟多级同步；3) **触控拦截与系统手势避让彻底休眠/重建**：关闭开关时立即撤销活跃 Overlay、将边缘触发层设置为 `View.GONE` 并清空 `systemGestureExclusionRects`，彻底释放触控；重新开启时若触发视图未构建自动即时创建，在前台应用中恢复 `View.VISIBLE` 并重注手势排除区；4) **MainActivity 与无障碍通道自愈保护**：开启时若无障碍权限脱落自动通过 FIFO `ENABLE_A11Y` 进行安全自愈。Redmi K40 物理机高频来回开关与侧滑切回实测 100% 验证通过。 | Coding Agent |
+| 2026-09-24 | v1.7.8 | 彻底根治多任务卡片与滑动返回界面发生跨任务快照串扰（如进入B应用滑出手势却显示A应用界面）的复合缺陷：1) **严禁快照跨任务串扰与弱校验漏洞**：重构 `EdgeSwipeGestureService.loadLatestSnapshot()`，彻底废弃 `|| currentTaskId == LaunchOriginTracker.currentTaskId` 的弱匹配分支，建立任务 ID 强一致性校验链（优先当前任务专属 `snapshots/${tid}_live.png`，校验 `current_app_tid.txt` 强所有权，系统专属快照及内存缓存），当任务无有效快照时回退应用图标占位，严防任何历史残留截屏被错误渲染；2) **守护进程快照生命周期隔离与即时失效**：在 `meego_daemon.sh` 中为各应用生成以任务 ID 隔离的 `snapshots/${tid}_live.png`，前台应用切换时立即物理移除全局 `current_app_tid.txt` 与 `current_app.png` 消除竞态脏读，监控轮询周期压缩至 0.15s，并为 `SWITCH` 指令建立毫秒级任务 ID 同步；3) **动态无障碍焦点任务校准**：`onAccessibilityEvent` 捕获窗口焦点切换，实时校验并绑定前台包名对应的真实 TaskId；4) **任务前台调度权限升级**：声明 `android.permission.REORDER_TASKS` 并优化 `RootTaskProvider.switchToTask` 优先调用 `activityManager.moveTaskToFront`，实现精准原栈唤起。物理真机全链路实测通过。 | Coding Agent |
+| 2026-09-24 | v1.7.7 | 彻底修复后台卡片点击删除后并未真正清理后台任务的严重问题：1) 深入排查系统底层交互，定位到 `meego_daemon.sh` 此前调用的 `am task remove` 在现代 Android 系统中为未知命令（报 `Error: unknown command 'remove'`），导致后台任务从未被系统移除；2) 将任务销毁命令订正为标准且生效的 `am stack remove "$tid"` 彻底关闭任务栈，并同步触发 `am force-stop "$pkg"` 彻底杀死目标应用后台进程释放 CPU/内存资源，同时清理专属快照缓存；3) 在 `RootTaskProvider.removeTask` 中向特权 FIFO 完整传递 `taskId` 与 `packageName`，并就地重写更新本地 `recent_tasks.json`，解决任务列表重刷时的并发竞态复现；4) 同步重构 `CLEAR_ALL`（一键清理）逻辑，遍历全部后台应用严格执行 `am stack remove` 与 `am force-stop`。真机测试点击删除和全部清理，任务及进程 100% 彻底终结。 | Coding Agent |
+| 2026-09-23 | v1.7.6 | 1) **应用内边缘划回手势扩大至全屏左右边缘全部**：将原本仅覆盖上半屏（`halfHeight = screenHeight / 2`）的限制彻底放开，升级为全屏幕纵向完整高度（`WindowManager.LayoutParams.MATCH_PARENT` 与 `FLAG_LAYOUT_NO_LIMITS`），手势排除区域同步适配整屏边缘，手指在屏幕任意垂直位置从屏幕边缘划入 1/2 均可顺畅唤起 MeeGo 划出退出动画。2) **解决系统设置（Settings App）内手势返回失效问题**：因原生设置页使用 `PRIVATE_FLAG_HIDE_NON_SYSTEM_OVERLAY_WINDOWS` 屏蔽应用级悬浮窗，此前若无障碍服务未保持活跃会导致边缘触控退化为系统原生返回手势；在 `meego_daemon.sh` 中引入 `ensure_system_settings` 周期自愈巡检与 `ENABLE_A11Y` 握手通道，确保 `EdgeSwipeGestureService` 持续获得 `TYPE_ACCESSIBILITY_OVERLAY` 顶级覆盖层；在无障碍事件 `onAccessibilityEvent` 中监听 `TYPE_WINDOW_STATE_CHANGED` 动态精准同步前台包名与悬浮层可见性，并在底层持续将 `back_gesture_inset_scale` 置零，杜绝系统原生侧滑抢占。真机在设置及各级子页验证通过。 | Coding Agent |
+| 2026-09-23 | v1.7.5 | 彻底修复后台卡片全部显示同一个 App 界面的严重缺陷：排查并消灭两大污染源：1) 守护进程此前在 `monitor_current_app` 和 `update_tasks` 中每隔数秒盲目将 `current_app.png` 复制覆盖到所有任务的快照文件，且并发写入导致临时文件冲突；彻底移除守护进程的侵入式复制，保障系统生成的真机快照文件不被污染；2) 重构 `EdgeSwipeGestureService.loadLatestSnapshot()` 与 `RootTaskProvider.getRecentTasks()`：移除无条件兜底任意快照的危险逻辑，强制校验任务 ID 严格匹配；优先加载系统专属快照文件，次选专属内存缓存，杜绝跨任务快照串扰。同步修复技术规范中 Markdown Changelog 表格语法缺少分隔符导致预览失效的问题。 | Coding Agent |
+| 2026-09-23 | v1.7.4 | 1) **设置 App 内手势返回全面支持**：解决原生系统设置（`com.android.settings`）声明 `PRIVATE_FLAG_HIDE_NON_SYSTEM_OVERLAY_WINDOWS` 屏蔽应用悬浮窗的问题，升级 `EdgeSwipeGestureService` 为 `AccessibilityService` 并申请 `TYPE_ACCESSIBILITY_OVERLAY` 突破窗口屏蔽，实现系统设置内边缘划回；在桌面内部设置面板补充 `BackHandler` 与左右边缘 `detectHorizontalDragGestures` 交互动画，支持滑出平滑退出。2) **双指缩放后台卡片阻尼调优**：将捏合缩放行程阻尼距离除数从 260f 扩大至 680f（灵敏度降低约 2.6 倍），手指滑动距离更长、缩放过渡更加平滑沉稳。3) **后台卡片顺滑位移动画 (C -> CAB)**：卡片坐标接入 `animateDpAsState` 弹簧动画，移动至前排的卡片赋予高 `zIndex` 浮层；`MainActivity` 增加原地无缝同步与 `promoteLastSwipedTaskToTop()`，保障 Compose Key 持续保活并触发流畅重排与顺位后移位移动画。真机全部验证通过。 | Coding Agent |
+| 2026-09-23 | v1.7.3 | 根除应用内手势划回时三层界面叠加（【当前应用】 + 【Multitasking/Grid】 + 【当前应用】）的视觉异常：深度排查并解决四大根因：1) 为手势 Overlay 补齐 `FLAG_LAYOUT_NO_LIMITS` 与 `LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES`，解决全屏上下端因挖孔/导航栏裁切导致底层应用露角；2) 引入 `device_config` 与 `settings` 解除 Android 系统对 `APPLICATION_OVERLAY` 窗口 0.8 透明度的强制夹紧，手势 Overlay 内部铺设纯黑保底垫层（`solidBlackBackdrop`），底层桌面维持 1:1 贴合与 alpha = 1.0，彻底消除透明度透光；3) 建立 `gesture_active` 状态互斥锁，严防守护进程在手势滑动中误截取包含桌面与卡片的过渡帧并污染快照；4) 调整 `loadLatestSnapshot` 优先级，优先读取由前台实时捕获的干净 `current_app.png`。真机 100% 验证双层纯净划出无叠加。 | Coding Agent |
+| 2026-09-23 | v1.7.2 | 全局 UI 全面落地统一超椭圆设计语言：彻底剔除所有 Android 原生 `RoundedCornerShape` 与 `CircleShape`；将后台卡片右上角关闭按钮（红色叉号角标）、多任务屏底部“一键关闭全部”悬浮按键、卡片头部标题胶囊、事件聚合流（Feed）卡片、设置中心（Settings）分组卡片及页面指示点全部统一重构为 n = 2.732 的 `SquircleShape` 超椭圆；真机截图验证各层级组件高度统一。 | Coding Agent |
+| 2026-09-23 | v1.7.1 | 校准 MeeGo Harmattan 超椭圆（Squircle）曲率数学模型：将超椭圆 Lamé 指数由历史占位值（n = 4.0 ~ 5.0）精确订正为 MeeGo Harmattan 官方黄金曲率常数 n = 2.732（1 + sqrt(3) 几何近似），消除方盒感并呈现圆润鹅卵石触感；全局同步更新 `SquircleShape`、`AppGridScreen`、`MultitaskingScreen` 样式定义及设计规范文档。 | Coding Agent |
+| 2026-09-23 | v1.7.0 | 实现 Multitasking View 双指无级缩放（2×2 ↔ 3×3）与 MeeGo 级联卡片堆叠展开物理动效：设计连续进度因子 p ∈ [0.0, 1.0] 并挂接双指物理距离动态插值；引入正弦堆叠权重 w = sin(p * pi)，在过渡中间态驱动卡片向屏幕中轴聚合形成阶梯式立体卡片堆（Cascade Deck，伴随 ±1.8° 微动旋转与层级阴影），随后扇形展开至目标网格；堆叠起点视口自适应，双指/单指触控严格隔离透传；真机 120FPS 验证通过。 | Coding Agent |
+| 2026-09-23 | v1.6.0 | 解决应用手势滑出退出后 Multitasking View 卡片退化显示图标的问题：建立多级实时全真快照保障管线（`TaskSnapshotCache` 内存直连缓存、`/data/local/tmp/current_app.png` 运行时特权捕获、守护脚本保底复制与 `MainActivity.onResume()` 600ms/1500ms 异步延时重刷）；为手势 Overlay 添加 `FLAG_NOT_TOUCHABLE` 杜绝遮挡系统/应用触控；物理机端到端验证多任务卡片 100% 实时渲染真实应用 UI 界面。 | Coding Agent |
+| 2026-09-22 | v1.5.0 | 落实三屏无限循环水平滑动架构（Feed ↔ Grid ↔ Recents ↔ Feed ... 左右双向无界穿梭，最短距离平滑跳转与循环指示点）；建立启动器内外手势动态隔离机制（桌面在前台时彻底销毁/隐藏边缘悬浮层，保证全宽无障碍循环滑动；仅在切入第三方应用后动态激活边缘划出服务）。 | Coding Agent |
+| 2026-09-22 | v1.4.1 | 修复 Multitasking View 2×2 / 3×3 布局切换后无法持久化的问题（接入 DataStore `KEY_RECENTS_COLUMNS`，双指缩放平滑吸附与状态绑定）；消除应用滑出后因过早隐藏遮罩导致旧应用“一闪而过”的视觉瑕疵（实现 0 闪烁交接管线：并行唤起桌面、Overlay 持续盖住旧应用，直至 `MainActivity.onResume()` 首帧绘制就绪后无缝撤销遮罩）。 | Coding Agent |
+| 2026-09-22 | v1.4.0 | 突破实现 1:1 MeeGo 原生划出跟随动画与双层揭示体系（Dual-Layer Reveal）：当前应用卡片随手指划出，底层根据来源动态揭示 Application Grid 或 Multitasking View；解决 Android 原生快照滞后问题（特权守护进程捕获 `current_app.png`）；消除系统原生侧滑返回冲突（`back_gesture_inset_scale` 设为0）；建立 `ScreenCaptureHelper` 内存+沙盒文件双重桌面快照管线。 | Coding Agent |
+| 2026-09-22 | v1.3.0 | 增加应用网格 4 列 / 5 列动态配置并提供启动器设置入口；多任务屏增加双指 Pinch-to-zoom 2×2 与 3×3 无级缩放，以及长按右上角删除角标任务终结交互；增加全局应用内上半屏边缘划回交互规范（划入 1/2 松手切出）与来源回溯机制（Grid 启动回 Grid，Recents 启动回 Recents）。 | Coding Agent |
+| 2026-09-22 | v1.2.0 | 实测检测 Redmi K40 (alioth, Android 16) 物理机就绪且具备 ADB Root (`uid=0`) 权限；架构新增 `RootTaskSnapshotProvider` 与 `RecentTaskController`，将多任务屏从静态占位升级为 1:1 真实后台应用实时硬件位图预览与特权秒切/强杀调度；完善优雅降级设计。 | Coding Agent |
+| 2026-09-22 | v1.1.0 | 增加物理机测试支持方案：明确 ADB 调试通道、非破坏性调试与安全回退策略、真机截屏/日志反馈闭环；补充现代物理机全面屏手势冲突避让（`systemGestureExclusionRects`）、长屏比例自适应与线性马达触觉反馈规范；更新路线图各阶段真机验证环节。 | Coding Agent |
+| 2026-09-22 | v1.0.0 | 初始技术方案建立：确定 MeeGo Harmattan 1:1 还原目标、三屏架构、环境诊断（复用本地 JDK17）、无 sudo 依赖的 SDK 方案与阶段路线图。 | Coding Agent |

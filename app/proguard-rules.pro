@@ -1,0 +1,1 @@
+# MeeGo Launcher Proguard Rules

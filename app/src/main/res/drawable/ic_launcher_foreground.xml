@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- MeeGo Cyan Squircle Logo -->
+    <path
+        android:fillColor="#00A2E8"
+        android:pathData="M 30,18 C 18,18 18,30 18,42 L 18,66 C 18,78 18,90 30,90 L 78,90 C 90,90 90,78 90,66 L 90,42 C 90,30 90,18 78,18 Z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M 40,36 L 40,72 L 48,72 L 48,50 L 60,72 L 68,72 L 68,36 L 60,36 L 60,58 L 48,36 Z" />
+</vector>

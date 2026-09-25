@@ -21,9 +21,14 @@ import kotlin.math.sin
  * - 当容器为长方形（如多任务卡片、按钮等）时，四角应用黄金超椭圆连续曲率倒角，边线保持平直，呈现正统 MeeGo 卡片质感。
  */
 class SquircleShape(
-    private val n: Float = 2.732f,
-    private val cornerRadius: Dp? = null
+    val n: Float = 2.732f,
+    val cornerRadius: Dp? = null
 ) : Shape {
+    private var lastWidth: Float = -1f
+    private var lastHeight: Float = -1f
+    private var lastDensity: Float = -1f
+    private var cachedOutline: Outline? = null
+
     override fun createOutline(
         size: Size,
         layoutDirection: LayoutDirection,
@@ -33,6 +38,10 @@ class SquircleShape(
         val height = size.height
         if (width <= 0f || height <= 0f) {
             return Outline.Generic(Path())
+        }
+
+        if (width == lastWidth && height == lastHeight && density.density == lastDensity && cachedOutline != null) {
+            return cachedOutline!!
         }
 
         val maxR = minOf(width, height) / 2f
@@ -70,7 +79,12 @@ class SquircleShape(
                 }
             }
             path.close()
-            return Outline.Generic(path)
+            val outline = Outline.Generic(path)
+            lastWidth = width
+            lastHeight = height
+            lastDensity = density.density
+            cachedOutline = outline
+            return outline
         }
 
         // 长方形容器：四角采用 n = 2.732 黄金超椭圆过渡，边线保持平滑直线连接
@@ -131,6 +145,25 @@ class SquircleShape(
         }
 
         path.close()
-        return Outline.Generic(path)
+        val outline = Outline.Generic(path)
+        lastWidth = width
+        lastHeight = height
+        lastDensity = density.density
+        cachedOutline = outline
+        return outline
+    }
+
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is SquircleShape) return false
+        return n == other.n && cornerRadius == other.cornerRadius
+    }
+
+    override fun hashCode(): Int {
+        var result = n.hashCode()
+        result = 31 * result + (cornerRadius?.hashCode() ?: 0)
+        return result
     }
 }
+
+val DefaultSquircleShape = SquircleShape(2.732f)

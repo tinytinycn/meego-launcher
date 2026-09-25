@@ -18,3 +18,7 @@ build/
 
 # Screenshots and test media
 screenshots/
+*.mp4
+*.png
+yavg.txt
+frames_*

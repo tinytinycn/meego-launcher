@@ -121,11 +121,16 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent?) {
         super.onNewIntent(intent)
         setIntent(intent)
+        if (Build.VERSION.SDK_INT >= 34) {
+            overrideActivityTransition(OVERRIDE_TRANSITION_OPEN, 0, 0)
+            overrideActivityTransition(OVERRIDE_TRANSITION_CLOSE, 0, 0)
+        } else {
+            @Suppress("DEPRECATION")
+            overridePendingTransition(0, 0)
+        }
         handleTargetPage(intent)
         promoteLastSwipedTaskToTop()
-        loadTasks()
-        window.decorView.postDelayed({ loadTasks() }, 600)
-        window.decorView.postDelayed({ loadTasks() }, 1500)
+        notifyFrameReadyForDismiss()
     }
 
     override fun onResume() {
@@ -144,13 +149,26 @@ class MainActivity : ComponentActivity() {
         startEdgeServiceIfNeeded()
         // 处于启动器内部时，彻底禁用边缘手势触发区，保证三屏循环滑动不被任何边缘悬浮层拦截
         EdgeSwipeGestureService.setInLauncher(true)
-        // 桌面首帧绘制就绪后，通知手势服务撤除底层遮罩，彻底杜绝切回桌面时的界面闪烁
-        window.decorView.post {
-            EdgeSwipeGestureService.dismissOverlay()
-        }
+        // 桌面首帧真实绘制并提交渲染后再通知手势服务解散上层遮罩，彻底杜绝闪黑
+        notifyFrameReadyForDismiss()
         window.decorView.postDelayed({
             ScreenCaptureHelper.captureLauncherScreen(this, LaunchOriginTracker.lastOrigin)
         }, 400)
+    }
+
+    private fun notifyFrameReadyForDismiss() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            window.decorView.viewTreeObserver.registerFrameCommitCallback {
+                window.decorView.post {
+                    EdgeSwipeGestureService.dismissOverlay()
+                }
+            }
+            window.decorView.invalidate()
+        } else {
+            window.decorView.postDelayed({
+                EdgeSwipeGestureService.dismissOverlay()
+            }, 80)
+        }
     }
 
     private fun promoteLastSwipedTaskToTop() {
@@ -162,6 +180,8 @@ class MainActivity : ComponentActivity() {
                 recentTasks.add(0, item)
             }
         }
+        // 关键：重排完成后，清空前台追踪状态，彻底杜绝历史残留影响后续打开其他应用
+        LaunchOriginTracker.reset()
     }
 
     override fun onPause() {
@@ -188,14 +208,31 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun updateRecentTasks(newTasks: List<RecentTask>) {
+        if (newTasks.isEmpty()) {
+            // 避免因守护进程轮询空窗期将已有卡片误清空（手动清空由 onClearAllTasks 执行）
+            return
+        }
+
+        // 强保序锁：如果有刚刚滑出的任务，确保其始终位于列表首位，绝对禁止因异步数据滞后导致卡片回弹到后方再切回
+        val swipedId = TaskSnapshotCache.lastSwipedTaskId
+        val effectiveNewTasks = if (swipedId != null) {
+            val idx = newTasks.indexOfFirst { it.taskId == swipedId }
+            if (idx > 0) {
+                val list = newTasks.toMutableList()
+                val item = list.removeAt(idx)
+                list.add(0, item)
+                list
+            } else newTasks
+        } else newTasks
+
         if (recentTasks.isEmpty()) {
-            recentTasks.addAll(newTasks)
+            recentTasks.addAll(effectiveNewTasks)
             return
         }
         // 同步更新现有列表以保留 item key，触发流畅的重排与顺移位移动画
-        val newIds = newTasks.map { it.taskId }.toSet()
+        val newIds = effectiveNewTasks.map { it.taskId }.toSet()
         recentTasks.removeAll { it.taskId !in newIds }
-        newTasks.forEachIndexed { targetIndex, task ->
+        effectiveNewTasks.forEachIndexed { targetIndex, task ->
             val currentIndex = recentTasks.indexOfFirst { it.taskId == task.taskId }
             if (currentIndex == -1) {
                 recentTasks.add(targetIndex.coerceAtMost(recentTasks.size), task)

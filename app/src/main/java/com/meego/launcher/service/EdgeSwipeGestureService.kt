@@ -3,6 +3,7 @@ package com.meego.launcher.service
 import android.accessibilityservice.AccessibilityService
 import android.animation.Animator
 import android.animation.AnimatorListenerAdapter
+import android.app.ActivityOptions
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
@@ -91,12 +92,15 @@ class EdgeSwipeGestureService : AccessibilityService() {
                 updateInLauncher(false)
                 if (LaunchOriginTracker.currentPackageName != pkg) {
                     LaunchOriginTracker.currentPackageName = pkg
+                    // 关键：包名发生变更，之前的 taskId 必然失效！立即清空，杜绝跨应用残留！
+                    LaunchOriginTracker.currentTaskId = null
                     updateCurrentTaskIdForPackage(pkg)
                 }
             } else if (event.className?.toString()?.contains("MainActivity") == true) {
                 // 仅当真正回到桌面 MainActivity 且不在手势拖拽中时才隐藏触发区
                 if (!isDraggingCard) {
                     updateInLauncher(true)
+                    LaunchOriginTracker.reset()
                 }
             }
         }
@@ -131,6 +135,7 @@ class EdgeSwipeGestureService : AccessibilityService() {
         mainHandler.post {
             removeViews()
             createTriggerViews()
+            createBottomMaskView()
             createCardOverlay()
         }
     }
@@ -146,11 +151,16 @@ class EdgeSwipeGestureService : AccessibilityService() {
 
     fun updateInLauncher(inLauncher: Boolean) {
         isInLauncher = inLauncher
+        if (inLauncher) {
+            LaunchOriginTracker.reset()
+        }
         mainHandler.post {
             val visibility = if (inLauncher || !isGestureEnabledByUser) View.GONE else View.VISIBLE
             leftTriggerView?.visibility = visibility
             rightTriggerView?.visibility = visibility
-            Log.d(TAG, "updateInLauncher: inLauncher=$inLauncher, isGestureEnabledByUser=$isGestureEnabledByUser, trigger visibility=$visibility")
+            // 仅在桌面展示底部遮罩层（屏蔽并隐藏小白条）；切入其它应用时隐退
+            bottomMaskView?.visibility = if (inLauncher) View.VISIBLE else View.GONE
+            Log.d(TAG, "updateInLauncher: inLauncher=$inLauncher, isGestureEnabledByUser=$isGestureEnabledByUser, trigger visibility=$visibility, bottomMask=${bottomMaskView?.visibility}")
         }
     }
 
@@ -170,12 +180,16 @@ class EdgeSwipeGestureService : AccessibilityService() {
                 if (leftTriggerView == null || rightTriggerView == null) {
                     createTriggerViews()
                 }
+                if (bottomMaskView == null) {
+                    createBottomMaskView()
+                }
                 if (cardOverlayLayout == null) {
                     createCardOverlay()
                 }
                 val visibility = if (isInLauncher) View.GONE else View.VISIBLE
                 leftTriggerView?.visibility = visibility
                 rightTriggerView?.visibility = visibility
+                bottomMaskView?.visibility = if (isInLauncher) View.VISIBLE else View.GONE
                 if (visibility == View.VISIBLE && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     leftTriggerView?.let { v ->
                         v.post {
@@ -203,6 +217,10 @@ class EdgeSwipeGestureService : AccessibilityService() {
     private var rightParams: WindowManager.LayoutParams? = null
     private var edgeWidth: Int = 0
 
+    // 启动器桌面专用底部小横条纯黑遮罩与手势屏蔽层 (仅在处于启动器时展示)
+    private var bottomMaskView: View? = null
+    private var bottomMaskParams: WindowManager.LayoutParams? = null
+
     // 全局划出卡片跟随 Overlay
     private var cardOverlayLayout: FrameLayout? = null
     private var desktopBackgroundImageView: ImageView? = null
@@ -212,6 +230,8 @@ class EdgeSwipeGestureService : AccessibilityService() {
     private var screenWidth = 1080
     private var screenHeight = 2400
     private var isDraggingCard = false
+    private var isCardAnimatingOut = false
+    private var pendingDismiss = false
 
     override fun onCreate() {
         super.onCreate()
@@ -224,6 +244,7 @@ class EdgeSwipeGestureService : AccessibilityService() {
         screenHeight = metrics.heightPixels
 
         createTriggerViews()
+        createBottomMaskView()
         createCardOverlay()
 
         serviceScope.launch {
@@ -239,7 +260,7 @@ class EdgeSwipeGestureService : AccessibilityService() {
 
     fun scheduleSafetyDismiss() {
         mainHandler.removeCallbacks(safetyDismissRunnable)
-        mainHandler.postDelayed(safetyDismissRunnable, 500)
+        mainHandler.postDelayed(safetyDismissRunnable, 400)
     }
 
     fun cancelSafetyDismiss() {
@@ -247,15 +268,38 @@ class EdgeSwipeGestureService : AccessibilityService() {
     }
 
     fun postDismissOverlay() {
-        cancelSafetyDismiss()
-        setGestureActive(false)
         mainHandler.post {
-            cardOverlayLayout?.visibility = View.GONE
-            cardContainer?.visibility = View.VISIBLE
-            cardContainer?.translationX = 0f
-            cardContainer?.scaleX = 1f
-            cardContainer?.scaleY = 1f
+            if (isCardAnimatingOut) {
+                pendingDismiss = true
+            } else {
+                executeSmoothDismiss()
+            }
         }
+    }
+
+    private fun executeSmoothDismiss() {
+        cancelSafetyDismiss()
+        pendingDismiss = false
+        isCardAnimatingOut = false
+        setGestureActive(false)
+
+        val overlay = cardOverlayLayout ?: return
+        if (overlay.visibility != View.VISIBLE) return
+
+        // 真实桌面首帧已在底层就绪，上层快照以 60ms 极速平滑淡出，两层画面无缝交融，杜绝任何黑屏与闪烁
+        overlay.animate()
+            ?.alpha(0f)
+            ?.setDuration(60)
+            ?.setInterpolator(DecelerateInterpolator())
+            ?.setListener(object : AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: Animator) {
+                    overlay.visibility = View.GONE
+                    // 注意：绝不在此处重置 overlay.alpha = 1.0f 或 cardContainer 状态！
+                    // 避免 SurfaceFlinger 在窗口隐藏过程中的异步帧被重置状态污染而产生短暂闪黑/闪烁。
+                    // 状态复位统一移至下一次手势触发 startSwipeOutAnimation() 时进行。
+                }
+            })
+            ?.start()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -379,6 +423,50 @@ class EdgeSwipeGestureService : AccessibilityService() {
         }
     }
 
+    private fun createBottomMaskView() {
+        if (windowManager == null || bottomMaskView != null) return
+
+        val density = resources.displayMetrics.density
+        val resId = resources.getIdentifier("navigation_bar_height", "dimen", "android")
+        val resHeight = if (resId > 0) resources.getDimensionPixelSize(resId) else 0
+        val maskHeight = if (resHeight > 0) resHeight else (26 * density).toInt()
+
+        bottomMaskParams = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            maskHeight,
+            getOverlayType(),
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                    WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.BOTTOM or Gravity.FILL_HORIZONTAL
+            x = 0
+            y = 0
+            alpha = 1.0f
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            }
+        }
+
+        bottomMaskView = View(this).apply {
+            // 纯黑背景，与 MeeGo OLED 纯黑桌面完美融为一体，彻底遮挡系统底部小白条
+            setBackgroundColor(Color.BLACK)
+            // 仅在处于桌面时展示，切入第三方应用后立即隐藏，完全不干扰其他应用
+            visibility = if (isInLauncher) View.VISIBLE else View.GONE
+            // 消费底部区域的触控事件，彻底屏蔽系统原生底部手势干扰
+            setOnTouchListener { _, _ -> true }
+        }
+
+        try {
+            windowManager?.addView(bottomMaskView, bottomMaskParams)
+            Log.d(TAG, "MeeGo bottom mask created successfully (initial inLauncher=$isInLauncher, height=$maskHeight)")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error adding bottom mask view", e)
+        }
+    }
+
     private fun createCardOverlay() {
         if (windowManager == null || cardOverlayLayout != null) return
 
@@ -405,21 +493,11 @@ class EdgeSwipeGestureService : AccessibilityService() {
         }
 
         cardOverlayLayout = FrameLayout(this).apply {
-            setBackgroundColor(Color.BLACK)
+            setBackgroundColor(Color.TRANSPARENT)
             visibility = View.GONE
         }
 
-        // 1. 底层纯黑保底垫层：完全覆盖全屏，从根源杜绝底层正在运行的第三方应用透光或露角
-        val solidBackdrop = View(this).apply {
-            layoutParams = FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT
-            )
-            setBackgroundColor(Color.BLACK)
-        }
-        cardOverlayLayout?.addView(solidBackdrop)
-
-        // 2. 真实底层桌面背景层 (Application Grid 或 Multitasking View 快照，100% 不透明)
+        // 真实底层桌面背景层 (Application Grid 或 Multitasking View 快照，100% 不透明全屏贴合)
         desktopBackgroundImageView = ImageView(this).apply {
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
@@ -524,23 +602,93 @@ class EdgeSwipeGestureService : AccessibilityService() {
 
     private fun getCurrentTaskId(): Int? {
         val curPkg = LaunchOriginTracker.currentPackageName
-        val trackerTaskId = LaunchOriginTracker.currentTaskId
 
-        // 1. 如果 LaunchOriginTracker 已经记录了有效的前台任务 ID，优先使用
-        if (trackerTaskId != null && curPkg != null) {
+        // 1. 优先读取守护进程实时探测记录的前台 Task ID（真实运行中应用的任务栈 ID）
+        val fileTaskId = readTaskIdFromFile()
+        val filePkg = readCurrentPkgFromFile()
+
+        if (fileTaskId != null) {
+            // 若守护进程记录了包名且与当前包名匹配，或当前包名为 null，强力优先采用
+            if (curPkg == null || filePkg == null || filePkg == curPkg) {
+                LaunchOriginTracker.currentTaskId = fileTaskId
+                if (filePkg != null && LaunchOriginTracker.currentPackageName == null) {
+                    LaunchOriginTracker.currentPackageName = filePkg
+                }
+                return fileTaskId
+            }
+        }
+
+        // 2. 如果是从多任务卡片明确点击唤起的任务，使用 trackerTaskId
+        val trackerTaskId = LaunchOriginTracker.currentTaskId
+        if (trackerTaskId != null) {
             return trackerTaskId
         }
 
-        // 2. 从守护进程的 current_task_id.txt 读取
-        return readTaskIdFromFile() ?: trackerTaskId
+        // 3. 从 recent_tasks.json 按当前包名匹配
+        if (curPkg != null) {
+            val foundId = findTaskIdForPackage(curPkg)
+            if (foundId != null) {
+                LaunchOriginTracker.currentTaskId = foundId
+                return foundId
+            }
+        }
+
+        return fileTaskId
     }
 
     private fun readTaskIdFromFile(): Int? {
+        return readIntFromFile(File(filesDir, "current_task_id.txt"))
+            ?: readIntFromFile(File("/data/local/tmp/current_task_id.txt"))
+    }
+
+    private fun readCurrentPkgFromFile(): String? {
+        return readTextFromFile(File(filesDir, "current_app_pkg.txt"))
+            ?: readTextFromFile(File("/data/local/tmp/current_app_pkg.txt"))
+    }
+
+    private fun readIntFromFile(file: File): Int? {
         return try {
-            val taskIdFile = File("/data/local/tmp/current_task_id.txt")
-            if (taskIdFile.exists() && taskIdFile.canRead()) {
-                taskIdFile.readText().trim().toIntOrNull()
+            if (file.exists() && file.canRead()) {
+                file.readText().trim().toIntOrNull()
             } else null
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun readTextFromFile(file: File): String? {
+        return try {
+            if (file.exists() && file.canRead()) {
+                val t = file.readText().trim()
+                if (t.isNotEmpty()) t else null
+            } else null
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun findTaskIdForPackage(pkg: String): Int? {
+        return try {
+            val candidateFiles = listOf(
+                File(filesDir, "recent_tasks.json"),
+                File("/data/local/tmp/recent_tasks.json")
+            )
+            for (f in candidateFiles) {
+                if (f.exists() && f.canRead()) {
+                    val text = f.readText().trim()
+                    if (text.isNotEmpty() && text != "[]") {
+                        val array = JSONArray(text)
+                        for (i in 0 until array.length()) {
+                            val obj = array.getJSONObject(i)
+                            if (obj.optString("packageName") == pkg) {
+                                val tid = obj.optInt("taskId", -1)
+                                if (tid != -1) return tid
+                            }
+                        }
+                    }
+                }
+            }
+            null
         } catch (e: Exception) {
             null
         }
@@ -548,18 +696,23 @@ class EdgeSwipeGestureService : AccessibilityService() {
 
     private fun startSwipeOutAnimation(isLeft: Boolean) {
         setGestureActive(true)
+        cancelSafetyDismiss()
+        pendingDismiss = false
+        isCardAnimatingOut = false
+        cardOverlayLayout?.animate()?.cancel()
+        cardOverlayLayout?.alpha = 1.0f
 
         // 1. 设置当前运行应用的卡片画面
         val snapBitmap = loadLatestSnapshot()
         val curTaskId = getCurrentTaskId()
-        val curPkg = LaunchOriginTracker.currentPackageName
+        val curPkg = LaunchOriginTracker.currentPackageName ?: readCurrentPkgFromFile()
 
         if (snapBitmap != null) {
             cardImageView?.setImageBitmap(snapBitmap)
             cardImageView?.scaleType = ImageView.ScaleType.FIT_XY
             cardImageView?.setBackgroundColor(Color.TRANSPARENT)
             if (curTaskId != null) {
-                TaskSnapshotCache.put(curTaskId, snapBitmap)
+                TaskSnapshotCache.put(curTaskId, snapBitmap, curPkg)
                 TaskSnapshotCache.lastSwipedTaskId = curTaskId
             }
             if (curPkg != null) {
@@ -596,8 +749,10 @@ class EdgeSwipeGestureService : AccessibilityService() {
         if (desktopBitmap != null) {
             desktopBackgroundImageView?.setImageBitmap(desktopBitmap)
             desktopBackgroundImageView?.visibility = View.VISIBLE
+            cardOverlayLayout?.setBackgroundColor(Color.TRANSPARENT)
         } else {
             desktopBackgroundImageView?.visibility = View.GONE
+            cardOverlayLayout?.setBackgroundColor(Color.BLACK)
         }
         desktopBackgroundImageView?.scaleX = 1.0f
         desktopBackgroundImageView?.scaleY = 1.0f
@@ -630,45 +785,42 @@ class EdgeSwipeGestureService : AccessibilityService() {
         if (deltaX >= threshold) {
             // 达到 1/2 屏幕: 顺势飞出屏幕 (Slide-out)
             val targetX = if (isLeft) screenWidth.toFloat() else -screenWidth.toFloat()
+            isCardAnimatingOut = true
+            pendingDismiss = false
 
             // 确保将当前滑出界面的真实快照存入 TaskSnapshotCache，供 Multitasking View 立即渲染
             val currentTaskId = getCurrentTaskId()
+            val curPkg = LaunchOriginTracker.currentPackageName ?: readCurrentPkgFromFile()
             val snapBitmap = (cardImageView?.drawable as? android.graphics.drawable.BitmapDrawable)?.bitmap
             if (snapBitmap != null && cardImageView?.scaleType == ImageView.ScaleType.FIT_XY) {
                 if (currentTaskId != null) {
-                    TaskSnapshotCache.put(currentTaskId, snapBitmap)
+                    TaskSnapshotCache.put(currentTaskId, snapBitmap, curPkg)
                     TaskSnapshotCache.lastSwipedTaskId = currentTaskId
                 }
-                if (LaunchOriginTracker.currentPackageName != null) {
-                    TaskSnapshotCache.lastSwipedPackageName = LaunchOriginTracker.currentPackageName
+                if (curPkg != null) {
+                    TaskSnapshotCache.lastSwipedPackageName = curPkg
                 }
                 TaskSnapshotCache.lastSwipedBitmap = snapBitmap
             }
 
-            // 1. 立即以无动画模式唤起桌面，让系统在后台并行装载 MainActivity
+            // 1. 立即以无动画模式唤起桌面，让系统在后台并行装载并渲染 MainActivity
             triggerReturnToLauncher()
 
             cardContainer?.animate()
                 ?.translationX(targetX)
                 ?.scaleX(0.85f)
                 ?.scaleY(0.85f)
-                ?.setDuration(220)
-                ?.setInterpolator(DecelerateInterpolator())
-                ?.start()
-
-            desktopBackgroundImageView?.animate()
-                ?.scaleX(1.0f)
-                ?.scaleY(1.0f)
-                ?.alpha(1.0f)
-                ?.setDuration(220)
+                ?.setDuration(200)
                 ?.setInterpolator(DecelerateInterpolator())
                 ?.setListener(object : AnimatorListenerAdapter() {
                     override fun onAnimationEnd(animation: Animator) {
-                        // 飞出动画完成：隐藏滑出的卡片
+                        isCardAnimatingOut = false
                         cardContainer?.visibility = View.GONE
-                        // 注意：保持 desktopBackgroundImageView 遮罩显示，绝不提前隐藏！
-                        // 覆盖在最上层的 desktopBackgroundImageView 继续平滑盖住旧应用，直到 MainActivity.onResume() 的首帧就绪通知 dismissOverlay()
-                        scheduleSafetyDismiss()
+                        if (pendingDismiss) {
+                            executeSmoothDismiss()
+                        } else {
+                            scheduleSafetyDismiss()
+                        }
                     }
                 })
                 ?.start()
@@ -711,7 +863,8 @@ class EdgeSwipeGestureService : AccessibilityService() {
             putExtra(MainActivity.EXTRA_TARGET_PAGE, targetPage)
             putExtra("ts", System.currentTimeMillis())
         }
-        startActivity(intent)
+        val options = ActivityOptions.makeCustomAnimation(this, 0, 0)
+        startActivity(intent, options.toBundle())
     }
 
     private fun loadOriginDesktopSnapshot(): Bitmap? {
@@ -753,57 +906,75 @@ class EdgeSwipeGestureService : AccessibilityService() {
     private fun loadLatestSnapshot(): Bitmap? {
         return try {
             val currentTaskId = getCurrentTaskId() ?: return null
+            val curPkg = LaunchOriginTracker.currentPackageName ?: readCurrentPkgFromFile()
 
-            // 1. 优先读取该任务专属的 live 实时截图
-            val liveFile = File("/data/local/tmp/snapshots/${currentTaskId}_live.png")
-            if (liveFile.exists() && liveFile.length() > 0) {
-                val bmp = loadBitmapFromFile(liveFile.absolutePath)
-                if (bmp != null) {
-                    Log.d(TAG, "Loaded live snapshot for task $currentTaskId from ${liveFile.name}")
-                    return bmp
-                }
-            }
-
-            // 2. 检查全局 current_app.png，但【严格校验】所有权：current_app_tid.txt 必须精确等于 currentTaskId！
-            val tidFile = File("/data/local/tmp/current_app_tid.txt")
-            if (tidFile.exists() && tidFile.readText().trim() == currentTaskId.toString()) {
-                val currentAppFile = File("/data/local/tmp/current_app.png")
-                if (currentAppFile.exists() && currentAppFile.length() > 0) {
-                    val bmp = loadBitmapFromFile(currentAppFile.absolutePath)
+            // 1. 优先读取该任务专属的 live 实时截图 (必须优先检查 App 私有目录，突破 Android 16 对 /data/local/tmp/snapshots 软链接的权限隔离)
+            val candidateLiveFiles = listOf(
+                File(filesDir, "snapshots/${currentTaskId}_live.png"),
+                File("/data/local/tmp/snapshots/${currentTaskId}_live.png")
+            )
+            for (liveFile in candidateLiveFiles) {
+                if (liveFile.exists() && liveFile.length() > 0 && liveFile.canRead()) {
+                    val bmp = loadBitmapFromFile(liveFile.absolutePath)
                     if (bmp != null) {
-                        Log.d(TAG, "Loaded verified live screen snapshot from current_app.png for task $currentTaskId")
+                        Log.d(TAG, "Loaded live snapshot for task $currentTaskId from ${liveFile.absolutePath}")
                         return bmp
                     }
                 }
             }
 
-            // 3. 读取系统生成的该任务专属快照文件 (绝对专属当前 taskId，杜绝跨任务混淆)
-            val taskSnapReduced = File("/data/local/tmp/snapshots/${currentTaskId}_reduced.jpg")
-            if (taskSnapReduced.exists() && taskSnapReduced.length() > 0) {
-                val bmp = loadBitmapFromFile(taskSnapReduced.absolutePath)
-                if (bmp != null) {
-                    Log.d(TAG, "Loaded snapshot for task $currentTaskId (reduced)")
-                    return bmp
-                }
-            }
-            val taskSnapFull = File("/data/local/tmp/snapshots/$currentTaskId.jpg")
-            if (taskSnapFull.exists() && taskSnapFull.length() > 0) {
-                val bmp = loadBitmapFromFile(taskSnapFull.absolutePath)
-                if (bmp != null) {
-                    Log.d(TAG, "Loaded snapshot for task $currentTaskId (full)")
-                    return bmp
+            // 2. 检查全局 current_app.png，严格校验所有权（current_app_tid 或 current_app_pkg 必须精确匹配）
+            val tidFromTidFile = readIntFromFile(File(filesDir, "current_app_tid.txt"))
+                ?: readIntFromFile(File("/data/local/tmp/current_app_tid.txt"))
+            val pkgFromPkgFile = readTextFromFile(File(filesDir, "current_app_pkg.txt"))
+                ?: readTextFromFile(File("/data/local/tmp/current_app_pkg.txt"))
+
+            val isOwnershipVerified = (tidFromTidFile == currentTaskId) ||
+                    (curPkg != null && pkgFromPkgFile == curPkg)
+
+            if (isOwnershipVerified) {
+                val candidateCurrentApp = listOf(
+                    File(filesDir, "current_app.png"),
+                    File("/data/local/tmp/current_app.png")
+                )
+                for (currentAppFile in candidateCurrentApp) {
+                    if (currentAppFile.exists() && currentAppFile.length() > 0 && currentAppFile.canRead()) {
+                        val bmp = loadBitmapFromFile(currentAppFile.absolutePath)
+                        if (bmp != null) {
+                            Log.d(TAG, "Loaded verified live screen snapshot from ${currentAppFile.absolutePath} for task $currentTaskId ($curPkg)")
+                            return bmp
+                        }
+                    }
                 }
             }
 
-            // 4. 读取当前任务专属内存缓存
+            // 3. 读取系统生成的该任务专属快照文件 (支持私有目录与 tmp 目录)
+            val candidateSysFiles = listOf(
+                File(filesDir, "snapshots/${currentTaskId}_reduced.jpg"),
+                File(filesDir, "snapshots/${currentTaskId}.jpg"),
+                File("/data/local/tmp/snapshots/${currentTaskId}_reduced.jpg"),
+                File("/data/local/tmp/snapshots/$currentTaskId.jpg")
+            )
+            for (taskSnapFile in candidateSysFiles) {
+                if (taskSnapFile.exists() && taskSnapFile.length() > 0 && taskSnapFile.canRead()) {
+                    val bmp = loadBitmapFromFile(taskSnapFile.absolutePath)
+                    if (bmp != null) {
+                        Log.d(TAG, "Loaded snapshot for task $currentTaskId from ${taskSnapFile.absolutePath}")
+                        return bmp
+                    }
+                }
+            }
+
+            // 4. 读取当前任务专属内存缓存 (优先按 taskId，次选按当前包名)
             val cached = TaskSnapshotCache.get(currentTaskId)
+                ?: (if (curPkg != null) TaskSnapshotCache.getByPackage(curPkg) else null)
             if (cached != null) {
-                Log.d(TAG, "Loaded snapshot from TaskSnapshotCache for task $currentTaskId")
+                Log.d(TAG, "Loaded snapshot from TaskSnapshotCache for task $currentTaskId ($curPkg)")
                 return cached
             }
 
             // 5. 严格隔离：若该任务尚无快照，坚决不读取任何其他任务的画面！
-            Log.w(TAG, "No snapshot available for task $currentTaskId")
+            Log.w(TAG, "No snapshot available for task $currentTaskId ($curPkg)")
             null
         } catch (e: Exception) {
             Log.e(TAG, "Failed to load snapshot", e)
@@ -831,12 +1002,14 @@ class EdgeSwipeGestureService : AccessibilityService() {
         try {
             if (leftTriggerView != null) windowManager?.removeView(leftTriggerView)
             if (rightTriggerView != null) windowManager?.removeView(rightTriggerView)
+            if (bottomMaskView != null) windowManager?.removeView(bottomMaskView)
             if (cardOverlayLayout != null) windowManager?.removeView(cardOverlayLayout)
         } catch (e: Exception) {
             e.printStackTrace()
         } finally {
             leftTriggerView = null
             rightTriggerView = null
+            bottomMaskView = null
             cardOverlayLayout = null
         }
     }

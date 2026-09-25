@@ -7,8 +7,11 @@ import androidx.compose.animation.core.spring
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.LocalOverscrollConfiguration
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.pager.HorizontalPager
@@ -21,7 +24,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.util.VelocityTracker
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalViewConfiguration
 import androidx.compose.ui.unit.dp
 import com.meego.launcher.data.RootTaskProvider
 import com.meego.launcher.model.AppItem
@@ -31,6 +38,7 @@ import com.meego.launcher.model.RecentTask
 import com.meego.launcher.ui.theme.MeeGoBlack
 import com.meego.launcher.ui.theme.MeeGoCyan
 import kotlin.math.abs
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 
 private const val SCREEN_COUNT = 3
@@ -60,6 +68,12 @@ fun HomeScreen(
     // 三屏无限循环水平滑动 Pager (Events Feed <-> Application Grid <-> Multitasking View)
     val pagerState = rememberPagerState(initialPage = INITIAL_PAGE, pageCount = { TOTAL_PAGES })
     var showSettings by remember { mutableStateOf(false) }
+    var scrollJob by remember { mutableStateOf<Job?>(null) }
+
+    val density = LocalDensity.current
+    val viewConfig = LocalViewConfiguration.current
+    val edgeWidthPx = with(density) { 36.dp.toPx() }
+    val touchSlop = viewConfig.touchSlop
 
     val currentScreen = Math.floorMod(pagerState.currentPage, SCREEN_COUNT)
 
@@ -87,30 +101,127 @@ fun HomeScreen(
         modifier = modifier
             .fillMaxSize()
             .background(MeeGoBlack)
+            .pointerInput(showSettings) {
+                if (showSettings) return@pointerInput
+                awaitEachGesture {
+                    val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                    val startX = down.position.x
+                    val isLeftEdge = startX <= edgeWidthPx
+                    val isRightEdge = startX >= size.width - edgeWidthPx
+
+                    // 核心准则：仅当触控起始点严格位于左右屏幕边缘（36dp 区域内）时才启动三屏边缘切屏手势探测；
+                    // 屏幕中央区域（如 Application Grid）一律完全放行，零阻断、零冲突
+                    if (!isLeftEdge && !isRightEdge) {
+                        return@awaitEachGesture
+                    }
+
+                    val startPage = pagerState.currentPage
+                    var isEdgeHorizontalDrag: Boolean? = null
+                    val velocityTracker = VelocityTracker()
+                    velocityTracker.addPosition(down.uptimeMillis, down.position)
+
+                    while (true) {
+                        val event = awaitPointerEvent(pass = PointerEventPass.Initial)
+                        val change = event.changes.firstOrNull { it.id == down.id } ?: break
+
+                        if (!change.pressed) {
+                            if (isEdgeHorizontalDrag == true) {
+                                val velocity = velocityTracker.calculateVelocity().x
+                                val totalDx = change.position.x - startX
+                                val threshold = size.width * 0.18f
+
+                                val destinationPage = if (isRightEdge) {
+                                    // 从右边缘向左划入，目标为下一屏 (startPage + 1)
+                                    if (totalDx < -threshold || velocity < -600f) {
+                                        startPage + 1
+                                    } else {
+                                        startPage
+                                    }
+                                } else {
+                                    // 从左边缘向右划入，目标为上一屏 (startPage - 1)
+                                    if (totalDx > threshold || velocity > 600f) {
+                                        startPage - 1
+                                    } else {
+                                        startPage
+                                    }
+                                }
+
+                                scrollJob?.cancel()
+                                scrollJob = coroutineScope.launch {
+                                    pagerState.animateScrollToPage(
+                                        page = destinationPage,
+                                        animationSpec = spring(dampingRatio = 0.82f, stiffness = 380f)
+                                    )
+                                }
+                            }
+                            break
+                        }
+
+                        velocityTracker.addPosition(change.uptimeMillis, change.position)
+
+                        val dx = change.position.x - startX
+                        val dy = change.position.y - down.position.y
+
+                        if (isEdgeHorizontalDrag == null) {
+                            val absDx = abs(dx)
+                            val absDy = abs(dy)
+                            if (absDx > touchSlop || absDy > touchSlop) {
+                                if (absDx > absDy) {
+                                    // 水平位移严格大于垂直位移，且方向必须是从边缘向屏幕内部滑入
+                                    if ((isLeftEdge && dx > 0) || (isRightEdge && dx < 0)) {
+                                        isEdgeHorizontalDrag = true
+                                        scrollJob?.cancel()
+                                        change.consume()
+                                    } else {
+                                        isEdgeHorizontalDrag = false
+                                        break
+                                    }
+                                } else {
+                                    // 垂直位移大于水平位移，说明用户是在边缘附近上下滑动网格或列表，坚决不拦截
+                                    isEdgeHorizontalDrag = false
+                                    break
+                                }
+                            }
+                        } else if (isEdgeHorizontalDrag == true) {
+                            val deltaX = change.position.x - change.previousPosition.x
+                            change.consume()
+                            pagerState.dispatchRawDelta(-deltaX)
+                        }
+                    }
+                }
+            }
     ) {
         Column(modifier = Modifier.fillMaxSize()) {
-            HorizontalPager(
-                state = pagerState,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .weight(1f)
-            ) { page ->
-                val actualPage = Math.floorMod(page, SCREEN_COUNT)
-                when (actualPage) {
-                    0 -> FeedScreen()
-                    1 -> AppGridScreen(
-                        apps = apps,
-                        columns = gridColumns,
-                        onOpenSettings = { showSettings = true }
-                    )
-                    2 -> MultitaskingScreen(
-                        tasks = recentTasks,
-                        taskProvider = taskProvider,
-                        onTaskRemoved = onTaskRemoved,
-                        onClearAll = onClearAllTasks,
-                        columns = recentsColumns,
-                        onColumnsChanged = onSelectRecentsColumns
-                    )
+            CompositionLocalProvider(
+                LocalOverscrollConfiguration provides null
+            ) {
+                HorizontalPager(
+                    state = pagerState,
+                    userScrollEnabled = false,
+                    beyondBoundsPageCount = 1,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f)
+                ) { page ->
+                    val actualPage = Math.floorMod(page, SCREEN_COUNT)
+                    when (actualPage) {
+                        0 -> FeedScreen()
+                        1 -> AppGridScreen(
+                            apps = apps,
+                            columns = gridColumns,
+                            onOpenSettings = { showSettings = true },
+                            isVisible = (currentScreen == 1)
+                        )
+                        2 -> MultitaskingScreen(
+                            tasks = recentTasks,
+                            taskProvider = taskProvider,
+                            onTaskRemoved = onTaskRemoved,
+                            onClearAll = onClearAllTasks,
+                            columns = recentsColumns,
+                            onColumnsChanged = onSelectRecentsColumns,
+                            isVisible = (currentScreen == 2)
+                        )
+                    }
                 }
             }
 
@@ -118,7 +229,7 @@ fun HomeScreen(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(bottom = 12.dp),
+                    .padding(bottom = 30.dp),
                 horizontalArrangement = Arrangement.Center,
                 verticalAlignment = Alignment.CenterVertically
             ) {

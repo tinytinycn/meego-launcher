@@ -7,6 +7,7 @@ import android.os.VibrationEffect
 import android.os.Vibrator
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.fadeIn
@@ -15,6 +16,7 @@ import androidx.compose.animation.scaleIn
 import androidx.compose.animation.scaleOut
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.LocalOverscrollConfiguration
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
@@ -22,6 +24,9 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.ui.input.nestedscroll.nestedScroll
+import com.meego.launcher.ui.components.rememberMeeGoBounceController
+import com.meego.launcher.ui.components.rememberMeeGoFlingBehavior
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material3.Icon
@@ -69,6 +74,7 @@ fun MultitaskingScreen(
     onClearAll: () -> Unit,
     columns: Int = 2,
     onColumnsChanged: (Int) -> Unit = {},
+    isVisible: Boolean = true,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -82,7 +88,13 @@ fun MultitaskingScreen(
     LaunchedEffect(columns) {
         val target = if (columns == 3) 0.0f else 1.0f
         if (animProgress.targetValue != target) {
-            animProgress.animateTo(target, spring(dampingRatio = 0.78f, stiffness = 380f))
+            animProgress.animateTo(target, spring(dampingRatio = 0.96f, stiffness = 450f))
+        }
+    }
+
+    LaunchedEffect(tasks.isEmpty()) {
+        if (tasks.isEmpty()) {
+            isEditMode = false
         }
     }
 
@@ -113,6 +125,14 @@ fun MultitaskingScreen(
     val baseH = cardHeight3 + (cardHeight2 - cardHeight3) * p
 
     val scrollState = rememberScrollState()
+    val flingBehavior = rememberMeeGoFlingBehavior()
+    val bounceController = rememberMeeGoBounceController()
+
+    LaunchedEffect(isVisible) {
+        if (!isVisible) {
+            bounceController.reset()
+        }
+    }
     val scrollYDp = with(density) { scrollState.value.toDp() }
     val stackStartY = maxOf(16.dp, scrollYDp + 16.dp)
 
@@ -125,6 +145,8 @@ fun MultitaskingScreen(
     val baseContainerH = height3 + (height2 - height3) * p
     val containerHeight = maxOf(baseContainerH, baseContainerH + (heightStack - baseContainerH) * stackWeight)
 
+    val currentColumns by rememberUpdatedState(columns)
+    val currentOnColumnsChanged by rememberUpdatedState(onColumnsChanged)
     var isPinching by remember { mutableStateOf(false) }
 
     Box(
@@ -165,13 +187,16 @@ fun MultitaskingScreen(
                                 val currentVal = animProgress.value
                                 val targetP = if (currentVal < 0.5f) 0.0f else 1.0f
                                 val targetCols = if (targetP == 0.0f) 3 else 2
+                                val initialCols = if (startProgress < 0.5f) 3 else 2
+                                val willChange = targetCols != initialCols || targetCols != currentColumns
+
                                 coroutineScope.launch {
                                     animProgress.animateTo(
                                         targetP,
-                                        spring(dampingRatio = 0.78f, stiffness = 380f)
+                                        spring(dampingRatio = 0.96f, stiffness = 450f)
                                     )
-                                    if (targetCols != columns) {
-                                        onColumnsChanged(targetCols)
+                                    if (willChange) {
+                                        currentOnColumnsChanged(targetCols)
                                         vibrate(context)
                                     }
                                 }
@@ -221,7 +246,7 @@ fun MultitaskingScreen(
                             coroutineScope.launch {
                                 animProgress.animateTo(
                                     newTarget,
-                                    spring(dampingRatio = 0.78f, stiffness = 380f)
+                                    spring(dampingRatio = 0.96f, stiffness = 450f)
                                 )
                                 onColumnsChanged(newCols)
                                 vibrate(context)
@@ -245,16 +270,36 @@ fun MultitaskingScreen(
                     )
                 }
             } else {
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .verticalScroll(scrollState)
+                CompositionLocalProvider(
+                    LocalOverscrollConfiguration provides null
                 ) {
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(containerHeight)
+                            .weight(1f)
+                            .nestedScroll(bounceController.nestedScrollConnection)
+                            .graphicsLayer {
+                                translationY = bounceController.overscrollOffset
+                            }
                     ) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .verticalScroll(scrollState, flingBehavior = flingBehavior)
+                                .clickable(
+                                    interactionSource = remember { MutableInteractionSource() },
+                                    indication = null
+                                ) {
+                                    if (isEditMode) {
+                                        isEditMode = false
+                                    }
+                                }
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(containerHeight)
+                            ) {
                         tasks.forEachIndexed { i, task ->
                             // 2 列网格目标位置
                             val col2 = i % 2
@@ -286,19 +331,20 @@ fun MultitaskingScreen(
 
                             key(task.taskId) {
                                 // 卡片坐标平滑位移动画：当后台任务重新排序时，C卡片由后方顺滑移动至第一位，AB卡片向后顺位移位
+                                // 适当降低刚度（stiffness = 140f）并搭配临界轻阻尼（dampingRatio = 0.92f），使卡片在 C A B 顺序重排换位过程中动画时长自然延伸至约 400~450ms，视觉呈现优雅丝滑、无晃动感
                                 val animX by animateDpAsState(
                                     targetValue = currentX,
                                     animationSpec = spring(
-                                        dampingRatio = 0.78f,
-                                        stiffness = 300f
+                                        dampingRatio = 0.92f,
+                                        stiffness = 140f
                                     ),
                                     label = "card_x_${task.taskId}"
                                 )
                                 val animY by animateDpAsState(
                                     targetValue = currentY,
                                     animationSpec = spring(
-                                        dampingRatio = 0.78f,
-                                        stiffness = 300f
+                                        dampingRatio = 0.92f,
+                                        stiffness = 140f
                                     ),
                                     label = "card_y_${task.taskId}"
                                 )
@@ -360,34 +406,38 @@ fun MultitaskingScreen(
                 }
             }
         }
+    }
+}
 
-        // 底部一键清理所有任务按钮 (MeeGo 经典圆形白叉)
-        if (tasks.isNotEmpty()) {
-            Box(
+        // 底部一键清理所有任务按钮 (MeeGo 原生交互：只有长按卡片进入编辑模式后才展示)
+        AnimatedVisibility(
+            visible = isEditMode && tasks.isNotEmpty(),
+            enter = fadeIn() + scaleIn(initialScale = 0.8f),
+            exit = fadeOut() + scaleOut(targetScale = 0.8f),
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(bottom = 28.dp)
+        ) {
+            IconButton(
+                onClick = {
+                    coroutineScope.launch {
+                        isEditMode = false
+                        taskProvider.removeAllTasks(tasks)
+                        onClearAll()
+                        vibrate(context)
+                    }
+                },
                 modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .padding(bottom = 28.dp)
+                    .size(52.dp)
+                    .clip(SquircleShape(2.732f))
+                    .background(MeeGoCardBg)
             ) {
-                IconButton(
-                    onClick = {
-                        coroutineScope.launch {
-                            taskProvider.removeAllTasks(tasks)
-                            onClearAll()
-                            vibrate(context)
-                        }
-                    },
-                    modifier = Modifier
-                        .size(52.dp)
-                        .clip(SquircleShape())
-                        .background(MeeGoCardBg)
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Close,
-                        contentDescription = "Close all",
-                        tint = MeeGoTextWhite,
-                        modifier = Modifier.size(24.dp)
-                    )
-                }
+                Icon(
+                    imageVector = Icons.Default.Close,
+                    contentDescription = "Close all",
+                    tint = MeeGoTextWhite,
+                    modifier = Modifier.size(24.dp)
+                )
             }
         }
     }

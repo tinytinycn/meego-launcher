@@ -1,0 +1,3 @@
+# Enable auto-env through sdkman
+java=17.0.1-open
+gradle=8.5

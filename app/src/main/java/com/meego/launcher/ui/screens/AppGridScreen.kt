@@ -22,6 +22,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.PointerEventPass
@@ -31,6 +32,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalViewConfiguration
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.graphics.drawable.toBitmap
@@ -42,7 +45,6 @@ import com.meego.launcher.ui.components.rememberMeeGoBounceController
 import com.meego.launcher.ui.components.rememberMeeGoFlingBehavior
 import com.meego.launcher.ui.theme.MeeGoCardBg
 import com.meego.launcher.ui.theme.MeeGoCyan
-import com.meego.launcher.ui.theme.MeeGoTextDim
 import com.meego.launcher.ui.theme.MeeGoTextWhite
 import com.meego.launcher.util.ScreenCaptureHelper
 import kotlinx.coroutines.Job
@@ -59,19 +61,33 @@ fun AppGridScreen(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
-    val iconSize = if (columns == 4) 62.dp else 52.dp
-    val fontSize = if (columns == 4) 12.sp else 11.sp
     val bounceController = rememberMeeGoBounceController()
     val gridState = rememberLazyGridState()
     val flingBehavior = rememberMeeGoFlingBehavior()
     val coroutineScope = rememberCoroutineScope()
     val touchSlop = LocalViewConfiguration.current.touchSlop
-    var flingJob by remember { mutableStateOf<Job?>(null) }
+    // 用非快照 Holder 保存 fling Job：Job 的启停/赋值不会触发任何重组，
+    // 原实现用 mutableStateOf<Job?>，每次起手/抬手都会写一次快照状态。
+    val flingJob = remember { JobHolder() }
+
+    // 注意：apps 是 SnapshotStateList，主流程用 clear()+addAll() 更新，
+    // 其“实例引用”永不变化，只有内容变化。若对它做 remember(apps) 缓存，
+    // 会永久锁死首次（空列表）快照。因此这里直接透传 apps：
+    // items() 读取快照状态本身已是正确且廉价的做法，真正的滑动期开销在 key 拼接，已由 gridKey 解决。
+
+    // 列数 → 图标尺寸/字号 收敛到 remember(columns)。
+    // 避免在每个 item 的组合中重复做条件判断与装箱分配。
+    val metrics = remember(columns) { GridMetrics.from(columns) }
+
+    // 预取（§3.3）：Compose foundation 1.6.2 中 `LazyGridState.prefetchingEnabled` 为 internal，
+    // 编译期不可访问；实测反编译确认其默认即为 true，且预取由 onScroll 驱动 ——
+    // 本项目自研手势走 dispatchRawDelta -> scrollableState.dispatchRawDelta -> onScroll 链路，
+    // 因此框架预取在本项目手势路径下同样生效，无需（也无法）在此显式开启。
+    // beyondBoundsItemCount / prefetchItemCount 属 Compose 1.7+ API，本项目锁定 1.6.2 不适用。
 
     LaunchedEffect(isVisible) {
         if (!isVisible) {
-            flingJob?.cancel()
-            flingJob = null
+            flingJob.cancelAndClear()
             bounceController.reset()
         }
     }
@@ -128,8 +144,7 @@ fun AppGridScreen(
                     .pointerInput(Unit) {
                         awaitEachGesture {
                             val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
-                            flingJob?.cancel()
-                            flingJob = null
+                            flingJob.cancelAndClear()
                             var lastY = down.position.y
                             var totalDy = 0f
                             var dragging = false
@@ -165,7 +180,7 @@ fun AppGridScreen(
                                 if (abs(releaseVelocity) > 20f) {
                                     // 手指速度换算为列表速度方向（取反），复用统一的自适应增益 Fling 引擎
                                     val flingVelocity = -releaseVelocity
-                                    flingJob = coroutineScope.launch {
+                                    flingJob.set(coroutineScope.launch {
                                         val sink = object : ScrollScope {
                                             override fun scrollBy(pixels: Float): Float {
                                                 val consumed = gridState.dispatchRawDelta(pixels)
@@ -178,7 +193,7 @@ fun AppGridScreen(
                                         }
                                         val leftVelocity = with(flingBehavior) { sink.performFling(flingVelocity) }
                                         bounceController.releaseOverscroll(-leftVelocity)
-                                    }
+                                    })
                                 } else {
                                     bounceController.releaseOverscroll(releaseVelocity)
                                 }
@@ -196,13 +211,14 @@ fun AppGridScreen(
                 ) {
                     items(
                         items = apps,
-                        key = { it.packageName + it.activityName },
+                        // 使用 AppItem 构造期预计算好的稳定 key，避免每次 measure 都做字符串拼接
+                        key = { it.gridKey },
                         contentType = { "app_item" }
                     ) { app ->
                         AppGridItem(
                             app = app,
-                            iconSize = iconSize,
-                            fontSize = fontSize,
+                            iconSize = metrics.iconSize,
+                            fontSize = metrics.fontSize,
                             onClick = {
                                 if (app.isMeeGoSettings) {
                                     onOpenSettings()
@@ -218,11 +234,39 @@ fun AppGridScreen(
     }
 }
 
+/**
+ * 非快照的 Job 持有器。
+ * 避免使用 `mutableStateOf<Job?>`：那会在每次手指抬起/落下的赋值时写入快照状态，
+ * 触发一次无效重组。Fling Job 的生命周期只需要跟随手势，不需要驱动 UI。
+ */
+private class JobHolder {
+    var job: Job? = null
+    fun set(value: Job) { job = value }
+    fun cancelAndClear() {
+        job?.cancel()
+        job = null
+    }
+}
+
+/** 列数 → 图标尺寸/字号的收敛映射，避免在每个 item 中重复分支。 */
+private data class GridMetrics(
+    val iconSize: Dp,
+    val fontSize: TextUnit
+) {
+    companion object {
+        fun from(columns: Int): GridMetrics = when (columns) {
+            4 -> GridMetrics(62.dp, 12.sp)
+            5 -> GridMetrics(52.dp, 11.sp)
+            else -> GridMetrics(56.dp, 12.sp)
+        }
+    }
+}
+
 @Composable
 private fun AppGridItem(
     app: AppItem,
-    iconSize: androidx.compose.ui.unit.Dp,
-    fontSize: androidx.compose.ui.unit.TextUnit,
+    iconSize: Dp,
+    fontSize: TextUnit,
     onClick: () -> Unit
 ) {
     Column(
@@ -235,6 +279,26 @@ private fun AppGridItem(
                 onClick = onClick
             )
     ) {
+        // 预解码的 ImageBitmap 走主线程零分配直绘；仅当缺失时才准备 Drawable 回退位图。
+        val iconBitmap = app.iconBitmap ?: if (app.icon != null) {
+            remember(app.icon) {
+                try {
+                    app.icon.toBitmap(128, 128).asImageBitmap()
+                } catch (e: Exception) {
+                    null
+                }
+            }
+        } else {
+            null
+        }
+
+        // 图标：走框架级 clip + background + Image 直绘。
+        //
+        // 实测结论（docs/perf/perf_grid_after-opt_*.md）：改为在 drawBehind 内用
+        // clipPath() 手工裁剪虽少一层布局节点，却让每项每帧产生一次真实 canvas clip，
+        // 「Slow issue draw commands」由 5 飙到 46，jank 15.7%→21.5%，明显劣化。
+        // 原因是 Modifier.clip 走 RenderNode 的 clip 变换（近乎免费），
+        // 而 drawBehind 里的 clipPath 必须下发一条绘制指令。故保留框架路径。
         Box(
             modifier = Modifier
                 .size(iconSize)
@@ -242,29 +306,13 @@ private fun AppGridItem(
                 .background(MeeGoCardBg),
             contentAlignment = Alignment.Center
         ) {
-            val iconBitmap = app.iconBitmap
             if (iconBitmap != null) {
-                // 优先直接绘制异步预渲染的 ImageBitmap，主线程零内存分配，绝对满帧流畅
+                // 优先直接绘制异步预渲染的 ImageBitmap，主线程零内存分配
                 Image(
                     bitmap = iconBitmap,
-                    contentDescription = app.label,
+                    contentDescription = null,
                     modifier = Modifier.fillMaxSize()
                 )
-            } else if (app.icon != null) {
-                val fallbackBitmap = remember(app.icon) {
-                    try {
-                        app.icon.toBitmap(128, 128)
-                    } catch (e: Exception) {
-                        null
-                    }
-                }
-                if (fallbackBitmap != null) {
-                    Image(
-                        bitmap = fallbackBitmap.asImageBitmap(),
-                        contentDescription = app.label,
-                        modifier = Modifier.fillMaxSize()
-                    )
-                }
             }
         }
 

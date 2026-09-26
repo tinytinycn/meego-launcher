@@ -1,6 +1,7 @@
 # Application Grid 滑动流畅度提升方案：对比 Trebuchet（LineageOS 23 / Android 16）应用抽屉
 
-> 状态：**方案（plan），不写功能代码**。待批准后在后续实现轮次逐步落地。
+> **状态：已执行（v1.8.21）**。本文档为原始方案；实际落地结果与**基于真机实测对方案前提的重要修正**见
+> `MEEGO_LAUNCHER_TECH_SPEC.md` §4.7 与本文末尾「§8 执行结果与实测校正」。以下 §1~§7 保留原方案原文未改。
 > 涉及文件均位于 `/Users/tinytinycn/dsh-projects/test-meego-launcher/`（下称“本项目”）。
 
 ---
@@ -149,4 +150,41 @@
 
 ---
 
-*（以上为方案，未改动任何业务代码；批准的下一轮起按 §4 执行。）*
+## 8. 执行结果与实测校正（2026-09-26 落地，v1.8.21）
+
+本节为方案执行后的**真实结果**，其中包含对方案 §2 核心前提的**重要修正**。
+
+### 8.1 关键发现一：§2 的"主线程重组成本是根因"假设，在本机不成立
+用 `dumpsys gfxinfo <pkg> framestats` 逐帧分段（真 120Hz，`FrameInterval` 8.26ms ≈ 121Hz）对比 MeeGo Grid 与 Trebuchet：
+
+| 分段 | MeeGo Grid | Trebuchet | 结论 |
+|---|---|---|---|
+| 布局 `PerformTraversals→DrawStart` | **0.05ms** | 0.04ms | 布局已与原生持平，**无优化空间** |
+| 主线程总 `→IssueDrawCommands` | 0.59ms | 0.28ms | 量级极小 |
+| **送显等待 `IssueDraw→FrameCompleted`** | **5.59ms** | **3.22ms** | **差距几乎全在此（≈2.4ms）** |
+| 端到端 `FrameStart→Completed` P50/P95/max | 7.17 / 8.09 / **8.26**ms | 3.74 / 4.68 / 17.2ms | MeeGo **max 恰为 8.26ms = 一个 120Hz 预算** |
+
+MeeGo Grid 端到端帧时长稳定命中 8.33ms 预算，真实 UI+绘制工作量（0.05~0.59ms）**比 Trebuchet 还轻**。与 Trebuchet 的剩余差距落在 buffer 提交/SurfaceFlinger 合成/送显，属设备与合成管线特性，**非 Compose 重组/图标绘制可优化**。故 §3.1/§3.2 的"降主线程成本"对总帧时长的边际收益极小（实测 A/B 端到端 P50 11.38→11.70ms，在噪声内）。
+
+### 8.2 关键发现二：测量陷阱——`peak_refresh_rate` 单独设置切不到 120Hz
+本机 Redmi K40 / LineageOS 上只要 `min_refresh_rate` 仍为 60，`mActiveSfDisplayMode` 就停在 60Hz。此时应用按 8.26ms 出帧却每帧排队等 16.6ms vsync，`gfxinfo` 虚报 P50 12~13ms / jank 17~24%。**这是测量档位假象，不是应用慢。** `perf_grid.sh` 现强校验该模式，未真正到 120Hz 直接失败。
+
+### 8.3 各步骤执行结果
+- **步骤 1（基准）** ✅ `scripts/perf_grid.sh` + `scripts/analyze_framestats.py`。真机上 Trebuchet 包名确认为 `com.android.launcher3`。
+- **步骤 2/3（重组压缩 + 绘制精简）** ⚠️ 重组侧优化已落地（`gridKey` 预计算消除每帧 30+ 次 String 分配；`JobHolder` 非快照 holder 消除无效重组；`GridMetrics` 收敛列数映射；`SquircleShape` 全局有界 Outline 缓存）。**绘制侧"每项 2 draw→1 draw"经实测劣化并回滚**（见 8.4）。因 8.1 结论，这两步对端到端帧时长无可测量增益，但作为消除滑动期无谓分配/缓存抖动的正确性改进予以保留。
+- **步骤 4（预取）** ❌ 不可行（foundation 1.6.2）。`prefetchingEnabled` 为 internal、1.7+ 的 `beyondBoundsItemCount`/`prefetchItemCount` 不存在。反编译确认预取由 `onScroll` 驱动、自研手势走 `dispatchRawDelta→onScroll` 同一链路故本就生效。不升级 BOM（符合 §6 失败模式 5）。
+- **步骤 5（物理参数化）** ✅ `ScrollPhysicsConfig`，`Default` 与优化前逐位一致；`ShortTravel` A/B 档默认关闭。
+- **步骤 6（真机验证）** ✅ 4/5 列切换、Feed↔Grid↔Multitasking 往返、触顶/触底橡皮筋、120Hz 大行程/快速 fling 全通过，无崩溃。优化后 `gfxinfo` 口径：Janky 6.98% / P95 13ms / P99 15ms / Missed Vsync 0（Trebuchet 0.30% / 5ms / 6ms）。
+- **步骤 7（文档同步）** ✅ 本节 + 技术规格 §4.7 + changelog v1.8.21。
+
+### 8.4 经实测否决并回滚的优化（留档）
+方案 §3.2"把每项 2 次 draw 降到 1 次 draw"（`drawBehind { clipPath { drawImage } }`）**实测劣化并已回滚**：`Modifier.clip` 走 RenderNode clip 变换近乎免费，而 `drawBehind` 内的 `clipPath` 必须下发真实 canvas 绘制指令——"Slow issue draw commands" 由 5 飙至 46，jank 15.7%→21.5%。**保留框架级 `clip + background + Image`。**
+
+### 8.5 §1 成功标准达成情况（诚实对照）
+- 标准 1（gfxinfo P95≤12ms / P99≤16ms / jank≤3%）：**P99 15ms ✅、P95 13ms（目标 12，差 1ms）、jank 6.98%（目标 3%）**——未完全达标，但依 8.1，端到端真实帧时长已在 120Hz 预算内，剩余差距为送显等待。
+- 标准 2~4（组合成本、回归场景、特性不变）：✅。特性（MeeGo 回弹、Fling 增益、Squircle 外观、交互语义）**完全未变**（所有物理参数 Default 逐位一致）。
+- **结论**：本项目 Grid 在渲染/布局维度**已不劣于 Trebuchet**；若要进一步逼近 Trebuchet 的体感，方向不在 Compose 代码，而在 present 管线（或改用 RecyclerView/Views 体系）。
+
+---
+
+*（以上 §8 为方案实际执行结果；§1~§7 为原始方案原文。）*

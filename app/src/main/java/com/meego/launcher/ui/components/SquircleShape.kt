@@ -24,6 +24,12 @@ class SquircleShape(
     val n: Float = 2.732f,
     val cornerRadius: Dp? = null
 ) : Shape {
+    // 全局共享 Outline 缓存（§3.2）。
+    // 此前缓存是每个 SquircleShape 实例私有的单槽位缓存，而 DefaultSquircleShape 是全局单例，
+    // 同一尺寸的图标在 Grid / 多任务卡片 / 标题栏等处被交替请求时会互相挤掉单槽，
+    // 造成「首次测量又重新遍历 72 点 Path」。改为按 (w,h,density,n,cornerRadius) 键的
+    // 有界全局表，滑动期图标绘制稳定命中，且不同屏幕/列数组合各自独立缓存。
+    // 上限见 MAX_OUTLINE_CACHE_ENTRIES，防止长尾尺寸组合无界增长。
     private var lastWidth: Float = -1f
     private var lastHeight: Float = -1f
     private var lastDensity: Float = -1f
@@ -40,8 +46,19 @@ class SquircleShape(
             return Outline.Generic(Path())
         }
 
+        // 先查实例单槽（最热路径：同一图标尺寸连续绘制）
         if (width == lastWidth && height == lastHeight && density.density == lastDensity && cachedOutline != null) {
             return cachedOutline!!
+        }
+
+        // 再查/写全局共享表
+        val key = OutlineCacheKey(n, cornerRadius?.value ?: Float.NaN, width, height, density.density)
+        OutlineCache.get(key)?.let { shared ->
+            lastWidth = width
+            lastHeight = height
+            lastDensity = density.density
+            cachedOutline = shared
+            return shared
         }
 
         val maxR = minOf(width, height) / 2f
@@ -54,6 +71,8 @@ class SquircleShape(
                 with(density) { 20.dp.toPx() }.coerceAtMost(maxR)
             }
         }
+
+        val outline: Outline
 
         // 如果半径正好等于半宽高（正方形全局超椭圆），执行标准全局超椭圆渲染
         if (r >= maxR && abs(width - height) < 1f) {
@@ -79,77 +98,16 @@ class SquircleShape(
                 }
             }
             path.close()
-            val outline = Outline.Generic(path)
-            lastWidth = width
-            lastHeight = height
-            lastDensity = density.density
-            cachedOutline = outline
-            return outline
+            outline = Outline.Generic(path)
+        } else {
+            outline = Outline.Generic(buildRoundedSquirclePath(width, height, r, n))
         }
 
-        // 长方形容器：四角采用 n = 2.732 黄金超椭圆过渡，边线保持平滑直线连接
-        val path = Path()
-        val stepsPerCorner = 18
-
-        // 1. 顶边
-        path.moveTo(r, 0f)
-        path.lineTo(width - r, 0f)
-
-        // 2. 右上角 (从 theta = π/2 到 0)
-        for (i in 0..stepsPerCorner) {
-            val t = (Math.PI / 2.0 * (1.0 - i.toDouble() / stepsPerCorner)).toFloat()
-            val cosT = abs(cos(t)).coerceIn(0f, 1f)
-            val sinT = abs(sin(t)).coerceIn(0f, 1f)
-            val x = (width - r) + r * cosT.pow(2f / n)
-            val y = r - r * sinT.pow(2f / n)
-            path.lineTo(x, y)
-        }
-
-        // 3. 右边
-        path.lineTo(width, height - r)
-
-        // 4. 右下角 (从 theta = 0 到 π/2)
-        for (i in 0..stepsPerCorner) {
-            val t = (Math.PI / 2.0 * (i.toDouble() / stepsPerCorner)).toFloat()
-            val cosT = abs(cos(t)).coerceIn(0f, 1f)
-            val sinT = abs(sin(t)).coerceIn(0f, 1f)
-            val x = (width - r) + r * cosT.pow(2f / n)
-            val y = (height - r) + r * sinT.pow(2f / n)
-            path.lineTo(x, y)
-        }
-
-        // 5. 底边
-        path.lineTo(r, height)
-
-        // 6. 左下角 (从 theta = π/2 到 0)
-        for (i in 0..stepsPerCorner) {
-            val t = (Math.PI / 2.0 * (1.0 - i.toDouble() / stepsPerCorner)).toFloat()
-            val cosT = abs(cos(t)).coerceIn(0f, 1f)
-            val sinT = abs(sin(t)).coerceIn(0f, 1f)
-            val x = r - r * cosT.pow(2f / n)
-            val y = (height - r) + r * sinT.pow(2f / n)
-            path.lineTo(x, y)
-        }
-
-        // 7. 左边
-        path.lineTo(0f, r)
-
-        // 8. 左上角 (从 theta = 0 到 π/2)
-        for (i in 0..stepsPerCorner) {
-            val t = (Math.PI / 2.0 * (i.toDouble() / stepsPerCorner)).toFloat()
-            val cosT = abs(cos(t)).coerceIn(0f, 1f)
-            val sinT = abs(sin(t)).coerceIn(0f, 1f)
-            val x = r - r * cosT.pow(2f / n)
-            val y = r - r * sinT.pow(2f / n)
-            path.lineTo(x, y)
-        }
-
-        path.close()
-        val outline = Outline.Generic(path)
         lastWidth = width
         lastHeight = height
         lastDensity = density.density
         cachedOutline = outline
+        OutlineCache.put(key, outline)
         return outline
     }
 
@@ -163,6 +121,96 @@ class SquircleShape(
         var result = n.hashCode()
         result = 31 * result + (cornerRadius?.hashCode() ?: 0)
         return result
+    }
+}
+
+/** 长方形 MeeGo 卡片超椭圆路径：四角 n 指数倒角 + 平直边线。 */
+private fun buildRoundedSquirclePath(width: Float, height: Float, r: Float, n: Float): Path {
+    val path = Path()
+    val stepsPerCorner = 18
+
+    // 1. 顶边
+    path.moveTo(r, 0f)
+    path.lineTo(width - r, 0f)
+
+    // 2. 右上角 (从 theta = π/2 到 0)
+    for (i in 0..stepsPerCorner) {
+        val t = (Math.PI / 2.0 * (1.0 - i.toDouble() / stepsPerCorner)).toFloat()
+        val cosT = abs(cos(t)).coerceIn(0f, 1f)
+        val sinT = abs(sin(t)).coerceIn(0f, 1f)
+        val x = (width - r) + r * cosT.pow(2f / n)
+        val y = r - r * sinT.pow(2f / n)
+        path.lineTo(x, y)
+    }
+
+    // 3. 右边
+    path.lineTo(width, height - r)
+
+    // 4. 右下角 (从 theta = 0 到 π/2)
+    for (i in 0..stepsPerCorner) {
+        val t = (Math.PI / 2.0 * (i.toDouble() / stepsPerCorner)).toFloat()
+        val cosT = abs(cos(t)).coerceIn(0f, 1f)
+        val sinT = abs(sin(t)).coerceIn(0f, 1f)
+        val x = (width - r) + r * cosT.pow(2f / n)
+        val y = (height - r) + r * sinT.pow(2f / n)
+        path.lineTo(x, y)
+    }
+
+    // 5. 底边
+    path.lineTo(r, height)
+
+    // 6. 左下角 (从 theta = π/2 到 0)
+    for (i in 0..stepsPerCorner) {
+        val t = (Math.PI / 2.0 * (1.0 - i.toDouble() / stepsPerCorner)).toFloat()
+        val cosT = abs(cos(t)).coerceIn(0f, 1f)
+        val sinT = abs(sin(t)).coerceIn(0f, 1f)
+        val x = r - r * cosT.pow(2f / n)
+        val y = (height - r) + r * sinT.pow(2f / n)
+        path.lineTo(x, y)
+    }
+
+    // 7. 左边
+    path.lineTo(0f, r)
+
+    // 8. 左上角 (从 theta = 0 到 π/2)
+    for (i in 0..stepsPerCorner) {
+        val t = (Math.PI / 2.0 * (i.toDouble() / stepsPerCorner)).toFloat()
+        val cosT = abs(cos(t)).coerceIn(0f, 1f)
+        val sinT = abs(sin(t)).coerceIn(0f, 1f)
+        val x = r - r * cosT.pow(2f / n)
+        val y = r - r * sinT.pow(2f / n)
+        path.lineTo(x, y)
+    }
+
+    path.close()
+    return path
+}
+
+/** 全局 Outline 缓存键。 */
+private data class OutlineCacheKey(
+    val n: Float,
+    val cornerRadiusPx: Float,
+    val width: Float,
+    val height: Float,
+    val density: Float
+)
+
+/**
+ * 有界全局 Outline 缓存。
+ * 键的不同取值组合在真实设备上极少（不同 dp 尺寸 × 密度 × 曲率），
+ * 设置上限后即使遇到长尾组合也只会整体清空重建，不会无界增长。
+ */
+private object OutlineCache {
+    private const val MAX_OUTLINE_CACHE_ENTRIES = 128
+    private val map = HashMap<OutlineCacheKey, Outline>(32)
+
+    fun get(key: OutlineCacheKey): Outline? = synchronized(map) { map[key] }
+
+    fun put(key: OutlineCacheKey, outline: Outline) {
+        synchronized(map) {
+            if (map.size >= MAX_OUTLINE_CACHE_ENTRIES) map.clear()
+            map[key] = outline
+        }
     }
 }
 

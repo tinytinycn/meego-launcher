@@ -22,3 +22,11 @@ screenshots/
 *.png
 yavg.txt
 frames_*
+
+# 沙箱内本地构建环境（GRADLE_USER_HOME 副本 / TMPDIR / 构建环境脚本）
+/.gradle-local/
+/.tmp-build/
+/.build-env.sh
+
+# 性能基准原始输出（报告按需提交，gfxinfo 原始 dump 不入库）
+docs/perf/gfxinfo_*.txt

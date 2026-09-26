@@ -78,7 +78,17 @@ data class AppItem(
     val icon: Drawable? = null,
     val iconBitmap: ImageBitmap? = null,
     val isMeeGoSettings: Boolean = false
-)
+) {
+    /**
+     * LazyVerticalGrid 的稳定 key，构造时一次性算好。
+     *
+     * 性能要点：此前 `key = { it.packageName + it.activityName }` 会在每次 measure/recycle
+     * 时对列表中的每个可见项做一次字符串拼接（30+ 应用 = 每帧 30+ 次 String 分配），
+     * 属于典型的滑动期主线程分配抖动。改为在 data class 构造时预计算成不可变字段，
+     * key lambda 退化为一次字段读取。
+     */
+    val gridKey: String = packageName + "/" + activityName
+}
 
 data class RecentTask(
     val taskId: Int,

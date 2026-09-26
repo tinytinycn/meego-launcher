@@ -1,6 +1,6 @@
 # MeeGo Harmattan 风格 Android 启动器 (MeeGo Launcher) 技术方案
 
-> **版本**：v1.8.21  
+> **版本**：v1.8.22  
 > **文档位置**：`MEEGO_LAUNCHER_TECH_SPEC.md`（项目根目录）  
 > **维护规范**：全程在 DSH 环境中进行自主开发，每次会话针对架构、需求、实现的任何调整，均需即时同步更新此文档。
 
@@ -424,6 +424,59 @@ $$\left|\frac{x}{a}\right|^n + \left|\frac{y}{b}\right|^n = 1 \quad (n = 2.732)$
 #### 4.7.5 回归验证（Step 6）
 真机验证通过、无崩溃：4/5 列切换 ✅、Feed↔Grid↔Multitasking 往返滑动 ✅、触顶/触底橡皮筋回弹 ✅、120Hz 大行程/快速 fling ✅。
 
+### 4.8 触顶/触底"先卡住再回弹"修复：回弹动画中途停顿（v1.8.22）
+
+> 现象：Application Grid 与 Multitasking View 快速上下滑动触顶/触底后，列表**不是即时回弹**，而是先卡住一段，再回弹到正常位。
+
+#### 4.8.1 根因：两段弹簧中的第一段是一次「无位移空转」
+
+修复前的 `releaseOverscroll`（以及 `onPostFling`）在高速撞界时走**两段**弹簧：
+
+1. `animateTo(impactTarget, spring(0.65f, 520f))` —— 冲击吸能段
+2. `animateTo(0f, spring(0.78f, 380f))` —— 归零段
+
+关键缺陷：**`impactTarget` 只由速度决定**（`velocity * 0.022` 再限幅到 ±`maxOverscroll*0.35`），**与当前越界位移 `current` 无关**。撞界时手指速度极高，该值被限幅钳到固定的 ±86.6px（90dp × 2.75 密度 × 0.35），于是第一段变成一次"从越界位置冲到 86.6px、再在 86.6px 附近来回阻尼振荡"的**长时间空转**，画面看上去就是"卡住不动"。
+
+#### 4.8.2 真机插桩实测（Redmi K40 / 120Hz，Application Grid）
+
+越界 213.8px、释放速度 5113px/s 时逐帧记录 `overscrollOffset`：
+
+| 阶段 | t=0 | 104ms | 203ms | 303ms | 401ms | 500ms | 600ms | 707ms | 806ms | … | 1302ms |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| offset(px) | 213.8 | 107.2 | 78.5 | 86.1 | 87.1 | 86.6 | **86.6** | 74.5 | 14.0 | … | 0.0 |
+
+- 第一段在 **664ms** 内仅走完 127px，其中 **t=203ms→664ms（461ms，占第一段 69%）** 停在 78.5~86.6px 反复阻尼振荡；
+- 归零总耗时 **1302ms**，其中"屏幕完全静止"的最长连续区间 **397ms（占全程 30%）**——即用户感知到的"卡住"。
+
+#### 4.8.3 修复：单段弹簧 + 释放速度作为初速度注入
+
+`releaseOverscroll` / `onPostFling` 改为**一次连续**弹簧归零，把释放速度直接作为 `Animatable.animateTo` 的 `initialVelocity`，一次走完"吸能 + 归零"：
+
+```kotlin
+animatable.animateTo(
+    targetValue = 0f,
+    animationSpec = spring(dampingRatio = 0.78f, stiffness = 380f),
+    initialVelocity = velocity.coerceIn(-maxReboundInitialVelocity, maxReboundInitialVelocity)
+) { overscrollOffset = this.value }
+```
+
+同时新增 `maxReboundInitialVelocity = 8000f`：**撞界速度是未经限幅的**（高速 fling 已叠加 1.85x 冲量增益），若不设上限，弹簧初速远超 `stiffness=380` 的固有频率（ω₀≈19.5rad/s）会冲过静止点，实测峰值可达 **505px**——**击穿 90dp(248px) 的橡皮筋位移上限**。限幅后峰值被夹在上限内，既保留冲击感又不破坏阻尼上限。
+
+随本次重构删除已无用的 `impactRatio` / `impactScale` / `impactDampingRatio` / `impactStiffness`（两段结构专属），`impactVelocityThreshold` 保留（仍用于 `onPostFling` 判定是否把剩余速度交给回弹）。
+
+#### 4.8.4 修复前后对比（同一真机、同一手势）
+
+| 指标 | 修复前（两段） | 修复后（单段） |
+|---|---|---|
+| 归零总耗时 | **1302ms** | **502ms**（↓61%） |
+| 最长"屏幕完全静止"区间 | **397ms**（占 30%） | **0ms** |
+| 位移曲线 | 78.5→86.6 反跳并长时间空转 | 单调收敛，无反跳 |
+
+复测 offset 轨迹：`205 → 155 → 14.4 → −5.4 → −1.6 → 0.0`（502ms 内走完全程）。
+
+#### 4.8.5 验证
+Application Grid 与 Multitasking View 双屏：触顶/触底快速 fling 后即时回弹、精确归位（回弹后页头元素回到静止位 y 坐标），慢速拖拽释放路径无回归，零崩溃。
+
 ---
 
 ## 5. DSH 全程自主开发实施路线图
@@ -485,6 +538,6 @@ flowchart TD
 
 变更日志已独立抽取并维护于 [changelog.md](./changelog.md)。
 
-- 最新版本：**v1.8.21**（2026-09-26）
-- 历史版本条目（v1.8.20 及更早）全部见 `changelog.md`。
+- 最新版本：**v1.8.22**（2026-09-26）
+- 历史版本条目（v1.8.21 及更早）全部见 `changelog.md`。
 

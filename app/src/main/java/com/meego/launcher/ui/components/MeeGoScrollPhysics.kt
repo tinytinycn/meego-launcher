@@ -95,6 +95,90 @@ class MeeGoBounceScrollController(
         overscrollOffset = 0f
     }
 
+    /**
+     * 手动拖拽驱动：先消化已有越界拉伸位移；
+     * 返回真正应交给列表滚动的剩余位移（与原生 NestedScrollConnection.onPreScroll 语义一致）。
+     */
+    fun consumeOverscrollForDrag(dy: Float): Float {
+        reboundJob?.cancel()
+        reboundJob = null
+        val current = overscrollOffset
+        if (abs(current) < 0.5f) {
+            if (current != 0f) overscrollOffset = 0f
+            return dy
+        }
+        return if (current > 0f && dy < 0f) {
+            val target = current + dy
+            if (target >= 0f) {
+                overscrollOffset = target
+                0f
+            } else {
+                overscrollOffset = 0f
+                target
+            }
+        } else if (current < 0f && dy > 0f) {
+            val target = current + dy
+            if (target <= 0f) {
+                overscrollOffset = target
+                0f
+            } else {
+                overscrollOffset = 0f
+                target
+            }
+        } else {
+            dy
+        }
+    }
+
+    /**
+     * 手动拖拽驱动：列表已到底/顶后，把未能消费的剩余位移转成非线性阻尼橡皮筋拉伸。
+     */
+    fun pullOverscroll(leftover: Float) {
+        if (abs(leftover) < 0.01f) return
+        reboundJob?.cancel()
+        reboundJob = null
+        val current = overscrollOffset
+        val currentRatio = (abs(current) / maxOverscrollPx).coerceIn(0f, 1f)
+        val damping = (0.42f * (1f - currentRatio * 0.65f)).coerceIn(0.12f, 0.42f)
+        overscrollOffset = (current + leftover * damping).coerceIn(-maxOverscrollPx, maxOverscrollPx)
+    }
+
+    /**
+     * 手动拖拽/惯性结束驱动：越界则弹簧平滑归零，高速撞界则先做一次冲击吸能再归零。
+     */
+    fun releaseOverscroll(velocity: Float) {
+        val current = overscrollOffset
+        if (abs(current) < 0.5f) {
+            overscrollOffset = 0f
+            return
+        }
+        reboundJob?.cancel()
+        val absV = abs(velocity)
+        reboundJob = coroutineScope.launch {
+            try {
+                animatable.snapTo(overscrollOffset)
+                if (absV > 120f) {
+                    val maxImpact = maxOverscrollPx * 0.35f
+                    val impactTarget = (velocity * 0.022f).coerceIn(-maxImpact, maxImpact)
+                    animatable.animateTo(
+                        targetValue = impactTarget,
+                        animationSpec = spring(dampingRatio = 0.65f, stiffness = 520f)
+                    ) {
+                        overscrollOffset = this.value
+                    }
+                }
+                animatable.animateTo(
+                    targetValue = 0f,
+                    animationSpec = spring(dampingRatio = 0.78f, stiffness = 380f)
+                ) {
+                    overscrollOffset = this.value
+                }
+            } finally {
+                overscrollOffset = 0f
+            }
+        }
+    }
+
     val nestedScrollConnection: NestedScrollConnection = object : NestedScrollConnection {
         override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
             // 仅当用户手指物理接触屏幕拖拽时才取消回弹动画（由手指接管控制）

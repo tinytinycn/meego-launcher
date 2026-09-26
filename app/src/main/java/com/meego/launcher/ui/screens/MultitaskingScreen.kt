@@ -20,11 +20,13 @@ import androidx.compose.foundation.LocalOverscrollConfiguration
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.gestures.ScrollScope
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.ui.input.nestedscroll.nestedScroll
 import com.meego.launcher.ui.components.rememberMeeGoBounceController
 import com.meego.launcher.ui.components.rememberMeeGoFlingBehavior
 import androidx.compose.material.icons.Icons
@@ -39,10 +41,13 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.util.VelocityTracker
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalViewConfiguration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -61,8 +66,10 @@ import com.meego.launcher.ui.theme.MeeGoRed
 import com.meego.launcher.ui.theme.MeeGoTextDim
 import com.meego.launcher.ui.theme.MeeGoTextWhite
 import com.meego.launcher.util.ScreenCaptureHelper
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlin.math.PI
+import kotlin.math.abs
 import kotlin.math.sin
 
 @OptIn(ExperimentalFoundationApi::class)
@@ -127,9 +134,13 @@ fun MultitaskingScreen(
     val scrollState = rememberScrollState()
     val flingBehavior = rememberMeeGoFlingBehavior()
     val bounceController = rememberMeeGoBounceController()
+    val touchSlop = LocalViewConfiguration.current.touchSlop
+    var flingJob by remember { mutableStateOf<Job?>(null) }
 
     LaunchedEffect(isVisible) {
         if (!isVisible) {
+            flingJob?.cancel()
+            flingJob = null
             bounceController.reset()
         }
     }
@@ -277,15 +288,82 @@ fun MultitaskingScreen(
                         modifier = Modifier
                             .fillMaxWidth()
                             .weight(1f)
-                            .nestedScroll(bounceController.nestedScrollConnection)
                             .graphicsLayer {
                                 translationY = bounceController.overscrollOffset
+                            }
+                            // 自研纵向滚动手势驱动（与 AppGridScreen 同源方案）。
+                            // 背景：HorizontalPager 多页共存时，相邻页滚动过后内建 scrollable 的拖拽
+                            // 位移派发会失效（事件被消费但 scrollState.value 不推进），表现为
+                            // “列表不跟手、只有抬起手指后才滚动”。此处以 Initial pass 接管单指纵向拖拽，
+                            // 直接用 scrollState.dispatchRawDelta 驱动滚动；一旦出现第二根手指立即让位，
+                            // 保证双指无级缩放（Pinch）零干扰。
+                            .pointerInput(Unit) {
+                                awaitEachGesture {
+                                    val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                                    flingJob?.cancel()
+                                    flingJob = null
+                                    var lastY = down.position.y
+                                    var totalDy = 0f
+                                    var dragging = false
+                                    val velocityTracker = VelocityTracker()
+                                    velocityTracker.addPosition(down.uptimeMillis, down.position)
+                                    while (true) {
+                                        val event = awaitPointerEvent(PointerEventPass.Initial)
+                                        val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                        if (!change.pressed) break
+                                        // 双指按下：立刻放弃单指滚动，完整让位给外层 Pinch 手势
+                                        if (event.changes.count { it.pressed } >= 2) {
+                                            dragging = false
+                                            break
+                                        }
+                                        velocityTracker.addPosition(change.uptimeMillis, change.position)
+                                        val dy = change.position.y - lastY
+                                        lastY = change.position.y
+                                        totalDy += dy
+                                        if (!dragging && abs(totalDy) > touchSlop) dragging = true
+                                        if (dragging) {
+                                            // 在 Initial pass 消费位移，阻止内建 scrollable 重复接管造成双倍滚动
+                                            change.consume()
+                                            // 手指位移 -> 列表位移方向换算（dispatchRawDelta 正值 = 内容上移）
+                                            val forListFinger = bounceController.consumeOverscrollForDrag(dy)
+                                            val listDelta = -forListFinger
+                                            val consumed = scrollState.dispatchRawDelta(listDelta)
+                                            val leftoverFinger = -(listDelta - consumed)
+                                            if (abs(leftoverFinger) > 0.01f) {
+                                                bounceController.pullOverscroll(leftoverFinger)
+                                            }
+                                        }
+                                    }
+                                    if (dragging) {
+                                        val releaseVelocity = velocityTracker.calculateVelocity().y
+                                        if (abs(releaseVelocity) > 20f) {
+                                            // 手指速度换算为列表速度方向（取反），复用统一的自适应增益 Fling 引擎
+                                            val flingVelocity = -releaseVelocity
+                                            flingJob = coroutineScope.launch {
+                                                val sink = object : ScrollScope {
+                                                    override fun scrollBy(pixels: Float): Float {
+                                                        val consumed = scrollState.dispatchRawDelta(pixels)
+                                                        val leftoverFinger = -(pixels - consumed)
+                                                        if (abs(leftoverFinger) > 0.5f) {
+                                                            bounceController.pullOverscroll(leftoverFinger)
+                                                        }
+                                                        return consumed
+                                                    }
+                                                }
+                                                val leftVelocity = with(flingBehavior) { sink.performFling(flingVelocity) }
+                                                bounceController.releaseOverscroll(-leftVelocity)
+                                            }
+                                        } else {
+                                            bounceController.releaseOverscroll(releaseVelocity)
+                                        }
+                                    }
+                                }
                             }
                     ) {
                         Box(
                             modifier = Modifier
                                 .fillMaxSize()
-                                .verticalScroll(scrollState, flingBehavior = flingBehavior)
+                                .verticalScroll(scrollState)
                                 .clickable(
                                     interactionSource = remember { MutableInteractionSource() },
                                     indication = null

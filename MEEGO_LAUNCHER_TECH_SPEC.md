@@ -477,6 +477,55 @@ animatable.animateTo(
 #### 4.8.5 验证
 Application Grid 与 Multitasking View 双屏：触顶/触底快速 fling 后即时回弹、精确归位（回弹后页头元素回到静止位 y 坐标），慢速拖拽释放路径无回归，零崩溃。
 
+### 4.9 越界回弹遮挡页头标题修复：滚动容器缺失越界裁剪（v1.8.23）
+
+> 现象：Application Grid 与 Multitasking View 在触顶/触底回弹过程中，图标或卡片会**压到标题上**——"Applications" / "Open Applications" 被内容盖住，甚至整行扫入状态栏区域。
+
+#### 4.9.1 根因
+
+两屏的滚动内容都放在一个带 `graphicsLayer { translationY = bounceController.overscrollOffset }` 的容器 `Box` 里（`AppGridScreen.kt` / `MultitaskingScreen.kt`），该 `Box` 是 `Column` 中位于标题 `Row` **之后**的兄弟节点。
+
+Compose **默认不对布局节点做裁剪**，因此：
+
+1. 触底/触顶时 `overscrollOffset` 把整层内容拖出自身布局边界；
+2. 越界部分照常绘制，且绘制顺序在后 → **直接覆盖在标题之上**；
+3. 越界位移上限 `maxOverscrollDp = 90dp`（440dpi 下 247.5px），而标题与滚动区顶边之间仅 `16dp`（44px）间距，远不足以容纳。
+
+关键细节：`graphicsLayer` 的 `translationY` 为**负**（触底时内容上移）才会撞上标题；触顶时为正（内容下移）反而远离标题，因此该缺陷**只在触底/向上甩动时出现**，容易被漏测。
+
+#### 4.9.2 真机实测（Redmi K40 / 1080x2400 / 440dpi）
+
+以 `screencap` 逐帧解码统计非黑像素行区间，标题带为 `y = 149..236`（高 88px）：
+
+| 帧 | 标题带 | 首行图标顶边 | 判定 |
+|---|---|---|---|
+| 静止 | 149..236 | 281 | 留白 45px，正常 |
+| 触底上拉（修复前） | 149..**561** | 605 | **标题与卡片粘连，严重遮挡** |
+| 触底上拉（修复前，更强） | **33**..396 | 441 | **内容扫入状态栏** |
+| 修复后全部 12 帧 | 149..236 | ≥281 | **恒定留白 ≥45px，零遮挡** |
+
+#### 4.9.3 修复
+
+在越界容器上、`graphicsLayer` **之前**插入 `.clipToBounds()`：
+
+```kotlin
+Box(
+    modifier = Modifier
+        .fillMaxWidth()
+        .weight(1f)
+        .clipToBounds()                       // 必须在 graphicsLayer 之前
+        .graphicsLayer { translationY = bounceController.overscrollOffset }
+) { /* LazyVerticalGrid / 卡片 */ }
+```
+
+**顺序不可调换**：Compose 中靠前的 modifier 包裹靠后的。`graphicsLayer` 放在 `clipToBounds()` 外层会把裁剪矩形一起平移，等于没有裁剪；置于其外层才能在**未平移的父坐标系**中裁掉越界内容。
+
+**性能**：`clipToBounds()` 走 RenderNode 的 clip 变换（近乎免费，不下发 canvas 绘制指令），与 §4.7 中"保留 `Modifier.clip` 而非 `drawBehind { clipPath }`"的实测结论一致。同手势 A/B 对照（各 2~3 轮 `gfxinfo`，jank 5.08% / 11.67% / 12.19% vs 基线 5.68% / 9.79%）落在同一波动区间，**无可测量的性能代价**。
+
+#### 4.9.4 验证
+
+两屏 × 触顶/触底 × 多帧采样共 12 帧，标题带恒为 `149..236`、与内容恒留 ≥45px，**零遮挡**。回归：图标点击唤起、列数胶囊打开设置、`BACK` 返回、Grid↔Multitasking↔Feed 三屏往返、Feed 滚动后返回 Grid 的 1:1 跟手（v1.8.19 行为保持）、Multitasking 长按进入编辑模式与 "Close all" 浮现，均无回归，零崩溃。
+
 ---
 
 ## 5. DSH 全程自主开发实施路线图

@@ -38,6 +38,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
@@ -288,6 +289,11 @@ fun MultitaskingScreen(
                         modifier = Modifier
                             .fillMaxWidth()
                             .weight(1f)
+                            // 越界裁剪（必须在 graphicsLayer 之前，理由同 AppGridScreen）：
+                            // 触底/触顶时整层卡片被 translationY 拖出自身边界，Compose 默认不裁剪，
+                            // 本 Box 作为 Column 中靠后的兄弟节点会直接盖住上方的 "Open Applications" 标题。
+                            // clipToBounds 走 RenderNode clip 变换，开销近乎为零。
+                            .clipToBounds()
                             .graphicsLayer {
                                 translationY = bounceController.overscrollOffset
                             }

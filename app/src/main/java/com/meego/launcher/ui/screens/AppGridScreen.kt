@@ -22,6 +22,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
@@ -131,6 +132,16 @@ fun AppGridScreen(
                 modifier = Modifier
                     .fillMaxWidth()
                     .weight(1f)
+                    // 越界裁剪（必须在 graphicsLayer 之前）。
+                    // 触底/触顶时整层网格被 translationY 拖出自身边界，而 Compose 默认不做裁剪，
+                    // 位于 Column 中靠后的本 Box 会直接盖住上方的 "Applications" 标题。
+                    // 实测（1080x2400 / 440dpi）：静止时首行图标顶边 y=281，标题带 y=149..236，
+                    // 留白仅 45px；触底上拉越界时整层上移可达 190px，图标直接覆盖标题整行。
+                    // clipToBounds 走 RenderNode 的 clip 变换（近乎免费，不下发 canvas 绘制指令），
+                    // 与本屏图标绘制保持同一 "用 Modifier.clip 而非 drawBehind{clipPath}" 的性能结论一致。
+                    // 顺序不可调换：graphicsLayer 在外会把 clip 一起平移，等于没有裁剪；
+                    // 置于其外层才能在"未平移"的父坐标系中裁掉越界内容。
+                    .clipToBounds()
                     .graphicsLayer {
                         translationY = bounceController.overscrollOffset
                     }

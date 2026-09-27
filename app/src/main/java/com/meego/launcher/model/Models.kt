@@ -73,6 +73,18 @@ data class SnapshotEntry(
 )
 
 object TaskSnapshotCache {
+    /**
+     * 滑出保序锁的有效期。
+     *
+     * 需覆盖「滑出 → 守护进程 `update_tasks` 落盘」的最大滞后。守护进程主循环
+     * 轮询间隔 2s（`meego_daemon.sh` 末尾 `sleep 2.0`），且落盘前还要做
+     * `cp` 快照同步与 JSON 组装，故取 5s 留足余量。
+     *
+     * 取值过小 → 锁在磁盘数据到达前就失效，卡片会先回弹到旧位再跳回（v1.8.13 修掉的抖动）。
+     * 取值过大 → 锁越过用户后续的唤起动作仍在置顶旧任务，即本次修复的 A D B C 缺陷。
+     */
+    private const val SWIPE_PIN_VALIDITY_MS = 5_000L
+
     private val cache = mutableMapOf<Int, Bitmap>()
     private val pkgCache = mutableMapOf<String, Bitmap>()
     private val entries = mutableMapOf<Int, SnapshotEntry>()
@@ -81,6 +93,67 @@ object TaskSnapshotCache {
     var lastSwipedTaskId: Int? = null
     var lastSwipedPackageName: String? = null
     var lastSwipedBitmap: Bitmap? = null
+
+    /**
+     * 最近一次手势滑出的时刻（epoch ms），用于判定 [lastSwipedTaskId] 是否仍然有效。
+     */
+    private var lastSwipedAtMs: Long = 0L
+
+    /**
+     * 记录一次「手势滑出」事件并盖上时刻戳。
+     *
+     * 必须经由本方法写入 [lastSwipedTaskId]，否则 [isSwipePinValid] 会因时刻戳缺失
+     * 而恒判为失效，滑出保护随之失效。
+     */
+    @Synchronized
+    fun recordSwipe(taskId: Int?, packageName: String?, bitmap: Bitmap?) {
+        if (taskId != null && taskId > 0) {
+            lastSwipedTaskId = taskId
+            lastSwipedAtMs = System.currentTimeMillis()
+        }
+        if (packageName != null) {
+            lastSwipedPackageName = packageName
+        }
+        if (bitmap != null) {
+            lastSwipedBitmap = bitmap
+        }
+    }
+
+    /**
+     * 「滑出置顶」保序锁当前是否仍然可信。
+     *
+     * 该锁存在的唯一目的，是补偿守护进程把 `dumpsys activity recents` 新顺序落盘到
+     * JSON 之前的短暂空窗期（主循环 2s 轮询 + 滑出路径的即时刷盘），使刚滑出的任务
+     * 不被陈旧数据反向拉回后方。
+     *
+     * **但它绝不能越过有效期**：一旦用户在此期间又唤起了别的应用，系统 recents 中
+     * 真正的最近使用任务已经换人，此时若仍强行置顶旧任务，就会把新任务挤到第二位，
+     * 表现为「打开 D 再退出后，卡片顺序是 A D B C 而不是 D A B C」。
+     * 根因即 `lastSwipedTaskId` 在 `remove`/`clear` 之外从无复位点，会无限期存活。
+     *
+     * 因此以时刻戳划定一个短窗口：窗口内视作「磁盘数据可能陈旧，信任置顶锁」，
+     * 窗口外视作「锁已失效，一律以系统 recents 权威顺序为准」。
+     * 窗口过期只会退化为**正确**行为，不会退化为缺陷，故该取值只需宽于落盘滞后。
+     */
+    @Synchronized
+    fun isSwipePinValid(): Boolean {
+        val id = lastSwipedTaskId ?: return false
+        if (id <= 0) return false
+        val elapsed = System.currentTimeMillis() - lastSwipedAtMs
+        return elapsed >= 0 && elapsed < SWIPE_PIN_VALIDITY_MS
+    }
+
+    /**
+     * 作废滑出保序锁。用于「用户已唤起新应用」的时刻 —— 新应用的启动优先级高于
+     * 一切历史滑出记录，旧锁在此之后再无置顶理由。
+     */
+    @Synchronized
+    fun clearSwipeRecord() {
+        lastSwipedTaskId = null
+        lastSwipedPackageName = null
+        lastSwipedBitmap = null
+        lastSwipedAtMs = 0L
+    }
 
     @Synchronized
     fun put(
@@ -119,8 +192,7 @@ object TaskSnapshotCache {
         val removed = cache.remove(taskId)
         entries.remove(taskId)
         if (lastSwipedTaskId == taskId) {
-            lastSwipedTaskId = null
-            lastSwipedBitmap = null
+            clearSwipeRecord()
         }
         // 包名索引可能仍指向该任务，顺手剔除，避免已删除任务继续被按包名命中
         if (removed != null) {
@@ -135,9 +207,7 @@ object TaskSnapshotCache {
         pkgCache.clear()
         entries.clear()
         pkgEntries.clear()
-        lastSwipedTaskId = null
-        lastSwipedPackageName = null
-        lastSwipedBitmap = null
+        clearSwipeRecord()
     }
 }
 

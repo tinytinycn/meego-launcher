@@ -179,8 +179,13 @@ class RootTaskProvider(private val context: Context) {
             }
         }
 
-        // 关键保序：若有最新手势滑出的任务，确保其绝对处于首位（杜绝守护进程落盘短暂延迟导致任务逆向重排弹跳）
-        val swipedTaskId = TaskSnapshotCache.lastSwipedTaskId
+        // 关键保序：若有最新手势滑出的任务，且该保序锁仍在有效期内，确保其绝对处于首位
+        // （杜绝守护进程落盘短暂延迟导致任务逆向重排弹跳）。
+        //
+        // 必须经 isSwipePinValid() 判定而非直接看 lastSwipedTaskId 非空：该字段除删除/清空外
+        // 从无复位点，若无有效期限制会在用户下一次唤起新应用后仍强行置顶旧任务，
+        // 使新任务被挤到第二位（实测 A D B C 缺陷）。
+        val swipedTaskId = if (TaskSnapshotCache.isSwipePinValid()) TaskSnapshotCache.lastSwipedTaskId else null
         if (swipedTaskId != null) {
             val idx = tasks.indexOfFirst { it.taskId == swipedTaskId }
             if (idx > 0) {

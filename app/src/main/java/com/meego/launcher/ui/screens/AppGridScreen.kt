@@ -41,6 +41,7 @@ import androidx.core.graphics.drawable.toBitmap
 import com.meego.launcher.model.AppItem
 import com.meego.launcher.model.LaunchOrigin
 import com.meego.launcher.model.LaunchOriginTracker
+import com.meego.launcher.model.TaskSnapshotCache
 import com.meego.launcher.ui.components.DefaultSquircleShape
 import com.meego.launcher.ui.components.meeGoTopSafeArea
 import com.meego.launcher.ui.components.rememberMeeGoBounceController
@@ -361,6 +362,13 @@ private fun launchApp(context: Context, app: AppItem) {
     LaunchOriginTracker.lastOrigin = LaunchOrigin.GRID
     LaunchOriginTracker.currentPackageName = app.packageName
     LaunchOriginTracker.currentTaskId = null // 关键：清空旧应用的 TaskId，绝不在新应用中串扰使用
+    // 关键：唤起新应用即刻作废上一次手势滑出的保序锁。
+    //
+    // 该锁只用于补偿「滑出后守护进程尚未把新顺序落盘」的短暂空窗期；而用户主动
+    // 唤起新应用时，系统 recents 中真正的最近使用任务已经换人，此刻仍在置顶旧任务
+    // 会把新任务挤到第二位 —— 即「打开 D 再退出后顺序为 A D B C 而非 D A B C」的根因。
+    // 锁只活在进程内存中，清掉不影响任何持久化状态，代价为零。
+    TaskSnapshotCache.clearSwipeRecord()
     (context as? Activity)?.let { activity ->
         ScreenCaptureHelper.captureLauncherScreen(activity, LaunchOrigin.GRID)
     }

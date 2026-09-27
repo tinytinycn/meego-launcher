@@ -503,6 +503,9 @@ fun MultitaskingScreen(
                                                 LaunchOriginTracker.lastOrigin = LaunchOrigin.RECENTS
                                                 LaunchOriginTracker.currentTaskId = task.taskId
                                                 LaunchOriginTracker.currentPackageName = task.packageName
+                                                // 与 launchApp 同理：点卡片唤起新应用时，
+                                                // 旧的滑出保序锁必须让位于新任务的置顶权
+                                                TaskSnapshotCache.clearSwipeRecord()
                                                 (context as? Activity)?.let { activity ->
                                                     ScreenCaptureHelper.captureLauncherScreen(activity, LaunchOrigin.RECENTS)
                                                 }

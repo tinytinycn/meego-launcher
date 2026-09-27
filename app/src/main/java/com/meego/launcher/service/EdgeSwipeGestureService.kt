@@ -690,12 +690,9 @@ class EdgeSwipeGestureService : AccessibilityService() {
                 .maxOfOrNull { it.lastModified() } ?: System.currentTimeMillis()
             if (curTaskId != null) {
                 TaskSnapshotCache.put(curTaskId, snapBitmap, curPkg, srcTime, isSettled = false)
-                TaskSnapshotCache.lastSwipedTaskId = curTaskId
             }
-            if (curPkg != null) {
-                TaskSnapshotCache.lastSwipedPackageName = curPkg
-            }
-            TaskSnapshotCache.lastSwipedBitmap = snapBitmap
+            // 经 recordSwipe 统一写入并盖上时刻戳，滑出保序锁才会被正确计时
+            TaskSnapshotCache.recordSwipe(curTaskId, curPkg, snapBitmap)
         } else {
             // 没有快照时，优雅显示当前应用的图标与深色背景，绝不串扰其他应用
             val icon = if (curPkg != null) {
@@ -837,12 +834,9 @@ class EdgeSwipeGestureService : AccessibilityService() {
                     .maxOfOrNull { it.lastModified() } ?: System.currentTimeMillis()
                 if (currentTaskId != null) {
                     TaskSnapshotCache.put(currentTaskId, snapBitmap, curPkg, srcTime, isSettled = false)
-                    TaskSnapshotCache.lastSwipedTaskId = currentTaskId
                 }
-                if (curPkg != null) {
-                    TaskSnapshotCache.lastSwipedPackageName = curPkg
-                }
-                TaskSnapshotCache.lastSwipedBitmap = snapBitmap
+                // 经 recordSwipe 统一写入并盖上时刻戳，滑出保序锁才会被正确计时
+                TaskSnapshotCache.recordSwipe(currentTaskId, curPkg, snapBitmap)
             }
 
             // 1. 立即以无动画模式唤起桌面，让系统在后台并行装载并渲染 MainActivity

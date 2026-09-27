@@ -72,6 +72,23 @@ data class SnapshotEntry(
     val isSettled: Boolean
 )
 
+/**
+ * 一次手势滑出的完整记录，四项内容与时刻戳**同生共死**。
+ *
+ * 把它们收进一条不可变记录（而非三个平行的 `public var`），是为了让
+ * 「写入必盖时刻戳」这一不变量在类型层面成立：不存在「只改了任务号、
+ * 忘了更新时刻戳」这种半新半旧的中间态。
+ *
+ * @param taskId 该次滑出对应的任务栈 ID。无法确定时为 null，此时不产生置顶锁。
+ * @param atMs   滑出发生的时刻（epoch ms），由 [TaskSnapshotCache.recordSwipe] 现场取。
+ */
+data class SwipeRecord(
+    val taskId: Int?,
+    val packageName: String?,
+    val bitmap: Bitmap?,
+    val atMs: Long
+)
+
 object TaskSnapshotCache {
     /**
      * 滑出保序锁的有效期。
@@ -90,69 +107,67 @@ object TaskSnapshotCache {
     private val entries = mutableMapOf<Int, SnapshotEntry>()
     private val pkgEntries = mutableMapOf<String, SnapshotEntry>()
 
-    var lastSwipedTaskId: Int? = null
-    var lastSwipedPackageName: String? = null
-    var lastSwipedBitmap: Bitmap? = null
-
     /**
-     * 最近一次手势滑出的时刻（epoch ms），用于判定 [lastSwipedTaskId] 是否仍然有效。
-     */
-    private var lastSwipedAtMs: Long = 0L
-
-    /**
-     * 记录一次「手势滑出」事件并盖上时刻戳。
+     * 最近一次手势滑出的记录。
      *
-     * 必须经由本方法写入 [lastSwipedTaskId]，否则 [isSwipePinValid] 会因时刻戳缺失
-     * 而恒判为失效，滑出保护随之失效。
+     * 刻意**私有**：滑出信息必须整条经 [recordSwipe] 写入、经 [activeSwipe] 读出。
+     * 此前三个字段是 `public var`，任何调用点都能裸写 `lastSwipedTaskId` 而漏掉时刻戳，
+     * 不变量只能靠约定维持 —— 这正是 v1.8.31 那个 A D B C 缺陷得以长成的原因。
+     * 收敛为单条私有记录后，编译期即保证外部无法绕过「写入必盖时刻戳、读取必判有效期」。
+     */
+    private var lastSwipe: SwipeRecord? = null
+
+    /**
+     * 记录一次「手势滑出」事件，并把 taskId / 包名 / 画面 / 时刻戳**原子地**写成一条记录。
+     *
+     * [taskId] 为 null 或非正时表示「滑出了但未能确定任务号」：画面与包名仍然记录
+     * （供快照回退使用），但不产生置顶锁 —— 没有任务号本就无从置顶。
+     * 这一点也意味着：包名/画面与时刻戳**总是同时更新**，不会出现
+     * 「画面是新的、时刻戳却是旧的」这种半新半旧状态。
      */
     @Synchronized
     fun recordSwipe(taskId: Int?, packageName: String?, bitmap: Bitmap?) {
-        if (taskId != null && taskId > 0) {
-            lastSwipedTaskId = taskId
-            lastSwipedAtMs = System.currentTimeMillis()
-        }
-        if (packageName != null) {
-            lastSwipedPackageName = packageName
-        }
-        if (bitmap != null) {
-            lastSwipedBitmap = bitmap
-        }
+        lastSwipe = SwipeRecord(
+            taskId = if (taskId != null && taskId > 0) taskId else null,
+            packageName = packageName,
+            bitmap = bitmap,
+            atMs = System.currentTimeMillis()
+        )
     }
 
     /**
-     * 「滑出置顶」保序锁当前是否仍然可信。
+     * 取仍然有效的滑出记录；已过期或从未记录则返回 null。
      *
-     * 该锁存在的唯一目的，是补偿守护进程把 `dumpsys activity recents` 新顺序落盘到
-     * JSON 之前的短暂空窗期（主循环 2s 轮询 + 滑出路径的即时刷盘），使刚滑出的任务
+     * 「滑出置顶」保序锁的唯一目的，是补偿守护进程把 `dumpsys activity recents`
+     * 新顺序落盘到 JSON 之前的短暂空窗期（主循环 2s 轮询），使刚滑出的任务
      * 不被陈旧数据反向拉回后方。
      *
      * **但它绝不能越过有效期**：一旦用户在此期间又唤起了别的应用，系统 recents 中
      * 真正的最近使用任务已经换人，此时若仍强行置顶旧任务，就会把新任务挤到第二位，
      * 表现为「打开 D 再退出后，卡片顺序是 A D B C 而不是 D A B C」。
-     * 根因即 `lastSwipedTaskId` 在 `remove`/`clear` 之外从无复位点，会无限期存活。
+     * 根因即滑出记录在 `remove`/`clear` 之外从无复位点，会无限期存活。
      *
      * 因此以时刻戳划定一个短窗口：窗口内视作「磁盘数据可能陈旧，信任置顶锁」，
      * 窗口外视作「锁已失效，一律以系统 recents 权威顺序为准」。
      * 窗口过期只会退化为**正确**行为，不会退化为缺陷，故该取值只需宽于落盘滞后。
+     *
+     * 这是滑出信息的**唯一**合法出口：调用方无需（也不应）自行判断有效期。
      */
     @Synchronized
-    fun isSwipePinValid(): Boolean {
-        val id = lastSwipedTaskId ?: return false
-        if (id <= 0) return false
-        val elapsed = System.currentTimeMillis() - lastSwipedAtMs
-        return elapsed >= 0 && elapsed < SWIPE_PIN_VALIDITY_MS
+    fun activeSwipe(): SwipeRecord? {
+        val record = lastSwipe ?: return null
+        val elapsed = System.currentTimeMillis() - record.atMs
+        // elapsed < 0 说明系统时钟被回拨，此时宁可保守判为失效
+        return if (elapsed in 0 until SWIPE_PIN_VALIDITY_MS) record else null
     }
 
     /**
-     * 作废滑出保序锁。用于「用户已唤起新应用」的时刻 —— 新应用的启动优先级高于
+     * 作废滑出记录。用于「用户已唤起新应用」的时刻 —— 新应用的启动优先级高于
      * 一切历史滑出记录，旧锁在此之后再无置顶理由。
      */
     @Synchronized
     fun clearSwipeRecord() {
-        lastSwipedTaskId = null
-        lastSwipedPackageName = null
-        lastSwipedBitmap = null
-        lastSwipedAtMs = 0L
+        lastSwipe = null
     }
 
     @Synchronized
@@ -191,7 +206,7 @@ object TaskSnapshotCache {
     fun remove(taskId: Int) {
         val removed = cache.remove(taskId)
         entries.remove(taskId)
-        if (lastSwipedTaskId == taskId) {
+        if (lastSwipe?.taskId == taskId) {
             clearSwipeRecord()
         }
         // 包名索引可能仍指向该任务，顺手剔除，避免已删除任务继续被按包名命中

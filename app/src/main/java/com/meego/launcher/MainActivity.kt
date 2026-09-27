@@ -215,13 +215,9 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun promoteLastSwipedTaskToTop() {
-        // 仅在保序锁有效期内才允许置顶。锁一旦过期（即用户已唤起新应用），
-        // 系统 recents 顺序才是权威来源，旧锁不得再干涉。
-        val topTaskId = if (TaskSnapshotCache.isSwipePinValid()) {
-            LaunchOriginTracker.currentTaskId ?: TaskSnapshotCache.lastSwipedTaskId
-        } else {
-            null
-        }
+        // 滑出记录已过期（即用户已唤起新应用）时返回 null，
+        // 此时系统 recents 顺序才是权威来源，旧锁不得再干涉。
+        val topTaskId = LaunchOriginTracker.currentTaskId ?: TaskSnapshotCache.activeSwipe()?.taskId
         if (topTaskId != null) {
             val idx = recentTasks.indexOfFirst { it.taskId == topTaskId }
             if (idx > 0) {
@@ -262,10 +258,10 @@ class MainActivity : ComponentActivity() {
             return
         }
 
-        // 强保序锁：如果有刚刚滑出的任务且锁仍有效，确保其始终位于列表首位，
+        // 强保序锁：如果有刚刚滑出的任务，确保其始终位于列表首位，
         // 绝对禁止因异步数据滞后导致卡片回弹到后方再切回。
-        // 锁过期后一律以守护进程（dumpsys activity recents）顺序为准。
-        val swipedId = if (TaskSnapshotCache.isSwipePinValid()) TaskSnapshotCache.lastSwipedTaskId else null
+        // 记录过期后一律以守护进程（dumpsys activity recents）顺序为准。
+        val swipedId = TaskSnapshotCache.activeSwipe()?.taskId
         val effectiveNewTasks = if (swipedId != null) {
             val idx = newTasks.indexOfFirst { it.taskId == swipedId }
             if (idx > 0) {

@@ -131,17 +131,20 @@ class RootTaskProvider(private val context: Context) {
                         }
 
                         // 1.5 严格回退：手势刚滑出的任务专属快照
-                        if (snapshotBitmap == null && taskId == TaskSnapshotCache.lastSwipedTaskId && pkgName == TaskSnapshotCache.lastSwipedPackageName) {
-                            snapshotBitmap = TaskSnapshotCache.lastSwipedBitmap
-                            if (snapshotBitmap != null) {
-                                // 滑出画面对应的是过渡态，不得标记为稳定帧
-                                snapshotIsSettled = false
-                                TaskSnapshotCache.put(
-                                    taskId, snapshotBitmap, null,
-                                    captureTimeMs = System.currentTimeMillis(),
-                                    isSettled = false
-                                )
-                            }
+                        // 取局部变量 smart-cast，避免反复解包；activeSwipe() 已内建有效期判定
+                        val swiped = TaskSnapshotCache.activeSwipe()
+                        val swipedBitmap = swiped?.bitmap
+                        if (snapshotBitmap == null && swipedBitmap != null &&
+                            taskId == swiped.taskId && pkgName == swiped.packageName
+                        ) {
+                            snapshotBitmap = swipedBitmap
+                            // 滑出画面对应的是过渡态，不得标记为稳定帧
+                            snapshotIsSettled = false
+                            TaskSnapshotCache.put(
+                                taskId, swipedBitmap, null,
+                                captureTimeMs = System.currentTimeMillis(),
+                                isSettled = false
+                            )
                         }
 
                         // 1.6 全部候选均为 provisional（应用仍处于启动动画期）：
@@ -179,13 +182,11 @@ class RootTaskProvider(private val context: Context) {
             }
         }
 
-        // 关键保序：若有最新手势滑出的任务，且该保序锁仍在有效期内，确保其绝对处于首位
-        // （杜绝守护进程落盘短暂延迟导致任务逆向重排弹跳）。
+        // 关键保序：若有最新手势滑出的任务，确保其绝对处于首位（杜绝守护进程落盘短暂延迟导致任务逆向重排弹跳）。
         //
-        // 必须经 isSwipePinValid() 判定而非直接看 lastSwipedTaskId 非空：该字段除删除/清空外
-        // 从无复位点，若无有效期限制会在用户下一次唤起新应用后仍强行置顶旧任务，
-        // 使新任务被挤到第二位（实测 A D B C 缺陷）。
-        val swipedTaskId = if (TaskSnapshotCache.isSwipePinValid()) TaskSnapshotCache.lastSwipedTaskId else null
+        // 取值一律经 activeSwipe() 判定：滑出记录过期后即自动作废，不再强行置顶旧任务，
+        // 使新唤起的应用不会被挤到第二位（v1.8.31 修复的 A D B C 缺陷）。
+        val swipedTaskId = TaskSnapshotCache.activeSwipe()?.taskId
         if (swipedTaskId != null) {
             val idx = tasks.indexOfFirst { it.taskId == swipedTaskId }
             if (idx > 0) {

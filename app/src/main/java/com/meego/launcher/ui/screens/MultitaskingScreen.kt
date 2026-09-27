@@ -472,7 +472,7 @@ fun MultitaskingScreen(
                                 val renderY = if (isPinching) currentY else animY
 
                                 // 切换至最前面的卡片享有更高层级，确保优雅浮于其他卡片上方飞过
-                                val isTopMoving = (i == 0 && (task.taskId == LaunchOriginTracker.currentTaskId || task.taskId == TaskSnapshotCache.lastSwipedTaskId))
+                                val isTopMoving = (i == 0 && (task.taskId == LaunchOriginTracker.currentTaskId || task.taskId == TaskSnapshotCache.activeSwipe()?.taskId))
                                 val zIndexVal = if (isTopMoving) 25f else (tasks.size - i).toFloat()
 
                                 Box(

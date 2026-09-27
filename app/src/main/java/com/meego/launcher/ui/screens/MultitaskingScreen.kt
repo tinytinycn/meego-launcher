@@ -12,6 +12,7 @@ import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
@@ -76,6 +77,21 @@ import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.sin
 
+/**
+ * 多任务卡片删除动效统一参数。
+ *
+ * 需求：点击删除后，卡片先「消失」（线性缩小 20% + 透明度线性变淡至 50%），
+ * 消失动画播放完毕后，其余卡片才开始补位（顺位移动）动画。
+ */
+private object TaskDeleteAnim {
+    /** 消失动画时长(ms) */
+    const val DURATION_MS = 260
+    /** 缩小比例：缩小 20% */
+    const val SCALE_FACTOR = 0.8f
+    /** 透明度终点：变淡 50% */
+    const val MIN_ALPHA = 0.5f
+}
+
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun MultitaskingScreen(
@@ -92,6 +108,62 @@ fun MultitaskingScreen(
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
     var isEditMode by remember { mutableStateOf(false) }
+
+    // 正在播放「消失动画」的任务集合。
+    // 任务被加入本集合后，其卡片会保持在上层继续渲染并播放缩小/淡出动画；
+    // 动画播放完毕才真正从数据源移除（onTaskRemoved），此时其余卡片才开始补位动画。
+    // 用 Set 而非单个 taskId：底部「一键删除」会同时让全部卡片消失。
+    val deletingTaskIds = remember { mutableStateListOf<Int>() }
+
+    // 「一键删除」整体流程的状态：所有卡片消失动画结束后才真正清空数据源。
+    var pendingClearAll by remember { mutableStateOf(false) }
+
+    // 兜底自愈：若外部（如守护进程轮询）直接把任务从数据源抹掉，
+    // 残留的 deletingTaskIds 会让「一键删除」的收尾流程永远等不到最后一张卡片。
+    LaunchedEffect(tasks.map { it.taskId }.toSet(), deletingTaskIds.toSet()) {
+        val alive = tasks.map { it.taskId }.toSet()
+        val stale = deletingTaskIds.filterNot { it in alive }
+        if (stale.isNotEmpty()) {
+            deletingTaskIds.removeAll(stale.toSet())
+        }
+        // 集合已空 => 必定处于「无人正在消失」的稳定态
+        if (deletingTaskIds.isEmpty() && pendingClearAll) {
+            pendingClearAll = false
+            coroutineScope.launch {
+                taskProvider.removeAllTasks(tasks)
+                onClearAll()
+            }
+        }
+    }
+
+    /**
+     * 单张卡片的消失动画播放完毕后才被调用：此刻才真正把任务从数据源摘除，
+     * 从而让剩余卡片的补位（顺位移动）动画严格发生在消失动画之后。
+     *
+     * 一键删除（pendingClearAll = true）时不逐张摘除：全部卡片的消失动画播完后
+     * 统一走一次 removeAllTasks + onClearAll，避免逐个强杀的竞态与无谓开销。
+     */
+    val onDeleteAnimFinished: (Int, String) -> Unit = { taskId, packageName ->
+        if (!pendingClearAll) {
+            coroutineScope.launch {
+                taskProvider.removeTask(taskId, packageName)
+                onTaskRemoved(taskId)
+            }
+        }
+        // 移除标记：本卡片交回数据源接管，补位动画自此才开始
+        deletingTaskIds.remove(taskId)
+        if (deletingTaskIds.isEmpty()) {
+            // 一键删除：所有卡片都已消失动画结束，此刻才真正清空数据源
+            if (pendingClearAll) {
+                pendingClearAll = false
+                val doomed = tasks
+                coroutineScope.launch {
+                    taskProvider.removeAllTasks(doomed)
+                    onClearAll()
+                }
+            }
+        }
+    }
 
     // 双指缩放进度: 1.0f 为 2x2 视图, 0.0f 为 3x3 视图
     val initialProgress = if (columns == 3) 0.0f else 1.0f
@@ -448,6 +520,27 @@ fun MultitaskingScreen(
                             val currentRot = if (i % 2 == 0) (-1.8f) * stackWeight else 1.8f * stackWeight
 
                             key(task.taskId) {
+                                // 该卡片是否正在播放「消失动画」。
+                                // 0 = 正常常驻，1 = 已完全消失。
+                                val deleteProgress = remember { Animatable(1f) }
+                                val isDeleting = task.taskId in deletingTaskIds
+
+                                // 触发消失动画：线性缩小 20% + 线性变淡至 50%。
+                                // 动画播放完毕（onDeleteAnimFinished）才真正移除数据源，
+                                // 从而保证补位动画严格发生在消失动画之后。
+                                LaunchedEffect(isDeleting) {
+                                    if (isDeleting) {
+                                        deleteProgress.animateTo(
+                                            targetValue = 0f,
+                                            animationSpec = tween(
+                                                durationMillis = TaskDeleteAnim.DURATION_MS,
+                                                easing = androidx.compose.animation.core.LinearEasing
+                                            )
+                                        )
+                                        onDeleteAnimFinished(task.taskId, task.packageName)
+                                    }
+                                }
+
                                 // 卡片坐标平滑位移动画：当后台任务重新排序时，C卡片由后方顺滑移动至第一位，AB卡片向后顺位移位
                                 // 适当降低刚度（stiffness = 140f）并搭配临界轻阻尼（dampingRatio = 0.92f），使卡片在 C A B 顺序重排换位过程中动画时长自然延伸至约 400~450ms，视觉呈现优雅丝滑、无晃动感
                                 val animX by animateDpAsState(
@@ -473,7 +566,13 @@ fun MultitaskingScreen(
 
                                 // 切换至最前面的卡片享有更高层级，确保优雅浮于其他卡片上方飞过
                                 val isTopMoving = (i == 0 && (task.taskId == LaunchOriginTracker.currentTaskId || task.taskId == TaskSnapshotCache.activeSwipe()?.taskId))
-                                val zIndexVal = if (isTopMoving) 25f else (tasks.size - i).toFloat()
+                                // 正在消失的卡片浮至最上层，避免被补位中的卡片遮挡
+                                val zIndexVal = if (isDeleting) 100f
+                                else if (isTopMoving) 25f else (tasks.size - i).toFloat()
+
+                                // 消失进度映射为实际渲染的缩放与透明度
+                                val deleteScale = 1f - (1f - TaskDeleteAnim.SCALE_FACTOR) * (1f - deleteProgress.value)
+                                val deleteAlpha = TaskDeleteAnim.MIN_ALPHA + (1f - TaskDeleteAnim.MIN_ALPHA) * deleteProgress.value
 
                                 Box(
                                     modifier = Modifier
@@ -481,10 +580,11 @@ fun MultitaskingScreen(
                                         .graphicsLayer {
                                             translationX = renderX.toPx()
                                             translationY = renderY.toPx()
-                                            scaleX = currentScale
-                                            scaleY = currentScale
+                                            scaleX = currentScale * deleteScale
+                                            scaleY = currentScale * deleteScale
                                             rotationZ = currentRot
-                                            shadowElevation = (6.dp * (1f + stackWeight * 0.8f)).toPx()
+                                            shadowElevation = (6.dp * (1f + stackWeight * 0.8f) * deleteProgress.value).toPx()
+                                            alpha = deleteAlpha
                                         }
                                         .zIndex(zIndexVal)
                                 ) {
@@ -497,6 +597,9 @@ fun MultitaskingScreen(
                                             vibrate(context)
                                         },
                                         onClick = {
+                                            // 编辑模式下的点击一律「仅退出编辑模式」。
+                                            // 绝不在此处因卡片本体被点而唤起应用，
+                                            // 更不得连带影响底部「一键删除」按钮的可见状态。
                                             if (isEditMode) {
                                                 isEditMode = false
                                             } else {
@@ -513,11 +616,11 @@ fun MultitaskingScreen(
                                             }
                                         },
                                         onDelete = {
-                                            coroutineScope.launch {
-                                                taskProvider.removeTask(task.taskId, task.packageName)
-                                                onTaskRemoved(task.taskId)
-                                                vibrate(context)
-                                            }
+                                            if (task.taskId in deletingTaskIds) return@RecentTaskCard
+                                            // 标记为正在消失：卡片保留在列表中继续渲染并播放
+                                            // 缩小/淡出动画，动画结束才真正移除。
+                                            deletingTaskIds.add(task.taskId)
+                                            vibrate(context)
                                         }
                                     )
                                 }
@@ -541,12 +644,13 @@ fun MultitaskingScreen(
         ) {
             IconButton(
                 onClick = {
-                    coroutineScope.launch {
-                        isEditMode = false
-                        taskProvider.removeAllTasks(tasks)
-                        onClearAll()
-                        vibrate(context)
-                    }
+                    // 一键删除与单卡删除共用同一套「消失动画」表现：
+                    // 逐张卡片先线性缩小 20% + 线性变淡至 50%，
+                    // 待全部卡片动画播放完毕后，才真正清空数据源。
+                    isEditMode = false
+                    pendingClearAll = true
+                    deletingTaskIds.addAll(tasks.map { it.taskId })
+                    vibrate(context)
                 },
                 modifier = Modifier
                     .size(52.dp)

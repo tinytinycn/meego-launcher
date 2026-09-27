@@ -19,13 +19,182 @@ APP_CMD_DIR="$APP_DIR/cmd_queue"
 APP_TASKS_JSON="$APP_DIR/recent_tasks.json"
 APP_SNAP_DIR="$APP_DIR/snapshots"
 
+# ---------------------------------------------------------------------------
+# 0. Watchdog：守护进程存活自愈
+# ---------------------------------------------------------------------------
+# 【背景：为什么需要 watchdog】
+# 本脚本由 init 以 oneshot service 方式拉起，而 oneshot 的语义是「进程一退出，
+# init 就把 service 标记为 stopped」；而 on property:sys.boot_completed=1 只在开机
+# 触发一次。于是一旦脚本死亡，service 永久停在 stopped，直到下次重启。
+# 旧版 deploy.sh 还会用 nohup 手动拉起脚本，与 init 管理的实例互相 kill -9，
+# 手动实例上位后成为无人监管的孤儿 —— 这正是「删除/一键清理只清 UI 不杀进程」
+# 的直接成因。
+#
+# 【真机实测结论：watchdog 必须先于 service 存在】
+# 逐一验证过以下形态，结果只有一种能活：
+#   (a) service 启动时 fork 出的 watchdog，setsid 后 PPID=1          -> 必死
+#   (b) 同上再套一层 setsid 双重脱离，PPID=1、cgroup 与 PGID 均独立   -> 仍必死
+#   (c) 在 service 启动【之前】就已存在的独立 watchdog                -> 存活
+# 原因是 init 终止 oneshot service 时按「本次启动的派生树」清理，而 (a)(b) 的
+# watchdog 都由该次 service 派生；setsid 只换进程组与会话，换不掉这层派生关系。
+# 只要 watchdog 不是这次 service 派生的，就不在清理名单内。
+#
+# 【因此本脚本的约定】
+# 启动顺序固定为「watchdog 先、主进程后」：主进程入口先确保 watchdog 已存在
+# （watchdog_alive 判定为否才 fork），再继续向下执行主流程。deploy.sh 亦遵循
+# 同一顺序 —— 先用 setsid 预置一个独立 watchdog，再拉起主进程。
+# watchdog 每 5s 校验一次主进程存活，连续 3 次（15s 宽限期，覆盖互斥抢占与正常
+# 重启的短暂空窗）确认死亡后，重新拉起【当前这份脚本】。
+#
+# 【为什么不用 setprop ctl.start 重启】
+# init 的 meego_daemon.rc 指向 /system/bin/meego_daemon.sh，而 /system 受
+# dm-verity 保护无法更新 —— 那里永远停留在首次刷入时的旧版本。实测 ctl.start
+# 拉起的正是那份旧脚本（既不写心跳也没有本版修复），自愈一次就等于回退一次。
+# 故统一改为直接拉起当前正在运行的这份脚本。
+DAEMON_SCRIPT="$0"
+case "$DAEMON_SCRIPT" in
+    /*) ;;
+    *) DAEMON_SCRIPT="/data/local/tmp/meego_daemon.sh" ;;
+esac
+
+# 读取某进程 cmdline 的第 N 段（1-based）。cmdline 以 NUL 分隔，tr 成行后
+# 第 1 行=argv0(/system/bin/sh)、第 2 行=脚本路径、第 3 行=__WATCHDOG（若有）。
+# 注意 __WATCHDOG 在第 3 行而非第 2 行 —— 误用 2p 会取到脚本路径，判定恒不
+# 成立，进而让互斥逻辑把 watchdog 当普通进程杀掉。
+cmdline_field() {
+    tr '\0' '\n' < "/proc/$1/cmdline" 2>/dev/null | sed -n "${2}p"
+}
+
+# 是否存在【与本进程同源】的 watchdog。
+#
+# 刻意要求脚本路径一致，而不是「存在任意 watchdog 即可」：/system/bin 下可能
+# 残留着早先部署写入的旧副本（/system 受 dm-verity 保护，无法更新或删除），
+# 开机时 init 会按 .rc 启动那份旧脚本，于是它也会 fork 出指向自己的 watchdog。
+# 若这里只按 __WATCHDOG 标记判定，就会误以为「watchdog 已存在」而不启动自己
+# 的，紧接着单实例逻辑又把旧 watchdog 清掉 —— 结果是两个都没了。旧副本的
+# watchdog 还会把旧版主进程拉回来，使修复整体回退。
+watchdog_alive() {
+    for wp in $(pgrep -f "meego_daemon.sh" 2>/dev/null || true); do
+        [ "$(cmdline_field "$wp" 3)" = "__WATCHDOG" ] || continue
+        [ "$(cmdline_field "$wp" 2)" = "$DAEMON_SCRIPT" ] && return 0
+    done
+    return 1
+}
+
+if [ "$1" != "__WATCHDOG" ]; then
+    # 预置 watchdog：确保它独立于本次 service 启动而存在（见上文情形 (c)）。
+    # 双重 setsid 不可省：内层 setsid 让 watchdog 自成会话，外层让中间 sh 立刻
+    # 退出，从而 watchdog 被 init 收养为 PPID=1。
+    if ! watchdog_alive; then
+        setsid /system/bin/sh -c "setsid /system/bin/sh \"$DAEMON_SCRIPT\" __WATCHDOG >/dev/null 2>&1" >/dev/null 2>&1 &
+    fi
+    # 注意：此处【不能】exit 0。init 的 service 是 oneshot，入口一退出 init 就把
+    # service 标记为 stopped，主进程从未真正跑起来，而 watchdog 又只能靠 ctl.start
+    # 重启 —— ctl.start 重跑入口时 watchdog 已存在、同样只是空转，于是形成死结。
+    # 因此入口必须继续向下执行，把本次启动真正变成「主进程」。
+fi
+
+# ---------------------------------------------------------------------------
+# 0.1 Watchdog 主循环：主进程死掉就把当前这份脚本重新拉起来
+# ---------------------------------------------------------------------------
+if [ "$1" = "__WATCHDOG" ]; then
+    MISS_COUNT=0
+    while true; do
+        sleep 5
+        # 心跳：把自身 pid 与当前时间写入 App 可读的状态文件。
+        # App 侧读不到 /proc（本机 /proc 挂载了 hidepid=2，普通 uid 看不到
+        # 其他进程的 cmdline），故「watchdog 是否健在」只能由它自己申报。
+        # 文件权限 666 是必须的 —— App 进程 u0_a209 需要能读。
+        # 心跳必须落在 App 私有目录：/data/local/tmp 属 shell_data_file 域，
+        # 即便权限 666，App（untrusted_app）仍会被 SELinux 拒绝读取（真机实测
+        # avc: denied { read } ... tclass=lnk_file）。App 私有目录带
+        # app_data_file 标签，是 App 唯一能稳定读到的 root 可写位置。
+        mkdir -p "$APP_CMD_DIR" 2>/dev/null || true
+        echo "$$ $(date +%s)" > "$APP_CMD_DIR/watchdog.hb" 2>/dev/null || true
+        chmod 666 "$APP_CMD_DIR/watchdog.hb" 2>/dev/null || true
+        chown "$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null)" "$APP_CMD_DIR/watchdog.hb" 2>/dev/null || true
+
+        MAIN_PID=$(cat /data/local/tmp/meego_daemon.pid 2>/dev/null | tr -d '\r\n ')
+        if [ -n "$MAIN_PID" ] && [ -d "/proc/$MAIN_PID" ]; then
+            MISS_COUNT=0
+        else
+            MISS_COUNT=$((MISS_COUNT + 1))
+            if [ "$MISS_COUNT" -ge 3 ]; then
+                MISS_COUNT=0
+                # 注意：这里【不能】用 setprop ctl.start。
+                # init 的 meego_daemon.rc 指向 /system/bin/meego_daemon.sh，
+                # 而 /system 受 dm-verity 保护不可更新 —— 那里永远是首次刷入时的
+                # 旧版本。经实测，ctl.start 拉起的正是 /system 旧版，它既不写
+                # .alive 心跳，也缺少后续修复，一旦被拉起就等于回退。
+                # 故直接拉起当前这份脚本（/data/local/tmp，由 deploy.sh 推送）。
+                # 走 nohup + setsid：新主进程立刻成为 PPID=1 的独立进程，
+                # 而本 watchdog 早已脱离该派生树，两者互不牵连。
+                setsid /system/bin/sh -c "nohup \"$DAEMON_SCRIPT\" >/data/local/tmp/daemon.log 2>&1" >/dev/null 2>&1 &
+            fi
+        fi
+    done
+fi
+
 # 1. 单实例保障：终止历史旧守护进程，严防竞争冲突
-MY_PID=$$
+# 旧逻辑用 pgrep -f "meego_daemon.sh" 无差别匹配，把 watchdog 一起 kill -9 了
+# —— 那正是「手动拉起一次之后无人监管」的直接成因。
+# 现规则：
+#   · 与本进程同源的 watchdog  -> 保留（它的职责正是把主进程拉回来）
+#   · 其余一切同脚本名进程    -> 清除（含旧副本的 watchdog）
+# 清除旧副本 watchdog 是本版收敛 stale /system 副本的关键：既然 /system 不可写，
+# 就改为在运行期把它派生出来的守护链一并接管，使全局最终只剩当前这份脚本。
 for p in $(pgrep -f "meego_daemon.sh" 2>/dev/null || true); do
-    if [ "$p" != "$MY_PID" ]; then
+    if [ "$p" != "$$" ]; then
+        if [ "$(cmdline_field "$p" 3)" = "__WATCHDOG" ] && \
+           [ "$(cmdline_field "$p" 2)" = "$DAEMON_SCRIPT" ]; then
+            continue
+        fi
         kill -9 "$p" 2>/dev/null || true
     fi
 done
+
+# 业务主进程 pid 落盘，供 watchdog 存活检测
+echo $$ > /data/local/tmp/meego_daemon.pid 2>/dev/null || true
+chmod 666 /data/local/tmp/meego_daemon.pid 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# 1.1 App 私有目录自愈
+# ---------------------------------------------------------------------------
+# App 被重装/清数据后 /data/user/0/<pkg>/files 会被删除，而本脚本的
+# mkdir -p 在父目录缺失时会一并失败（此前被 `2>/dev/null || true` 静默吞掉，
+# 表现为日志里连篇的 "can't create ... No such file or directory"，且命令队列
+# 永远收不到指令 —— 此时删除/一键清理只清 UI 不杀进程）。
+# 这里逐级创建并显式校准属主，确保 App 侧能读 cmd_queue、读写快照。
+ensure_app_dirs() {
+    if [ ! -d "$APP_DIR" ]; then
+        # 父目录被删时无法凭 root 直接 mkdir 出带正确 SELinux 标签与属主的
+        # 私有目录（label 缺失会导致 App 侧一律 Permission denied）。此时
+        # 只能退化为「不建目录、仅记录」，等 App 下次启动自建后再由
+        # 主循环 ensure_app_dirs 补齐 —— 见主循环中的兜底调用。
+        return 1
+    fi
+    mkdir -p "$APP_CMD_DIR" "$APP_SNAP_DIR" 2>/dev/null || true
+    chmod 777 "$APP_CMD_DIR" "$APP_SNAP_DIR" 2>/dev/null || true
+    # 属主对齐 App uid（u0_a209 / uid 10209），否则 root 写入的文件 App 读不到
+    APP_UID=$(stat -c '%u' "$APP_DIR" 2>/dev/null)
+    if [ -n "$APP_UID" ] && [ "$APP_UID" != "0" ]; then
+        chown -R "$APP_UID:$APP_UID" "$APP_CMD_DIR" "$APP_SNAP_DIR" 2>/dev/null || true
+    fi
+    return 0
+}
+APP_DIRS_OK=0
+ensure_app_dirs && APP_DIRS_OK=1
+
+# 写主进程存活心跳，供 App 侧读取（见 DaemonWatchdogClient 说明）。
+# 落在 App 私有目录而非 /data/local/tmp：后者 SELinux 标签为 shell_data_file，
+# 即便权限 666，App（untrusted_app）仍会被拒绝读取（真机实测 avc denied）。
+# 必须放在 ensure_app_dirs 之后 —— 目录不存在时写入会静默失败。
+write_daemon_heartbeat() {
+    echo "$$ $(date +%s)" > "$APP_CMD_DIR/daemon.hb" 2>/dev/null || true
+    chmod 666 "$APP_CMD_DIR/daemon.hb" 2>/dev/null || true
+    chown "$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null)" "$APP_CMD_DIR/daemon.hb" 2>/dev/null || true
+}
+write_daemon_heartbeat
 
 mkdir -p /data/local/tmp
 if [ ! -p "$FIFO" ]; then
@@ -33,11 +202,6 @@ if [ ! -p "$FIFO" ]; then
     mkfifo "$FIFO"
 fi
 chmod 777 "$FIFO" 2>/dev/null || true
-
-mkdir -p "$APP_CMD_DIR" 2>/dev/null || true
-chmod 777 "$APP_CMD_DIR" 2>/dev/null || true
-mkdir -p "$APP_SNAP_DIR" 2>/dev/null || true
-chmod 777 "$APP_SNAP_DIR" 2>/dev/null || true
 
 # 2. 确保无障碍服务与全屏边缘侧滑所需系统配置始终生效
 ensure_system_settings() {
@@ -349,6 +513,19 @@ execute_command() {
     pkg=$(echo "$line" | awk '{print $3}')
 
     case "$cmd" in
+        ENSURE_DAEMON)
+            # App 侧辅助唤醒：启动器进程发现主进程已消失时投递本指令，
+            # 用来跳过 watchdog 剩余的宽限期等待、立即把主进程拉回来。
+            # 注意本分支由 monitor_cmd_queue 在【主进程】内执行 —— 若主进程
+            # 真已死亡则它跑不到这里；实际承担补救的是 watchdog。本分支真正
+            # 生效的场景是主进程尚存但 pid 文件曾被清掉（心跳过期而进程健在），
+            # 此时就地重新拉起一份即可。
+            MAIN_PID=$(cat /data/local/tmp/meego_daemon.pid 2>/dev/null | tr -d '\r\n ')
+            if [ -z "$MAIN_PID" ] || [ ! -d "/proc/$MAIN_PID" ]; then
+                # 同上：拉当前脚本而非 init service（后者指向不可更新的 /system 旧版）
+                setsid /system/bin/sh -c "nohup \"$DAEMON_SCRIPT\" >/data/local/tmp/daemon.log 2>&1" >/dev/null 2>&1 &
+            fi
+            ;;
         REMOVE)
             if [ -n "$arg" ]; then
                 tid="$arg"
@@ -569,6 +746,15 @@ monitor_current_app &
 update_tasks
 
 while true; do
+    # App 私有目录自愈：启动时若目录尚不存在（App 未安装 / 清数据 / 重装），
+    # 需在 App 下次启动自建目录之后补齐 cmd_queue 与 snapshots 及其属主。
+    # 正常情况下紧接着的一次 mkdir 是廉价的 stat，不构成轮询开销。
+    if [ "$APP_DIRS_OK" -eq 0 ] && [ -d "$APP_DIR" ]; then
+        ensure_app_dirs && APP_DIRS_OK=1
+    fi
+    # 存活心跳：App 侧读不到 /proc（hidepid=2），只能靠这个带时间戳的文件
+    # 判断主进程是否健在；它同时是 App 侧 DaemonWatchdogClient 的唯一判据。
+    write_daemon_heartbeat
     update_tasks
     # 系统快照校正 + provisional TTL 兜底：保证 live 帧不会长期陈旧，
     # 且不会因 settle 子 shell 意外死亡而永久停留在图标降级态

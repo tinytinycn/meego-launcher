@@ -22,6 +22,7 @@ import com.meego.launcher.model.TaskSnapshotCache
 import com.meego.launcher.service.EdgeSwipeGestureService
 import com.meego.launcher.ui.screens.HomeScreen
 import com.meego.launcher.ui.theme.MeeGoTheme
+import com.meego.launcher.util.DaemonWatchdogClient
 import com.meego.launcher.util.ScreenCaptureHelper
 import android.content.ComponentName
 import android.provider.Settings
@@ -92,6 +93,9 @@ class MainActivity : ComponentActivity() {
             immersiveUiEnabled.value = preferences.immersiveUiFlow.first()
             loadApps()
             loadTasks()
+            // 守护进程存活守卫：仅当主进程已消失而 watchdog 健在时，投递一条
+            // ENSURE_DAEMON 让它跳过 15s 宽限期立即补拉；两者都在时零开销返回。
+            DaemonWatchdogClient.ensureDaemonRunning(this@MainActivity)
             if (isEdgeEnabled) {
                 startEdgeServiceIfNeeded()
             }

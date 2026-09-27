@@ -5,6 +5,8 @@ import android.content.Context
 import android.os.Build
 import android.os.VibrationEffect
 import android.os.Vibrator
+import android.util.DisplayMetrics
+import android.view.WindowManager
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.Spring
@@ -114,17 +116,42 @@ fun MultitaskingScreen(
     val horizontalPadding = 16.dp
     val availableWidth = screenWidthDp - horizontalPadding * 2
 
+    // 卡片高宽比 = 屏幕真实长宽比（物理屏幕 高/宽），使后台应用卡片与手机屏幕保持同一比例。
+    // 卡片内放的是整屏应用快照，同比例后 ContentScale.Crop 可完整无裁切地呈现。
+    //
+    // 刻意不使用 LocalConfiguration.screenHeightDp / screenWidthDp：该值取自「应用窗口」
+    // 而非物理屏幕，会随系统栏/挖孔 inset 变化。Redmi K40 实测同一台机器上
+    // 全屏态为 w393dp/h873dp（比值 2.2214 = 2400/1080），而带挖孔与导航栏 inset 时
+    // 变为 w393dp/h811dp（比值 2.0636）—— 同一台机器卡片比例会随窗口状态漂移，
+    // 且与整屏快照比例对不上。故改取 WindowManager 的真实显示尺寸：
+    // API 30+ 用 maximumWindowMetrics，更低版本回退 defaultDisplay.getRealMetrics。
+    // 该值只取决于屏幕本身，跨机型、跨横竖屏均稳定正确。
+    val screenAspect = remember(context) {
+        val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as? WindowManager
+        val (widthPx: Int, heightPx: Int) = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val bounds = windowManager?.maximumWindowMetrics?.bounds
+            (bounds?.width() ?: 0) to (bounds?.height() ?: 0)
+        } else {
+            val metrics = DisplayMetrics()
+            @Suppress("DEPRECATION")
+            windowManager?.defaultDisplay?.getRealMetrics(metrics)
+            metrics.widthPixels to metrics.heightPixels
+        }
+        // 取不到真实尺寸时退化为常见 20:9，宁可略有偏差也不让高度算成 0
+        if (widthPx > 0 && heightPx > 0) heightPx.toFloat() / widthPx else 2.2222f
+    }
+
     // 2 列模式几何参数 (大卡片)
     val spacingX2 = 12.dp
     val spacingY2 = 16.dp
     val cardWidth2 = (availableWidth - spacingX2) / 2
-    val cardHeight2 = 210.dp
+    val cardHeight2 = cardWidth2 * screenAspect
 
     // 3 列模式几何参数 (紧凑卡片)
     val spacingX3 = 10.dp
     val spacingY3 = 12.dp
     val cardWidth3 = (availableWidth - spacingX3 * 2) / 3
-    val cardHeight3 = 140.dp
+    val cardHeight3 = cardWidth3 * screenAspect
 
     val p = animProgress.value.coerceIn(0.0f, 1.0f)
     // 堆叠权重: 当 p = 0.5 (过渡中间态) 时达到峰值 1.0，两端 p=0 或 p=1 时归零

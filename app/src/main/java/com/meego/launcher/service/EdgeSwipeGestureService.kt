@@ -55,6 +55,15 @@ class EdgeSwipeGestureService : AccessibilityService() {
         const val ACTION_DISABLE = "com.meego.launcher.ACTION_DISABLE"
         const val EXTRA_ENABLED = "extra_enabled"
 
+        /**
+         * Application Grid 层级微缩放的**起始**比例（划出刚起手时的桌面观感）。
+         * 随划出进度线性回落到 1.0，形成「从 0.95 倍长回原位」的纵深。
+         *
+         * 仅对 [com.meego.launcher.model.LaunchOrigin.GRID] 生效；
+         * Multitasking View 与 Events Feed 恒为 1.0，不参与缩放。
+         */
+        private const val GRID_DEPTH_START = 0.95f
+
         @Volatile
         private var instance: EdgeSwipeGestureService? = null
         @Volatile
@@ -225,6 +234,7 @@ class EdgeSwipeGestureService : AccessibilityService() {
 
     private var screenWidth = 1080
     private var screenHeight = 2400
+
     private var isDraggingCard = false
     private var isCardAnimatingOut = false
     private var pendingDismiss = false
@@ -448,7 +458,18 @@ class EdgeSwipeGestureService : AccessibilityService() {
             visibility = View.GONE
         }
 
-        // 真实底层桌面背景层 (Application Grid 或 Multitasking View 快照，100% 不透明全屏贴合)
+        // 真实底层桌面背景层 (Application Grid 或 Multitasking View 快照)
+        //
+        // 关键：这里**不能**用 MATCH_PARENT + FIT_XY 铺满整个 Overlay。
+        // 桌面快照的位图尺寸 == 桌面窗口尺寸（挖孔机型上被挖孔 inset 顶掉，如
+        // Redmi K40 窗口 [0,95][1080,2400] = 1080x2305），而本 Overlay 是带
+        // FLAG_LAYOUT_NO_LIMITS 的全屏 1080x2400。直接 FIT_XY 铺满会把画面纵向
+        // 拉伸 1.0412 倍并把顶部 95px 留白撑没 —— 即「划出过程中 grid 顶到屏幕
+        // 最上沿铺满全屏」的根因。
+        //
+        // 正确做法：背景层始终与 Overlay 等尺寸（保证不透明底色铺满、无透光），
+        // 但把 ImageView 自身按**快照真实屏幕矩形**定位并缩放，图层始终以 FIT_XY
+        // 绘制 —— 组合结果即「快照 1:1 贴回它在物理屏幕上的原始位置」。
         desktopBackgroundImageView = ImageView(this).apply {
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
@@ -705,13 +726,29 @@ class EdgeSwipeGestureService : AccessibilityService() {
         if (desktopBitmap != null) {
             desktopBackgroundImageView?.setImageBitmap(desktopBitmap)
             desktopBackgroundImageView?.visibility = View.VISIBLE
-            cardOverlayLayout?.setBackgroundColor(Color.TRANSPARENT)
+            // 关键：Overlay 底色**必须保持不透明黑**。
+            //
+            // 快照只覆盖桌面窗口那块矩形（挖孔机型上顶部 95px 留白不在窗口内），
+            // 若底色设为 TRANSPARENT，这 95px 就会透出下层正在运行的三方应用 ——
+            // 实测表现为划出过程中顶部露出一条 Via 浏览器的白色页面带。
+            // 真实桌面首帧在该区域同样是纯黑，故不透明黑底才是与真实画面一致的还原。
+            cardOverlayLayout?.setBackgroundColor(Color.BLACK)
+            // 按快照真实屏幕矩形定位（顶部保留挖孔留白、1:1 不拉伸）
+            desktopBackgroundImageView?.post {
+                applyDesktopBackgroundGeometry(desktopBitmap)
+            }
+            // Overlay 首帧可能尚未完成布局：若已有宽高则立即定位一次，杜绝首帧拉伸闪烁
+            applyDesktopBackgroundGeometry(desktopBitmap)
+            // 复位层级微缩放：每次手势都从 0.95 重新起步，杜绝上一次手势的残留缩放
+            desktopBackgroundImageView?.animate()?.cancel()
+            desktopBackgroundImageView?.scaleX = 1f
+            desktopBackgroundImageView?.scaleY = 1f
+            desktopBackgroundImageView?.translationX = 0f
+            desktopBackgroundImageView?.translationY = 0f
         } else {
             desktopBackgroundImageView?.visibility = View.GONE
             cardOverlayLayout?.setBackgroundColor(Color.BLACK)
         }
-        desktopBackgroundImageView?.scaleX = 1.0f
-        desktopBackgroundImageView?.scaleY = 1.0f
         desktopBackgroundImageView?.alpha = 1.0f
 
         cardContainer?.visibility = View.VISIBLE
@@ -730,10 +767,56 @@ class EdgeSwipeGestureService : AccessibilityService() {
         cardContainer?.scaleX = scale
         cardContainer?.scaleY = scale
 
-        // 保持底层桌面 100% 不透明与全屏 1:1 贴合，杜绝透明度造成的三方应用内容透光
-        desktopBackgroundImageView?.scaleX = 1.0f
-        desktopBackgroundImageView?.scaleY = 1.0f
+        // 底层桌面保持 100% 不透明；其 1:1 贴回定位由 [applyDesktopBackgroundGeometry] 负责。
+        //
+        // 此处**只**叠加 GRID 专属的层级微缩放（见 [applyGridDepthScale]）：
+        // 缩放绕内容中心进行，故通过「先按缩放系数反推左上角偏移」来保持
+        // 快照中心在屏幕上不动 —— 表现为画面从 0.95 倍「长」回 1.0 倍，
+        // 而非整体朝某个角落漂移。Multitasking / Events Feed 恒为 1.0，不受影响。
         desktopBackgroundImageView?.alpha = 1.0f
+        applyGridDepthScale(progress)
+    }
+
+    /**
+     * Application Grid 专属的层级微缩放：0.95 → 1.0 随划出进度推进。
+     *
+     * **仅对 Application Grid 生效** —— 判据是
+     * [LaunchOriginTracker.currentScreenIndex]（用户此刻所在页序 == 1），
+     * 而**不是** [LaunchOriginTracker.lastOrigin]（应用从哪屏唤起）：
+     * Events Feed 从不写入 `lastOrigin`，停留在 Feed 时它仍停留在上一次的
+     * GRID/RECENTS，用它判断会给 Feed 错误地加上缩放动画。
+     * 故此判据同时精确排除了 **Multitasking View**（页序 2）与
+     * **Events Feed**（页序 0），两者恒为 1.0。
+     *
+     * 缩放锚点取快照矩形的**中心**：View 默认以左上角缩放，若直接改 scale，
+     * 画面会朝左上角漂移。故按 `s` 反推平移量 `t = center * (1 - s)`，
+     * 使 `t + s * center == center` 恒成立 —— 中心不动、四边对称内收。
+     *
+     * @param progress 划出进度 0..1（0 = 刚起手，1 = 划过半屏）
+     */
+    private fun applyGridDepthScale(progress: Float) {
+        val iv = desktopBackgroundImageView ?: return
+        if (LaunchOriginTracker.currentScreenIndex != LaunchOrigin.GRID.pageIndex) {
+            // 非 Grid 页（Events Feed / Multitasking View）：确保复位，
+            // 避免上一次 Grid 手势的残留缩放串到别屏
+            if (iv.scaleX != 1f || iv.scaleY != 1f ||
+                iv.translationX != 0f || iv.translationY != 0f
+            ) {
+                iv.scaleX = 1f
+                iv.scaleY = 1f
+                iv.translationX = 0f
+                iv.translationY = 0f
+            }
+            return
+        }
+
+        val s = GRID_DEPTH_START + (1f - GRID_DEPTH_START) * progress
+        val cx = iv.width * 0.5f
+        val cy = iv.height * 0.5f
+        iv.scaleX = s
+        iv.scaleY = s
+        iv.translationX = cx * (1f - s)
+        iv.translationY = cy * (1f - s)
     }
 
     private fun finishSwipeOut(isLeft: Boolean, deltaX: Float) {
@@ -795,14 +878,23 @@ class EdgeSwipeGestureService : AccessibilityService() {
                 ?.setInterpolator(OvershootInterpolator(1.2f))
                 ?.start()
 
+            // 底层桌面：透明度收尾 + 复位层级微缩放。
+            //
+            // 1:1 贴回定位由 [applyDesktopBackgroundGeometry] 用 layoutParams 设定，
+            // **不能**对其 scale 做「回到 1.0」的补间动画 —— 那会在收尾期间
+            // 与贴回定位打架，表现为交接瞬间一帧跳动。这里直接一次性归位：
+            // Overlay 随即被 GONE 隐藏，复位过程对用户不可见；
+            // 且 [startSwipeOutAnimation] 每次也会复位，绝无跨手势残留。
             desktopBackgroundImageView?.animate()
-                ?.scaleX(1.0f)
-                ?.scaleY(1.0f)
                 ?.alpha(1.0f)
                 ?.setDuration(250)
                 ?.setInterpolator(OvershootInterpolator(1.2f))
                 ?.setListener(object : AnimatorListenerAdapter() {
                     override fun onAnimationEnd(animation: Animator) {
+                        desktopBackgroundImageView?.scaleX = 1f
+                        desktopBackgroundImageView?.scaleY = 1f
+                        desktopBackgroundImageView?.translationX = 0f
+                        desktopBackgroundImageView?.translationY = 0f
                         cardOverlayLayout?.visibility = View.GONE
                         setGestureActive(false)
                     }
@@ -849,6 +941,66 @@ class EdgeSwipeGestureService : AccessibilityService() {
             ?: LauncherPreviews.recentsBitmap
             ?: loadBitmapFromFile(File(filesDir, "recents_preview.png").absolutePath)
             ?: loadBitmapFromFile("/data/local/tmp/recents_preview.png")
+    }
+
+    /**
+     * 取当前来源桌面的**真实屏幕矩形**（快照位图左上角在物理屏幕上的位置）。
+     *
+     * 内存路径带 [LauncherPreviews] 记录的 rect；从文件回读（进程重启、内存位图被清）
+     * 时 rect 丢失，此时按「屏幕高 − 快照高 = 顶部挖孔 inset」复原。
+     * 无挖孔机型上快照高 == 屏幕高，该式自然退化为 0，无需特判。
+     */
+    private fun originDesktopScreenRect(bitmap: Bitmap): Rect {
+        val remembered = when (LaunchOriginTracker.lastOrigin) {
+            LaunchOrigin.GRID -> LauncherPreviews.gridWindowRect
+            LaunchOrigin.RECENTS -> LauncherPreviews.recentsWindowRect
+        }
+        if (remembered != null && remembered.width() > 0 && remembered.height() > 0) {
+            return Rect(remembered)
+        }
+        val top = (screenHeight - bitmap.height).coerceAtLeast(0)
+        return Rect(0, top, bitmap.width, top + bitmap.height)
+    }
+
+    /**
+     * 把桌面背景层按快照真实矩形定位。
+     *
+     * 本 Overlay 带 `FLAG_LAYOUT_NO_LIMITS` 且为 MATCH_PARENT，坐标系**就是物理屏幕**
+     * （真机实测 frame=[0,0][1080,2400]），故窗口矩形可直接用作布局边距，
+     * 快照得以 1:1 贴回原始位置：顶部 95px 挖孔留白保留，画面不再被纵向拉伸。
+     *
+     * 未覆盖的挖孔区由 `cardOverlayLayout` 的不透明黑底兜底 ——
+     * 这与真实桌面首帧在该区域的呈现完全一致，交接瞬间零差异。
+     */
+    private fun applyDesktopBackgroundGeometry(bitmap: Bitmap) {
+        val iv = desktopBackgroundImageView ?: return
+        val overlayW = cardOverlayLayout?.width ?: 0
+        val overlayH = cardOverlayLayout?.height ?: 0
+        if (overlayW <= 0 || overlayH <= 0) return
+
+        val rect = originDesktopScreenRect(bitmap)
+        // 矩形必须完整落在 Overlay 内；否则说明坐标系假设失效，退回铺满（保持旧行为，绝不露出异常画面）
+        if (rect.width() <= 0 || rect.height() <= 0 ||
+            rect.left < 0 || rect.top < 0 ||
+            rect.right > overlayW || rect.bottom > overlayH
+        ) {
+            iv.layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+            iv.translationX = 0f
+            iv.translationY = 0f
+            Log.w(TAG, "desktop bg rect $rect does not fit overlay ${overlayW}x$overlayH; fallback to full-bleed")
+            return
+        }
+
+        iv.layoutParams = FrameLayout.LayoutParams(rect.width(), rect.height()).apply {
+            leftMargin = rect.left
+            topMargin = rect.top
+        }
+        iv.translationX = 0f
+        iv.translationY = 0f
+        Log.d(TAG, "desktop bg placed 1:1 at $rect (overlay ${overlayW}x$overlayH, bitmap ${bitmap.width}x${bitmap.height})")
     }
 
     private fun loadBitmapFromFile(path: String): Bitmap? {

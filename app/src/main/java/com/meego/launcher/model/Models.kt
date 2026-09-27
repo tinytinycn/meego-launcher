@@ -1,6 +1,7 @@
 package com.meego.launcher.model
 
 import android.graphics.Bitmap
+import android.graphics.Rect
 import android.graphics.drawable.Drawable
 import androidx.compose.runtime.Immutable
 import androidx.compose.ui.graphics.ImageBitmap
@@ -15,6 +16,20 @@ object LaunchOriginTracker {
     var currentTaskId: Int? = null
     var currentPackageName: String? = null
 
+    /**
+     * 当前三屏所在的页序：0 = Events Feed，1 = Application Grid，2 = Multitasking View。
+     *
+     * 与 [lastOrigin] **刻意不同**，二者不可混用：
+     * - [lastOrigin] 记录「应用是从哪一屏被唤起的」，决定划出后**回溯到哪一页**；
+     * - 本字段记录「用户此刻正停在哪一屏」，决定划出**动画**该如何表现。
+     *
+     * 之所以必须独立：Events Feed 从不写入 [lastOrigin]（它不是应用唤起来源，
+     * `LaunchOrigin` 枚举中也无对应值），故停留在 Feed 时 [lastOrigin] 仍停留在
+     * 上一次的 GRID/RECENTS。若拿 [lastOrigin] 判断「是否给底层桌面加层级微缩放」，
+     * 就会在 Feed 上误判为 Grid 而错误地加上一层缩放动画。
+     */
+    var currentScreenIndex: Int = LaunchOrigin.GRID.pageIndex
+
     fun reset() {
         currentTaskId = null
         currentPackageName = null
@@ -24,6 +39,22 @@ object LaunchOriginTracker {
 object LauncherPreviews {
     var gridBitmap: Bitmap? = null
     var recentsBitmap: Bitmap? = null
+
+    /**
+     * 抓帧时该窗口在**物理屏幕**上的绝对位置与尺寸（px）。
+     *
+     * 快照位图的大小 == 窗口大小，而非物理屏幕大小：挖孔机型上 MainActivity 的窗口
+     * 被挖孔 inset 顶掉（如 Redmi K40 1080x2400 / 挖孔 95px → 窗口 [0,95][1080,2400]，
+     * 高 2305），于是快照是 1080x2305。而手势 Overlay 是带 `FLAG_LAYOUT_NO_LIMITS`
+     * 的全屏 1080x2400。若把 2305 高的快照直接 `FIT_XY` 铺进 2400 高的 Overlay，
+     * 整幅画面会被纵向拉伸 1.0412 倍，且顶部 95px 挖孔留白被撑没 —— 即
+     * 「手动划出过程中 applications grid 顶到屏幕最上沿、铺满全屏」的根因。
+     *
+     * 因此必须一并记住**窗口的真实屏幕矩形**，渲染层据此把快照 1:1 贴回原位，
+     * 而非铺满 Overlay。
+     */
+    var gridWindowRect: Rect? = null
+    var recentsWindowRect: Rect? = null
 }
 
 /**

@@ -232,6 +232,14 @@ fun HomeScreen(
         }
     }
 
+    // 独立记录「用户此刻所在页序」，供划出手势的动画分支判断。
+    //
+    // 不能复用 [LaunchOriginTracker.lastOrigin]：它是「应用从哪一屏唤起」，
+    // 停留在 Events Feed 时它仍是上一次的 GRID/RECENTS，会导致 Feed 被误判。
+    SideEffect {
+        LaunchOriginTracker.currentScreenIndex = currentScreen
+    }
+
     // 响应外部传入的定向回溯目标页面 (例如边缘划回)，通过最短距离无缝瞬时定位
     LaunchedEffect(targetPageEvent) {
         if (targetPage != null && targetPage in 0..2) {

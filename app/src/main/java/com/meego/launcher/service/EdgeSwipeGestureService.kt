@@ -64,6 +64,15 @@ class EdgeSwipeGestureService : AccessibilityService() {
          */
         private const val GRID_DEPTH_START = 0.95f
 
+        /**
+         * 边缘侧滑「滑出应用界面」的判定比例（占屏幕宽度）。
+         *
+         * 手指横向位移达到 `screenWidth * 1/3` 即越过阈值：
+         * 越过的那一刻立刻给出触觉震动（不等抬手），
+         * 抬手时若位移仍在阈值之上则顺势飞出屏幕，否则原路弹回。
+         */
+        private const val SWIPE_OUT_THRESHOLD_RATIO = 1f / 3f
+
         @Volatile
         private var instance: EdgeSwipeGestureService? = null
         @Volatile
@@ -517,6 +526,8 @@ class EdgeSwipeGestureService : AccessibilityService() {
     private fun createEdgeTouchListener(isLeft: Boolean): View.OnTouchListener {
         var startRawX = 0f
         var isExpanded = false
+        // 本次手势是否已经越过滑出阈值并震动过：用于保证阈值只震一次（且不在抬手时重复震）
+        var hasVibratedThisGesture = false
 
         return View.OnTouchListener { v, event ->
             if (isInLauncher || !isGestureEnabledByUser) {
@@ -528,6 +539,7 @@ class EdgeSwipeGestureService : AccessibilityService() {
                 MotionEvent.ACTION_DOWN -> {
                     startRawX = event.rawX
                     isDraggingCard = false
+                    hasVibratedThisGesture = false
                     Log.d(TAG, "Touch ACTION_DOWN at rawX=$startRawX, isLeft=$isLeft")
 
                     if (params != null && !isExpanded) {
@@ -548,16 +560,24 @@ class EdgeSwipeGestureService : AccessibilityService() {
 
                     if (isDraggingCard) {
                         updateCardTransform(isLeft, deltaX)
+                        // 手指「滑过」阈值即刻震动，不等抬手 —— 触觉与手指动作实时同步。
+                        // 单调性：deltaX 只增不减，故自动锁定为仅首次越过时震一次。
+                        if (!hasVibratedThisGesture && deltaX >= swipeOutThreshold()) {
+                            hasVibratedThisGesture = true
+                            vibrate()
+                            Log.d(TAG, "Swipe crossed threshold in-flight: deltaX=$deltaX, threshold=${swipeOutThreshold()}")
+                        }
                     }
                     true
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                     if (isDraggingCard) {
                         val deltaX = if (isLeft) (event.rawX - startRawX) else (startRawX - event.rawX)
-                        Log.d(TAG, "Swipe release: deltaX=$deltaX, threshold=${screenWidth / 2f}")
+                        Log.d(TAG, "Swipe release: deltaX=$deltaX, threshold=${swipeOutThreshold()}")
                         finishSwipeOut(isLeft, deltaX)
                         isDraggingCard = false
                     }
+                    hasVibratedThisGesture = false
 
                     if (params != null && isExpanded) {
                         params.width = edgeWidth
@@ -789,7 +809,7 @@ class EdgeSwipeGestureService : AccessibilityService() {
      * 画面会朝左上角漂移。故按 `s` 反推平移量 `t = center * (1 - s)`，
      * 使 `t + s * center == center` 恒成立 —— 中心不动、四边对称内收。
      *
-     * @param progress 划出进度 0..1（0 = 刚起手，1 = 划过半屏）
+     * @param progress 划出进度 0..1（0 = 刚起手，1 = 划过 1/3 屏）
      */
     private fun applyGridDepthScale(progress: Float) {
         val iv = desktopBackgroundImageView ?: return
@@ -816,10 +836,13 @@ class EdgeSwipeGestureService : AccessibilityService() {
         iv.translationY = cy * (1f - s)
     }
 
+    /** 滑出阈值：屏幕宽度的 1/3（见 [SWIPE_OUT_THRESHOLD_RATIO]）。 */
+    private fun swipeOutThreshold(): Float = screenWidth * SWIPE_OUT_THRESHOLD_RATIO
+
     private fun finishSwipeOut(isLeft: Boolean, deltaX: Float) {
-        val threshold = screenWidth / 2f
+        val threshold = swipeOutThreshold()
         if (deltaX >= threshold) {
-            // 达到 1/2 屏幕: 顺势飞出屏幕 (Slide-out)
+            // 达到 1/3 屏幕: 顺势飞出屏幕 (Slide-out)
             val targetX = if (isLeft) screenWidth.toFloat() else -screenWidth.toFloat()
             isCardAnimatingOut = true
             pendingDismiss = false
@@ -860,10 +883,8 @@ class EdgeSwipeGestureService : AccessibilityService() {
                     }
                 })
                 ?.start()
-
-            vibrate()
         } else {
-            // 未达到 1/2 屏幕: 原路弹回全屏 (Spring back)
+            // 未达到 1/3 屏幕: 原路弹回全屏 (Spring back)
             cardContainer?.animate()
                 ?.translationX(0f)
                 ?.scaleX(1f)

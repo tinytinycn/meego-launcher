@@ -5,12 +5,22 @@ plugins {
 
 android {
     namespace = "com.meego.launcher"
-    compileSdk = 34
+    // compileSdk 35：需要 android:windowOptOutEdgeToEdgeEnforcement（API 35 引入），
+    // 用于退出 Android 15 强制 edge-to-edge，使内容可铺满至物理屏幕底边（详见 res/values-v35/themes.xml）。
+    compileSdk = 35
 
     defaultConfig {
         applicationId = "com.meego.launcher"
         minSdk = 28
-        targetSdk = 34
+        // targetSdk 35：启用 Android 官方 edge-to-edge 退出开关
+        // (android:windowOptOutEdgeToEdgeEnforcement，见 res/values-v35/themes.xml)，
+        // 使应用内容可铺满至物理屏幕底边 y=2400，消除底部 66px 黑缝。
+        //
+        // 真机实测根因（Redmi K40 / 1080x2400 / LineageOS Android 16）：
+        //   mBounds    = Rect(0,  0 - 1080, 2400)   ← 物理屏幕
+        //   mAppBounds = Rect(0, 95 - 1080, 2334)   ← 系统划给应用的安全区
+        // 该退出属性仅对 targetSdk 35+ 生效，targetSdk 34 时是死属性。
+        targetSdk = 35
         versionCode = 1
         versionName = "1.0.0"
 

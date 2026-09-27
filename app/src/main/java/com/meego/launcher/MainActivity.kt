@@ -9,6 +9,8 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.lifecycleScope
 import com.meego.launcher.data.AppRepository
 import com.meego.launcher.data.LauncherPreferences
@@ -43,14 +45,37 @@ class MainActivity : ComponentActivity() {
     private var gridColumns = androidx.compose.runtime.mutableIntStateOf(4)
     private var recentsColumns = androidx.compose.runtime.mutableIntStateOf(2)
     private var edgeSwipeEnabled = androidx.compose.runtime.mutableStateOf(true)
+    private var immersiveUiEnabled = androidx.compose.runtime.mutableStateOf(false)
     private var targetPage = androidx.compose.runtime.mutableStateOf<Int?>(null)
     private var targetPageEvent = androidx.compose.runtime.mutableLongStateOf(0L)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // 沉浸式透明状态栏和导航栏
+        // =========================================================================
+        // 全屏沉浸式：隐藏顶部状态栏与底部导航条
+        // =========================================================================
+        //
+        // 设计原则：**隐藏系统栏，而非屏蔽/拦截系统手势**。
+        //
+        // 此前方案是在应用层与守护脚本层反复压制系统手势
+        // （systemGestureExclusionRects、FLAG_NOT_TOUCH_MODAL、底部黑色遮罩），
+        // 实测既无法可靠拦下「底部上滑唤出导航条」，又引入额外浮层与性能开销。
+        // 改为直接向系统申请隐藏两条系统栏 —— 这是 Android 官方的标准做法：
+        // 系统栏隐藏后，其手势区与导航条一并消失，底部上滑自然无从触发，
+        // 无需任何对抗性屏蔽。
+        //
+        // 关键点（真机 Redmi K40 / LineageOS Android 16 行为）：
+        //  1. 必须用 WindowInsetsControllerCompat 隐藏（behavior 设为
+        //     BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE），手势导航下即生效；
+        //  2. 隐藏后导航条 inset 变为 0，内容可自然铺满至 y=2400；
+        //  3. 系统仍保留 mandatorySystemGestures，但因导航条已隐藏，
+        //     上滑不会再唤出任何东西，故无需 exclusion rects。
+        //
+        // 恢复方式：用户在系统栏位置下拉/上滑即可临时唤出（transient），
+        // 3 秒后自动隐藏，符合现代 Android 桌面惯例。
         WindowCompat.setDecorFitsSystemWindows(window, false)
+        hideSystemBars()
 
         appRepo = AppRepository(this)
         taskProvider = RootTaskProvider(this)
@@ -64,6 +89,7 @@ class MainActivity : ComponentActivity() {
             recentsColumns.intValue = preferences.recentsColumnsFlow.first()
             val isEdgeEnabled = preferences.edgeSwipeFlow.first()
             edgeSwipeEnabled.value = isEdgeEnabled
+            immersiveUiEnabled.value = preferences.immersiveUiFlow.first()
             loadApps()
             loadTasks()
             if (isEdgeEnabled) {
@@ -104,6 +130,13 @@ class MainActivity : ComponentActivity() {
                             }
                         }
                     },
+                    immersiveUiEnabled = immersiveUiEnabled.value,
+                    onToggleImmersiveUi = { enabled ->
+                        immersiveUiEnabled.value = enabled
+                        lifecycleScope.launch {
+                            preferences.setImmersiveUi(enabled)
+                        }
+                    },
                     taskProvider = taskProvider,
                     onTaskRemoved = { taskId ->
                         recentTasks.removeAll { it.taskId == taskId }
@@ -135,6 +168,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        // 从第三方应用划回启动器时系统栏可能被恢复，需重新隐藏
+        hideSystemBars()
         if (Build.VERSION.SDK_INT >= 34) {
             overrideActivityTransition(OVERRIDE_TRANSITION_OPEN, 0, 0)
             overrideActivityTransition(OVERRIDE_TRANSITION_CLOSE, 0, 0)
@@ -318,6 +353,41 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * 隐藏顶部状态栏与底部导航条，进入真正全屏沉浸式。
+     *
+     * 采用 [WindowInsetsControllerCompat] 而非已废弃的 `setSystemUiVisibility`：
+     * 前者是 AndroidX 官方现代 API，兼容 API 30+ 的手势导航，
+     * 且能正确设置 transient 行为 —— 用户在系统栏位置上下滑可临时唤出，
+     * 数秒后自动隐藏，不会破坏系统可访问性。
+     *
+     * 与「屏蔽系统手势」的本质区别：
+     * 隐藏系统栏后，导航条及其手势区**从屏幕上消失**，
+     * 底部上滑不再有可唤出的目标，因此无需任何对抗性的手势排除逻辑。
+     */
+    private fun hideSystemBars() {
+        val controller = WindowCompat.getInsetsController(window, window.decorView)
+        // 隐藏状态栏 + 导航条
+        controller.hide(WindowInsetsCompat.Type.systemBars())
+        // transient：用户从边缘滑动可临时唤出系统栏，随后自动隐藏
+        controller.systemBarsBehavior =
+            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+    }
+
+    /**
+     * 窗口重新获得焦点时重新隐藏系统栏。
+     *
+     * 必要性：从第三方应用划回启动器、或用户唤出系统栏后，
+     * 系统会恢复系统栏显示；此时必须重新隐藏，否则会残留一条导航条。
+     * 这是所有全屏桌面/沉浸式应用的标配回调。
+     */
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) {
+            hideSystemBars()
+        }
+    }
+
     private fun setupSystemGestureExclusion() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             val rootView = window.decorView
@@ -330,7 +400,18 @@ class MainActivity : ComponentActivity() {
 
                 val leftRect = Rect(0, 0, edgeW, height)
                 val rightRect = Rect(width - edgeW, 0, width, height)
-                ViewCompat.setSystemGestureExclusionRects(rootView, listOf(leftRect, rightRect))
+
+                // 注意：底部手势排除区已移除。
+                // 原因：系统栏（状态栏 + 导航条）现已通过
+                // WindowInsetsControllerCompat 真正隐藏，其手势区随之消失，
+                // 底部上滑不再会唤出导航条，无需再对抗性屏蔽。
+                // 仅保留左右两侧排除区，用于避开 Android 原生侧滑返回手势，
+                // 保障 MeeGo 自己的边缘切屏手势（changelog v1.5.0 / v1.8.5）。
+
+                ViewCompat.setSystemGestureExclusionRects(
+                    rootView,
+                    listOf(leftRect, rightRect)
+                )
             }
         }
     }

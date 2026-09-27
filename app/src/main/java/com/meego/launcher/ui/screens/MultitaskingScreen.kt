@@ -27,6 +27,7 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import com.meego.launcher.ui.components.meeGoTopSafeArea
 import com.meego.launcher.ui.components.rememberMeeGoBounceController
 import com.meego.launcher.ui.components.rememberMeeGoFlingBehavior
 import androidx.compose.material.icons.Icons
@@ -83,6 +84,7 @@ fun MultitaskingScreen(
     columns: Int = 2,
     onColumnsChanged: (Int) -> Unit = {},
     isVisible: Boolean = true,
+    showTitle: Boolean = true,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -164,7 +166,7 @@ fun MultitaskingScreen(
     Box(
         modifier = modifier
             .fillMaxSize()
-            .statusBarsPadding()
+            .meeGoTopSafeArea()
             .pointerInput(Unit) {
                 awaitPointerEventScope {
                     var startDistance = 0f
@@ -230,49 +232,54 @@ fun MultitaskingScreen(
                 .fillMaxSize()
                 .padding(horizontal = 16.dp)
         ) {
-            Spacer(modifier = Modifier.height(16.dp))
+            // 沉浸式 UI：隐藏顶部标题栏时，仅保留紧凑安全间距，让卡片铺满全屏
+            Spacer(modifier = Modifier.height(if (showTitle) 16.dp else 8.dp))
 
-            // 顶部栏
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 8.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    text = "Open Applications",
-                    color = MeeGoTextWhite,
-                    fontSize = 22.sp
-                )
-                Text(
-                    text = if (p > 0.5f) "2×2 视图" else "3×3 视图",
-                    color = MeeGoCyan,
-                    fontSize = 13.sp,
+            // 顶部栏（沉浸式 UI 开启时隐藏）
+            if (showTitle) {
+                Row(
                     modifier = Modifier
-                        .clip(SquircleShape())
-                        .background(MeeGoCardBg)
-                        .clickable {
-                            val newTarget = if (p > 0.5f) 0.0f else 1.0f
-                            val newCols = if (newTarget == 0.0f) 3 else 2
-                            coroutineScope.launch {
-                                animProgress.animateTo(
-                                    newTarget,
-                                    spring(dampingRatio = 0.96f, stiffness = 450f)
-                                )
-                                onColumnsChanged(newCols)
-                                vibrate(context)
+                        .fillMaxWidth()
+                        .padding(horizontal = 8.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "Open Applications",
+                        color = MeeGoTextWhite,
+                        fontSize = 22.sp
+                    )
+                    Text(
+                        text = if (p > 0.5f) "2×2 视图" else "3×3 视图",
+                        color = MeeGoCyan,
+                        fontSize = 13.sp,
+                        modifier = Modifier
+                            .clip(SquircleShape())
+                            .background(MeeGoCardBg)
+                            .clickable {
+                                val newTarget = if (p > 0.5f) 0.0f else 1.0f
+                                val newCols = if (newTarget == 0.0f) 3 else 2
+                                coroutineScope.launch {
+                                    animProgress.animateTo(
+                                        newTarget,
+                                        spring(dampingRatio = 0.96f, stiffness = 450f)
+                                    )
+                                    onColumnsChanged(newCols)
+                                    vibrate(context)
+                                }
                             }
-                        }
-                        .padding(horizontal = 10.dp, vertical = 4.dp)
-                )
-            }
+                            .padding(horizontal = 10.dp, vertical = 4.dp)
+                    )
+                }
 
-            Spacer(modifier = Modifier.height(16.dp))
+                Spacer(modifier = Modifier.height(16.dp))
+            }
 
             if (tasks.isEmpty()) {
                 Box(
-                    modifier = Modifier.fillMaxSize().padding(bottom = 96.dp),
+                    // 空态居中留白由 96dp 压缩至 16dp，配合窗口全屏铺满，
+                    // 避免空屏时底部出现大片无意义留白。
+                    modifier = Modifier.fillMaxSize().padding(bottom = 16.dp),
                     contentAlignment = Alignment.Center
                 ) {
                     Text(

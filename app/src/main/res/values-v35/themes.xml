@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+        Android 15 (API 35) 起，系统对 targetSdk=35+ 的应用**强制 edge-to-edge**，
+        并把应用可绘制区域收缩到 mAppBounds。
+
+        真机实测根因（Redmi K40 / 1080x2400 / LineageOS Android 16）：
+            mBounds    = Rect(0,   0 - 1080, 2400)   ← 物理屏幕
+            mAppBounds = Rect(0,  95 - 1080, 2334)   ← 系统划给应用的安全区
+            InsetsSource type=navigationBars frame=[0,2334][1080,2400]  ← 66px
+
+        尽管窗口与 ComposeView 均已是 [0,0][1080,2400]，
+        系统仍把底部 66px 导航条区域判为不可绘制：
+        实测调试色块范围恒为 y=127..2333，滚动到底亦不延伸，
+        导致列表底部永远留一条黑缝，MeeGo 全屏沉浸观感被破坏。
+
+        显式声明退出强制 edge-to-edge 策略，让应用自行掌控整屏绘制，
+        内容可一路铺到物理屏幕底边 y=2400。
+
+        说明：该属性自 API 35 引入，故置于 values-v35；
+        低版本设备沿用 values/themes.xml 的基础定义，行为不变。
+    -->
+    <style name="Theme.MeeGoLauncher" parent="android:Theme.Material.NoActionBar">
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowBackground">@android:color/black</item>
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+        <item name="android:windowDisablePreview">true</item>
+        <item name="android:windowSplashScreenAnimationDuration">0</item>
+        <item name="android:windowIsTranslucent">false</item>
+
+        <item name="android:windowOptOutEdgeToEdgeEnforcement">true</item>
+    </style>
+</resources>

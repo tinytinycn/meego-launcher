@@ -42,6 +42,7 @@ import com.meego.launcher.model.AppItem
 import com.meego.launcher.model.LaunchOrigin
 import com.meego.launcher.model.LaunchOriginTracker
 import com.meego.launcher.ui.components.DefaultSquircleShape
+import com.meego.launcher.ui.components.meeGoTopSafeArea
 import com.meego.launcher.ui.components.rememberMeeGoBounceController
 import com.meego.launcher.ui.components.rememberMeeGoFlingBehavior
 import com.meego.launcher.ui.theme.MeeGoCardBg
@@ -59,6 +60,7 @@ fun AppGridScreen(
     columns: Int,
     onOpenSettings: () -> Unit,
     isVisible: Boolean = true,
+    showTitle: Boolean = true,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -96,34 +98,42 @@ fun AppGridScreen(
     Column(
         modifier = modifier
             .fillMaxSize()
-            .statusBarsPadding()
+            // 顶部安全间距：状态栏已被真正隐藏，此处只避让挖孔，
+            // 不再按 105px 系统栏留白（否则图标被推到 y=117，顶部大片空白）。
+            .meeGoTopSafeArea()
             .padding(horizontal = 16.dp)
     ) {
-        // 顶部微间距与 MeeGo 极简标题
-        Spacer(modifier = Modifier.height(16.dp))
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text(
-                text = "Applications",
-                color = MeeGoTextWhite,
-                fontSize = 22.sp
-            )
-            Text(
-                text = "${columns} 列",
-                color = MeeGoCyan,
-                fontSize = 13.sp,
-                modifier = Modifier
-                    .clip(DefaultSquircleShape)
-                    .background(MeeGoCardBg)
-                    .clickable { onOpenSettings() }
-                    .padding(horizontal = 10.dp, vertical = 4.dp)
-            )
-        }
+        // 沉浸式 UI：隐藏顶部标题栏时，仅保留一个紧凑的安全间距，让图标真正铺满全屏
+        if (showTitle) {
+            // 顶部微间距与 MeeGo 极简标题
+            Spacer(modifier = Modifier.height(16.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "Applications",
+                    color = MeeGoTextWhite,
+                    fontSize = 22.sp
+                )
+                Text(
+                    text = "${columns} 列",
+                    color = MeeGoCyan,
+                    fontSize = 13.sp,
+                    modifier = Modifier
+                        .clip(DefaultSquircleShape)
+                        .background(MeeGoCardBg)
+                        .clickable { onOpenSettings() }
+                        .padding(horizontal = 10.dp, vertical = 4.dp)
+                )
+            }
 
-        Spacer(modifier = Modifier.height(16.dp))
+            Spacer(modifier = Modifier.height(16.dp))
+        } else {
+            // 沉浸式：顶部间距已由 meeGoTopSafeArea 统一处理（挖孔避让 + 最小呼吸空间），
+            // 此处不再额外叠加 Spacer，避免顶部出现冗余空白。
+        }
 
         CompositionLocalProvider(
             LocalOverscrollConfiguration provides null
@@ -217,7 +227,14 @@ fun AppGridScreen(
                     state = gridState,
                     horizontalArrangement = Arrangement.spacedBy(12.dp),
                     verticalArrangement = Arrangement.spacedBy(18.dp),
-                    contentPadding = PaddingValues(bottom = 96.dp),
+                    // 底部留白由 96dp 大幅压缩至 8dp。
+                    //
+                    // 真机实测（Redmi K40 / 440dpi / 1080x2400）：窗口与 ComposeView
+                    // 本身已铺满 [0,0][1080,2400]，并不存在系统级导航条留白；
+                    // 此前 96dp(=264px) 的 contentPadding 是底部黑缝的真正来源，
+                    // 使最后一行图标下方出现大片空白，破坏沉浸感。
+                    // 现压缩至 8dp，仅够容纳标签呼吸空间，内容一路铺至物理屏幕底边。
+                    contentPadding = PaddingValues(bottom = 8.dp),
                     modifier = Modifier.fillMaxSize()
                 ) {
                     items(

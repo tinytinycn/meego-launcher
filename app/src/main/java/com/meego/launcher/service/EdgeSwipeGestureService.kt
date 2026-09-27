@@ -135,7 +135,9 @@ class EdgeSwipeGestureService : AccessibilityService() {
         mainHandler.post {
             removeViews()
             createTriggerViews()
-            createBottomMaskView()
+            // 底部导航条遮罩已移除：MainActivity 现通过
+            // WindowInsetsControllerCompat 真正隐藏系统状态栏与导航条，
+            // 无需再用浮层去「盖住」导航条或对抗性屏蔽其手势。
             createCardOverlay()
         }
     }
@@ -158,9 +160,7 @@ class EdgeSwipeGestureService : AccessibilityService() {
             val visibility = if (inLauncher || !isGestureEnabledByUser) View.GONE else View.VISIBLE
             leftTriggerView?.visibility = visibility
             rightTriggerView?.visibility = visibility
-            // 仅在桌面展示底部遮罩层（屏蔽并隐藏小白条）；切入其它应用时隐退
-            bottomMaskView?.visibility = if (inLauncher) View.VISIBLE else View.GONE
-            Log.d(TAG, "updateInLauncher: inLauncher=$inLauncher, isGestureEnabledByUser=$isGestureEnabledByUser, trigger visibility=$visibility, bottomMask=${bottomMaskView?.visibility}")
+            Log.d(TAG, "updateInLauncher: inLauncher=$inLauncher, isGestureEnabledByUser=$isGestureEnabledByUser, trigger visibility=$visibility")
         }
     }
 
@@ -180,16 +180,12 @@ class EdgeSwipeGestureService : AccessibilityService() {
                 if (leftTriggerView == null || rightTriggerView == null) {
                     createTriggerViews()
                 }
-                if (bottomMaskView == null) {
-                    createBottomMaskView()
-                }
                 if (cardOverlayLayout == null) {
                     createCardOverlay()
                 }
                 val visibility = if (isInLauncher) View.GONE else View.VISIBLE
                 leftTriggerView?.visibility = visibility
                 rightTriggerView?.visibility = visibility
-                bottomMaskView?.visibility = if (isInLauncher) View.VISIBLE else View.GONE
                 if (visibility == View.VISIBLE && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     leftTriggerView?.let { v ->
                         v.post {
@@ -217,9 +213,9 @@ class EdgeSwipeGestureService : AccessibilityService() {
     private var rightParams: WindowManager.LayoutParams? = null
     private var edgeWidth: Int = 0
 
-    // 启动器桌面专用底部小横条纯黑遮罩与手势屏蔽层 (仅在处于启动器时展示)
-    private var bottomMaskView: View? = null
-    private var bottomMaskParams: WindowManager.LayoutParams? = null
+    // 注：原「底部导航条纯黑遮罩与手势屏蔽层」(bottomMaskView/bottomMaskParams) 已整体移除。
+    // MainActivity 现通过 WindowInsetsControllerCompat 真正隐藏系统状态栏与导航条，
+    // 导航条及其手势区不再显示，无需浮层遮盖或对抗性屏蔽。
 
     // 全局划出卡片跟随 Overlay
     private var cardOverlayLayout: FrameLayout? = null
@@ -244,7 +240,6 @@ class EdgeSwipeGestureService : AccessibilityService() {
         screenHeight = metrics.heightPixels
 
         createTriggerViews()
-        createBottomMaskView()
         createCardOverlay()
 
         serviceScope.launch {
@@ -420,50 +415,6 @@ class EdgeSwipeGestureService : AccessibilityService() {
             Log.d(TAG, "MeeGo edge triggers created successfully with exclusion rects (initial inLauncher=$isInLauncher, type=${leftParams?.type})")
         } catch (e: Exception) {
             Log.e(TAG, "Error adding trigger views", e)
-        }
-    }
-
-    private fun createBottomMaskView() {
-        if (windowManager == null || bottomMaskView != null) return
-
-        val density = resources.displayMetrics.density
-        val resId = resources.getIdentifier("navigation_bar_height", "dimen", "android")
-        val resHeight = if (resId > 0) resources.getDimensionPixelSize(resId) else 0
-        val maskHeight = if (resHeight > 0) resHeight else (26 * density).toInt()
-
-        bottomMaskParams = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.MATCH_PARENT,
-            maskHeight,
-            getOverlayType(),
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
-                    WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS,
-            PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.BOTTOM or Gravity.FILL_HORIZONTAL
-            x = 0
-            y = 0
-            alpha = 1.0f
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
-            }
-        }
-
-        bottomMaskView = View(this).apply {
-            // 纯黑背景，与 MeeGo OLED 纯黑桌面完美融为一体，彻底遮挡系统底部小白条
-            setBackgroundColor(Color.BLACK)
-            // 仅在处于桌面时展示，切入第三方应用后立即隐藏，完全不干扰其他应用
-            visibility = if (isInLauncher) View.VISIBLE else View.GONE
-            // 消费底部区域的触控事件，彻底屏蔽系统原生底部手势干扰
-            setOnTouchListener { _, _ -> true }
-        }
-
-        try {
-            windowManager?.addView(bottomMaskView, bottomMaskParams)
-            Log.d(TAG, "MeeGo bottom mask created successfully (initial inLauncher=$isInLauncher, height=$maskHeight)")
-        } catch (e: Exception) {
-            Log.e(TAG, "Error adding bottom mask view", e)
         }
     }
 
@@ -1063,14 +1014,12 @@ class EdgeSwipeGestureService : AccessibilityService() {
         try {
             if (leftTriggerView != null) windowManager?.removeView(leftTriggerView)
             if (rightTriggerView != null) windowManager?.removeView(rightTriggerView)
-            if (bottomMaskView != null) windowManager?.removeView(bottomMaskView)
             if (cardOverlayLayout != null) windowManager?.removeView(cardOverlayLayout)
         } catch (e: Exception) {
             e.printStackTrace()
         } finally {
             leftTriggerView = null
             rightTriggerView = null
-            bottomMaskView = null
             cardOverlayLayout = null
         }
     }

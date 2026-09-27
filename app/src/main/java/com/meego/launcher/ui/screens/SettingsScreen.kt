@@ -16,6 +16,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.meego.launcher.ui.components.meeGoTopSafeArea
 import com.meego.launcher.ui.components.SquircleShape
 import com.meego.launcher.ui.theme.MeeGoCardBg
 import com.meego.launcher.ui.theme.MeeGoCyan
@@ -28,13 +29,15 @@ fun SettingsScreen(
     onSelectColumns: (Int) -> Unit,
     edgeSwipeEnabled: Boolean,
     onToggleEdgeSwipe: (Boolean) -> Unit,
+    immersiveUiEnabled: Boolean,
+    onToggleImmersiveUi: (Boolean) -> Unit,
     onBack: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     Column(
         modifier = modifier
             .fillMaxSize()
-            .statusBarsPadding()
+            .meeGoTopSafeArea()
             .padding(16.dp)
             .verticalScroll(rememberScrollState())
     ) {
@@ -91,7 +94,32 @@ fun SettingsScreen(
 
         Spacer(modifier = Modifier.height(28.dp))
 
-        // 分组 2: 全局上半屏边缘划回手势
+        // 分组 2: 显示 (沉浸式 UI)
+        Text(
+            text = "DISPLAY 显示与沉浸式",
+            color = MeeGoCyan,
+            fontSize = 13.sp,
+            modifier = Modifier.padding(start = 8.dp, bottom = 8.dp)
+        )
+
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(SquircleShape(cornerRadius = 16.dp))
+                .background(MeeGoCardBg)
+                .padding(16.dp)
+        ) {
+            SettingSwitchItem(
+                title = "沉浸式 UI (隐藏标题与翻页点)",
+                description = "隐藏应用网格 / 多任务视图的顶部标题栏，以及底部三屏翻页指示点，让内容铺满全屏",
+                checked = immersiveUiEnabled,
+                onCheckedChange = onToggleImmersiveUi
+            )
+        }
+
+        Spacer(modifier = Modifier.height(28.dp))
+
+        // 分组 3: 全局上半屏边缘划回手势
         Text(
             text = "ORIGIN-AWARE SWIPE 边缘手势",
             color = MeeGoCyan,
@@ -106,38 +134,17 @@ fun SettingsScreen(
                 .background(MeeGoCardBg)
                 .padding(16.dp)
         ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = "全屏边缘侧滑切回",
-                        color = MeeGoTextWhite,
-                        fontSize = 16.sp
-                    )
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = "从任意 App 屏幕左右边缘划入 1/2 松手，切回启动源页面",
-                        color = MeeGoTextDim,
-                        fontSize = 13.sp
-                    )
-                }
-                Switch(
-                    checked = edgeSwipeEnabled,
-                    onCheckedChange = onToggleEdgeSwipe,
-                    colors = SwitchDefaults.colors(
-                        checkedThumbColor = Color.White,
-                        checkedTrackColor = MeeGoCyan
-                    )
-                )
-            }
+            SettingSwitchItem(
+                title = "全屏边缘侧滑切回",
+                description = "从任意 App 屏幕左右边缘划入 1/2 松手，切回启动源页面",
+                checked = edgeSwipeEnabled,
+                onCheckedChange = onToggleEdgeSwipe
+            )
         }
 
         Spacer(modifier = Modifier.height(28.dp))
 
-        // 分组 3: 系统与物理机信息
+        // 分组 4: 系统与物理机信息
         Text(
             text = "SYSTEM & HARDWARE",
             color = MeeGoCyan,
@@ -191,6 +198,42 @@ private fun SettingRadioItem(
                 modifier = Modifier.size(20.dp)
             )
         }
+    }
+}
+
+@Composable
+private fun SettingSwitchItem(
+    title: String,
+    description: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = title,
+                color = MeeGoTextWhite,
+                fontSize = 16.sp
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = description,
+                color = MeeGoTextDim,
+                fontSize = 13.sp
+            )
+        }
+        Switch(
+            checked = checked,
+            onCheckedChange = onCheckedChange,
+            colors = SwitchDefaults.colors(
+                checkedThumbColor = Color.White,
+                checkedTrackColor = MeeGoCyan
+            )
+        )
     }
 }
 

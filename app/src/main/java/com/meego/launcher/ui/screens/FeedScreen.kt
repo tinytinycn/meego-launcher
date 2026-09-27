@@ -30,6 +30,7 @@ import androidx.compose.ui.input.pointer.util.VelocityTracker
 import androidx.compose.ui.platform.LocalViewConfiguration
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.meego.launcher.ui.components.meeGoTopSafeArea
 import com.meego.launcher.ui.components.rememberMeeGoBounceController
 import com.meego.launcher.ui.components.rememberMeeGoFlingBehavior
 import com.meego.launcher.ui.theme.MeeGoCardBg
@@ -76,7 +77,7 @@ fun FeedScreen(modifier: Modifier = Modifier) {
         Box(
             modifier = modifier
                 .fillMaxSize()
-                .statusBarsPadding()
+                .meeGoTopSafeArea()
         ) {
             Box(
                 modifier = Modifier

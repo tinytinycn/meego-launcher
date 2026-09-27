@@ -26,18 +26,44 @@ object LauncherPreviews {
     var recentsBitmap: Bitmap? = null
 }
 
+/**
+ * 一帧快照及其真实元信息。
+ *
+ * @param captureTimeMs 该帧被**抓取**的时刻（epoch ms），必须来自文件 mtime 或抓帧现场，
+ *                      绝不能用「写入内存的时刻」代替 —— 否则手势动画里把帧塞进缓存时
+ *                      会盖上「现在」的时间戳，把一帧旧过渡帧伪装成最新帧，新鲜度仲裁随之失效。
+ * @param isSettled 该帧是否已确认是应用稳定后的画面。false 表示仍处于启动动画期，
+ *                   渲染层应降级为图标占位而非展示半渲染画面。
+ */
+data class SnapshotEntry(
+    val bitmap: Bitmap,
+    val captureTimeMs: Long,
+    val isSettled: Boolean
+)
+
 object TaskSnapshotCache {
     private val cache = mutableMapOf<Int, Bitmap>()
     private val pkgCache = mutableMapOf<String, Bitmap>()
+    private val entries = mutableMapOf<Int, SnapshotEntry>()
+    private val pkgEntries = mutableMapOf<String, SnapshotEntry>()
+
     var lastSwipedTaskId: Int? = null
     var lastSwipedPackageName: String? = null
     var lastSwipedBitmap: Bitmap? = null
 
     @Synchronized
-    fun put(taskId: Int, bitmap: Bitmap, packageName: String? = null) {
+    fun put(
+        taskId: Int,
+        bitmap: Bitmap,
+        packageName: String? = null,
+        captureTimeMs: Long = System.currentTimeMillis(),
+        isSettled: Boolean = true
+    ) {
         cache[taskId] = bitmap
+        entries[taskId] = SnapshotEntry(bitmap, captureTimeMs, isSettled)
         if (packageName != null) {
             pkgCache[packageName] = bitmap
+            pkgEntries[packageName] = SnapshotEntry(bitmap, captureTimeMs, isSettled)
         }
     }
 
@@ -51,12 +77,24 @@ object TaskSnapshotCache {
         return pkgCache[packageName]
     }
 
+    /** 取该任务的帧及其元信息；无记录时返回 null。 */
+    @Synchronized
+    fun getEntry(taskId: Int): SnapshotEntry? {
+        return entries[taskId]
+    }
+
     @Synchronized
     fun remove(taskId: Int) {
-        cache.remove(taskId)
+        val removed = cache.remove(taskId)
+        entries.remove(taskId)
         if (lastSwipedTaskId == taskId) {
             lastSwipedTaskId = null
             lastSwipedBitmap = null
+        }
+        // 包名索引可能仍指向该任务，顺手剔除，避免已删除任务继续被按包名命中
+        if (removed != null) {
+            pkgCache.entries.removeAll { it.value === removed }
+            pkgEntries.entries.removeAll { it.value.bitmap === removed }
         }
     }
 
@@ -64,6 +102,8 @@ object TaskSnapshotCache {
     fun clear() {
         cache.clear()
         pkgCache.clear()
+        entries.clear()
+        pkgEntries.clear()
         lastSwipedTaskId = null
         lastSwipedPackageName = null
         lastSwipedBitmap = null
@@ -96,5 +136,12 @@ data class RecentTask(
     val label: String,
     val icon: Drawable? = null,
     val snapshot: Bitmap? = null,
-    val isForeground: Boolean = false
+    val isForeground: Boolean = false,
+    /**
+     * 该快照被**抓取**的时刻（epoch ms）。渲染层可据此判断画面是否已过期，
+     * 避免长期展示陈旧帧。仅作观测用途，不参与 data class 相等性比较之外的逻辑。
+     */
+    val snapshotTimeMs: Long = 0L,
+    /** 该快照是否已确认是应用稳定后的画面；false 时渲染层应降级为图标占位。 */
+    val snapshotIsSettled: Boolean = true
 )

@@ -711,8 +711,13 @@ class EdgeSwipeGestureService : AccessibilityService() {
             cardImageView?.setImageBitmap(snapBitmap)
             cardImageView?.scaleType = ImageView.ScaleType.FIT_XY
             cardImageView?.setBackgroundColor(Color.TRANSPARENT)
+            // 滑出瞬间的画面本质是过渡态：显式标记 isSettled=false，
+            // 并用帧文件的真实 mtime 作为抓取时刻，避免把过渡帧伪装成"最新且稳定"的帧
+            val srcTime = snapshotCandidates(curTaskId ?: -1, curPkg)
+                .filter { it.exists() }
+                .maxOfOrNull { it.lastModified() } ?: System.currentTimeMillis()
             if (curTaskId != null) {
-                TaskSnapshotCache.put(curTaskId, snapBitmap, curPkg)
+                TaskSnapshotCache.put(curTaskId, snapBitmap, curPkg, srcTime, isSettled = false)
                 TaskSnapshotCache.lastSwipedTaskId = curTaskId
             }
             if (curPkg != null) {
@@ -793,8 +798,11 @@ class EdgeSwipeGestureService : AccessibilityService() {
             val curPkg = LaunchOriginTracker.currentPackageName ?: readCurrentPkgFromFile()
             val snapBitmap = (cardImageView?.drawable as? android.graphics.drawable.BitmapDrawable)?.bitmap
             if (snapBitmap != null && cardImageView?.scaleType == ImageView.ScaleType.FIT_XY) {
+                val srcTime = snapshotCandidates(currentTaskId ?: -1, curPkg)
+                    .filter { it.exists() }
+                    .maxOfOrNull { it.lastModified() } ?: System.currentTimeMillis()
                 if (currentTaskId != null) {
-                    TaskSnapshotCache.put(currentTaskId, snapBitmap, curPkg)
+                    TaskSnapshotCache.put(currentTaskId, snapBitmap, curPkg, srcTime, isSettled = false)
                     TaskSnapshotCache.lastSwipedTaskId = currentTaskId
                 }
                 if (curPkg != null) {
@@ -903,83 +911,136 @@ class EdgeSwipeGestureService : AccessibilityService() {
         }
     }
 
+    /**
+     * 判定某个 taskId 的 live 帧是否仍处于启动动画期（provisional）。
+     *
+     * 守护进程在应用刚进入前台时抓到的第一帧必然是 splash / 过渡帧，
+     * 它在 `settle_window` 结束前一直带此标记；渲染层遇到 provisional 帧应降级为图标占位，
+     * 绝不展示误导性的半渲染画面。
+     */
+    private fun isProvisional(taskId: Int): Boolean {
+        return try {
+            File(filesDir, "snapshots/${taskId}_live.provisional").exists()
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    private data class SnapshotCandidate(
+        val file: File,
+        val isProvisional: Boolean
+    )
+
+    /**
+     * 按**新鲜度**仲裁快照来源。
+     *
+     * 此前实现按固定优先级取 `${tid}_live.png` 并直接返回，导致一张陈旧的过渡帧
+     * 仅凭优先级就能压过系统刚刚写好的新鲜快照（实测：任务 192 的 live 帧老化 3725s，
+     * 而同任务的系统 `_reduced.jpg` 仅 0s）。现在改为：同池候选中取 mtime 最大者，
+     * 且 provisional 帧被排除在仲裁之外。
+     */
+    private fun pickFreshestFile(candidates: List<File>, taskId: Int): Pair<File, Boolean>? {
+        val provisional = isProvisional(taskId)
+        var best: File? = null
+        var bestTime = Long.MIN_VALUE
+        for (f in candidates) {
+            try {
+                if (!f.exists() || !f.canRead() || f.length() <= 0) continue
+                val t = f.lastModified()
+                if (t > bestTime) {
+                    bestTime = t
+                    best = f
+                }
+            } catch (e: Exception) {
+                // ignore
+            }
+        }
+        if (best == null) return null
+
+        // 标记只针对 live 类文件；系统快照（_reduced.jpg / .jpg）视为稳定帧
+        val isLive = best.name.endsWith("_live.png")
+        return Pair(best, isLive && provisional)
+    }
+
     private fun loadLatestSnapshot(): Bitmap? {
         return try {
             val currentTaskId = getCurrentTaskId() ?: return null
             val curPkg = LaunchOriginTracker.currentPackageName ?: readCurrentPkgFromFile()
 
-            // 1. 优先读取该任务专属的 live 实时截图 (必须优先检查 App 私有目录，突破 Android 16 对 /data/local/tmp/snapshots 软链接的权限隔离)
-            val candidateLiveFiles = listOf(
-                File(filesDir, "snapshots/${currentTaskId}_live.png"),
-                File("/data/local/tmp/snapshots/${currentTaskId}_live.png")
-            )
-            for (liveFile in candidateLiveFiles) {
-                if (liveFile.exists() && liveFile.length() > 0 && liveFile.canRead()) {
-                    val bmp = loadBitmapFromFile(liveFile.absolutePath)
-                    if (bmp != null) {
-                        Log.d(TAG, "Loaded live snapshot for task $currentTaskId from ${liveFile.absolutePath}")
-                        return bmp
-                    }
+            // a. 内存快路径：滑出动画需要即时性。若内存帧已确认稳定，且不早于任何文件候选
+            //    的最新 mtime，则直接采用，避免解码开销。
+            val memEntry = TaskSnapshotCache.getEntry(currentTaskId)
+            if (memEntry != null && memEntry.isSettled) {
+                val newestFileTime = snapshotCandidates(currentTaskId, curPkg)
+                    .maxOfOrNull { f -> if (f.exists()) f.lastModified() else 0L } ?: 0L
+                if (memEntry.captureTimeMs >= newestFileTime) {
+                    Log.d(TAG, "Using settled in-memory snapshot for task $currentTaskId ($curPkg)")
+                    return memEntry.bitmap
                 }
             }
 
-            // 2. 检查全局 current_app.png，严格校验所有权（current_app_tid 或 current_app_pkg 必须精确匹配）
-            val tidFromTidFile = readIntFromFile(File(filesDir, "current_app_tid.txt"))
-                ?: readIntFromFile(File("/data/local/tmp/current_app_tid.txt"))
-            val pkgFromPkgFile = readTextFromFile(File(filesDir, "current_app_pkg.txt"))
-                ?: readTextFromFile(File("/data/local/tmp/current_app_pkg.txt"))
+            // b. 文件仲裁：同池取 mtime 最大者，跳过 provisional 帧
+            val files = snapshotCandidates(currentTaskId, curPkg)
+            val nonProvisional = files.filter { !isProvisionalLive(it, currentTaskId) }
+            val pool = if (nonProvisional.isNotEmpty()) nonProvisional else emptyList()
 
-            val isOwnershipVerified = (tidFromTidFile == currentTaskId) ||
-                    (curPkg != null && pkgFromPkgFile == curPkg)
-
-            if (isOwnershipVerified) {
-                val candidateCurrentApp = listOf(
-                    File(filesDir, "current_app.png"),
-                    File("/data/local/tmp/current_app.png")
-                )
-                for (currentAppFile in candidateCurrentApp) {
-                    if (currentAppFile.exists() && currentAppFile.length() > 0 && currentAppFile.canRead()) {
-                        val bmp = loadBitmapFromFile(currentAppFile.absolutePath)
-                        if (bmp != null) {
-                            Log.d(TAG, "Loaded verified live screen snapshot from ${currentAppFile.absolutePath} for task $currentTaskId ($curPkg)")
-                            return bmp
-                        }
-                    }
+            val chosen = if (pool.isNotEmpty()) pickFreshestFile(pool, currentTaskId) else null
+            if (chosen != null) {
+                val (file, prov) = chosen
+                val bmp = loadBitmapFromFile(file.absolutePath)
+                if (bmp != null) {
+                    TaskSnapshotCache.put(
+                        currentTaskId, bmp, curPkg,
+                        captureTimeMs = file.lastModified(),
+                        isSettled = !prov
+                    )
+                    Log.d(TAG, "Picked freshest snapshot ${file.name} for task $currentTaskId ($curPkg) settled=${!prov}")
+                    return bmp
                 }
             }
 
-            // 3. 读取系统生成的该任务专属快照文件 (支持私有目录与 tmp 目录)
-            val candidateSysFiles = listOf(
-                File(filesDir, "snapshots/${currentTaskId}_reduced.jpg"),
-                File(filesDir, "snapshots/${currentTaskId}.jpg"),
-                File("/data/local/tmp/snapshots/${currentTaskId}_reduced.jpg"),
-                File("/data/local/tmp/snapshots/$currentTaskId.jpg")
-            )
-            for (taskSnapFile in candidateSysFiles) {
-                if (taskSnapFile.exists() && taskSnapFile.length() > 0 && taskSnapFile.canRead()) {
-                    val bmp = loadBitmapFromFile(taskSnapFile.absolutePath)
-                    if (bmp != null) {
-                        Log.d(TAG, "Loaded snapshot for task $currentTaskId from ${taskSnapFile.absolutePath}")
-                        return bmp
-                    }
-                }
+            // c. 全部文件候选均为 provisional（应用仍处于启动动画期）：
+            //    此时任何截图都是误导性的半渲染画面，按产品决策降级为图标占位，
+            //    即返回 null，由调用方渲染应用图标 + 名称。
+            if (files.isNotEmpty() && pool.isEmpty()) {
+                Log.d(TAG, "All snapshot candidates for task $currentTaskId ($curPkg) are provisional; degrade to icon")
             }
 
-            // 4. 读取当前任务专属内存缓存 (优先按 taskId，次选按当前包名)
-            val cached = TaskSnapshotCache.get(currentTaskId)
-                ?: (if (curPkg != null) TaskSnapshotCache.getByPackage(curPkg) else null)
-            if (cached != null) {
-                Log.d(TAG, "Loaded snapshot from TaskSnapshotCache for task $currentTaskId ($curPkg)")
-                return cached
-            }
-
-            // 5. 严格隔离：若该任务尚无快照，坚决不读取任何其他任务的画面！
-            Log.w(TAG, "No snapshot available for task $currentTaskId ($curPkg)")
+            // d. 严格隔离：若该任务尚无任何快照，坚决不读取其他任务的画面
+            Log.w(TAG, "No usable snapshot for task $currentTaskId ($curPkg)")
             null
         } catch (e: Exception) {
             Log.e(TAG, "Failed to load snapshot", e)
             null
         }
+    }
+
+    private fun snapshotCandidates(taskId: Int, curPkg: String?): List<File> {
+        val list = mutableListOf<File>()
+        // App 私有目录优先：Android 16 SELinux 严格隔离 /data/local/tmp/snapshots 软链
+        list.add(File(filesDir, "snapshots/${taskId}_live.png"))
+        list.add(File(filesDir, "snapshots/${taskId}_reduced.jpg"))
+        list.add(File(filesDir, "snapshots/${taskId}.jpg"))
+        list.add(File("/data/local/tmp/snapshots/${taskId}_live.png"))
+        list.add(File("/data/local/tmp/snapshots/${taskId}_reduced.jpg"))
+        list.add(File("/data/local/tmp/snapshots/${taskId}.jpg"))
+
+        // 全局 current_app.png 需严格校验所有权，防止跨应用串扰
+        val tidFromTidFile = readIntFromFile(File(filesDir, "current_app_tid.txt"))
+            ?: readIntFromFile(File("/data/local/tmp/current_app_tid.txt"))
+        val pkgFromPkgFile = readTextFromFile(File(filesDir, "current_app_pkg.txt"))
+            ?: readTextFromFile(File("/data/local/tmp/current_app_pkg.txt"))
+        val ownershipVerified = (tidFromTidFile == taskId) ||
+                (curPkg != null && pkgFromPkgFile == curPkg)
+        if (ownershipVerified) {
+            list.add(File(filesDir, "current_app.png"))
+            list.add(File("/data/local/tmp/current_app.png"))
+        }
+        return list
+    }
+
+    private fun isProvisionalLive(file: File, taskId: Int): Boolean {
+        return file.name.endsWith("_live.png") && isProvisional(taskId)
     }
 
     private fun vibrate() {

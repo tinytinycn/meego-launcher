@@ -146,6 +146,14 @@ class MainActivity : ComponentActivity() {
         loadTasks()
         window.decorView.postDelayed({ loadTasks() }, 600)
         window.decorView.postDelayed({ loadTasks() }, 1500)
+        // 兜底：慢设备上系统快照落盘可能晚于 1500ms。
+        // 仅在首位卡片仍无快照时追加一次刷新，避免无条件并发加载
+        // （v1.8.13 曾因重复并发 loadTasks 引入过卡片位移动画播放两次的竞态）。
+        window.decorView.postDelayed({
+            if (recentTasks.firstOrNull()?.snapshot == null) {
+                loadTasks()
+            }
+        }, 2500)
         startEdgeServiceIfNeeded()
         // 处于启动器内部时，彻底禁用边缘手势触发区，保证三屏循环滑动不被任何边缘悬浮层拦截
         EdgeSwipeGestureService.setInLauncher(true)

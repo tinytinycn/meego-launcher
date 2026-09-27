@@ -62,42 +62,91 @@ class RootTaskProvider(private val context: Context) {
 
                         val snapPath = obj.optString("snapshotPath", "")
                         var snapshotBitmap: Bitmap? = null
+                        var snapshotTimeMs = 0L
+                        var snapshotIsSettled = true
 
-                        // 1.1 优先读取系统为该 taskId 生成的官方真实快照文件 (支持私有目录与 tmp 目录)
+                        // 1.1 收集全部候选（私有目录优先，规避 Android 16 对
+                        //     /data/local/tmp/snapshots 软链的 SELinux 隔离）
                         val candidateFiles = listOfNotNull(
                             File(context.filesDir, "snapshots/${taskId}_live.png"),
                             File(context.filesDir, "snapshots/${taskId}_reduced.jpg"),
+                            File(context.filesDir, "snapshots/${taskId}.jpg"),
                             if (snapPath.isNotEmpty()) File(snapPath) else null,
                             File("/data/local/tmp/snapshots/${taskId}_live.png"),
                             File("/data/local/tmp/snapshots/${taskId}_reduced.jpg")
                         )
 
+                        // 1.2 该任务 live 帧是否仍处于启动动画期（provisional）
+                        val isProvisional = try {
+                            File(context.filesDir, "snapshots/${taskId}_live.provisional").exists()
+                        } catch (e: Exception) {
+                            false
+                        }
+
+                        // 1.3 同池取 mtime 最大者；provisional 的 live 帧不参与仲裁，
+                        //     也不写入内存缓存（防止污染 TaskSnapshotCache 权威版本）
+                        var bestFile: File? = null
+                        var bestTime = Long.MIN_VALUE
                         for (file in candidateFiles) {
-                            if (file.exists() && file.canRead()) {
-                                try {
-                                    snapshotBitmap = BitmapFactory.decodeFile(file.absolutePath)
-                                    if (snapshotBitmap != null) {
-                                        TaskSnapshotCache.put(taskId, snapshotBitmap)
-                                        break
-                                    }
-                                } catch (e: Exception) {
-                                    // ignore
+                            try {
+                                if (!file.exists() || !file.canRead() || file.length() <= 0) continue
+                                if (isProvisional && file.name.endsWith("_live.png")) continue
+                                val t = file.lastModified()
+                                if (t > bestTime) {
+                                    bestTime = t
+                                    bestFile = file
                                 }
+                            } catch (e: Exception) {
+                                // ignore
                             }
                         }
 
-                        // 1.2 次选：从内存缓存获取该 taskId 的专属快照
-                        if (snapshotBitmap == null) {
-                            snapshotBitmap = TaskSnapshotCache.get(taskId)
+                        if (bestFile != null) {
+                            try {
+                                val bmp = BitmapFactory.decodeFile(bestFile.absolutePath)
+                                if (bmp != null) {
+                                    snapshotBitmap = bmp
+                                    snapshotTimeMs = bestTime
+                                    // 系统快照（_reduced.jpg / .jpg）视为稳定帧
+                                    snapshotIsSettled = !bestFile.name.endsWith("_live.png")
+                                    TaskSnapshotCache.put(
+                                        taskId, bmp, null,
+                                        captureTimeMs = snapshotTimeMs,
+                                        isSettled = snapshotIsSettled
+                                    )
+                                }
+                            } catch (e: Exception) {
+                                // ignore
+                            }
                         }
 
-                        // 1.3 严格回退：手势刚滑出的任务专属快照
+                        // 1.4 次选：从内存缓存获取该 taskId 的专属快照
+                        if (snapshotBitmap == null) {
+                            val memEntry = TaskSnapshotCache.getEntry(taskId)
+                            if (memEntry != null && memEntry.isSettled) {
+                                snapshotBitmap = memEntry.bitmap
+                                snapshotTimeMs = memEntry.captureTimeMs
+                                snapshotIsSettled = true
+                            }
+                        }
+
+                        // 1.5 严格回退：手势刚滑出的任务专属快照
                         if (snapshotBitmap == null && taskId == TaskSnapshotCache.lastSwipedTaskId && pkgName == TaskSnapshotCache.lastSwipedPackageName) {
                             snapshotBitmap = TaskSnapshotCache.lastSwipedBitmap
                             if (snapshotBitmap != null) {
-                                TaskSnapshotCache.put(taskId, snapshotBitmap)
+                                // 滑出画面对应的是过渡态，不得标记为稳定帧
+                                snapshotIsSettled = false
+                                TaskSnapshotCache.put(
+                                    taskId, snapshotBitmap, null,
+                                    captureTimeMs = System.currentTimeMillis(),
+                                    isSettled = false
+                                )
                             }
                         }
+
+                        // 1.6 全部候选均为 provisional（应用仍处于启动动画期）：
+                        //     保持 snapshot 为 null，卡片自动降级为图标占位，
+                        //     绝不展示误导性的半渲染过渡画面。
 
                         val label = try {
                             val appInfo = packageManager.getApplicationInfo(pkgName, 0)
@@ -118,7 +167,9 @@ class RootTaskProvider(private val context: Context) {
                                 packageName = pkgName,
                                 label = label,
                                 icon = icon,
-                                snapshot = snapshotBitmap
+                                snapshot = snapshotBitmap,
+                                snapshotTimeMs = snapshotTimeMs,
+                                snapshotIsSettled = snapshotIsSettled
                             )
                         )
                     }
@@ -255,7 +306,16 @@ class RootTaskProvider(private val context: Context) {
                 }
 
                 // 尝试从持久化快照目录中读取快照
-                var snapshotBitmap = TaskSnapshotCache.get(taskId)
+                // 注意：仍处于启动动画期的 provisional 帧在此同样不可信（会复活 splash），
+                // 故与主路径保持一致，先排除 provisional 再选帧。
+                val localProvisional = try {
+                    File(context.filesDir, "snapshots/${taskId}_live.provisional").exists()
+                } catch (e: Exception) {
+                    false
+                }
+                var snapshotBitmap = TaskSnapshotCache.getEntry(taskId)
+                    ?.takeIf { it.isSettled }
+                    ?.bitmap
                 if (snapshotBitmap == null && taskId > 0) {
                     val candidateFiles = listOf(
                         File(context.filesDir, "snapshots/${taskId}_live.png"),
@@ -266,10 +326,15 @@ class RootTaskProvider(private val context: Context) {
                     )
                     for (file in candidateFiles) {
                         if (file.exists() && file.canRead()) {
+                            if (localProvisional && file.name.endsWith("_live.png")) continue
                             try {
                                 snapshotBitmap = BitmapFactory.decodeFile(file.absolutePath)
                                 if (snapshotBitmap != null) {
-                                    TaskSnapshotCache.put(taskId, snapshotBitmap)
+                                    TaskSnapshotCache.put(
+                                        taskId, snapshotBitmap, null,
+                                        captureTimeMs = file.lastModified(),
+                                        isSettled = !file.name.endsWith("_live.png")
+                                    )
                                     break
                                 }
                             } catch (e: Exception) {

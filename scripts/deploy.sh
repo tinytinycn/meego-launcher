@@ -77,6 +77,51 @@ daemon_proc_count() {
     "$ADB" shell 'pgrep -f "meego_daemon.sh" 2>/dev/null | wc -l' 2>/dev/null | tr -cd '0-9'
 }
 
+# ===========================================================================
+# 前置检查：设备连接 + Root 可用性
+#
+# 【为什么必须在编译之前检查 Root】
+# 特权守护进程**必须以 uid 0 运行** —— Task Snapshot 直读桥所需权限为
+#   allOf = {MANAGE_ACTIVITY_TASKS, READ_FRAME_BUFFER}
+# 二者皆 signature 级，只有 root 能满足（实测 uid=10209 直接 SecurityException）。
+#
+# 而部署流程是用 `adb shell` 拉起守护进程的，故「`adb shell` 是否 root」
+# 直接决定成败：
+#   `adb root` 可用（LineageOS userdebug/eng）→ adb shell 即 uid 0 → 正常
+#   仅 Magisk su 可用而 adb 非 root      → adb shell 是 shell uid(2000)
+#                                          → 守护进程非 root → 桥静默失效
+#
+# 【为何要显式拦下，而不是让它自然失败】
+# 非 root 时桥会返回 `{"ok":false,...}`，守护脚本按设计**静默回退**到纯
+# screencap 管线 —— 于是整套部署"看起来成功"，只是多任务卡片始终是整屏截图、
+# 永远拿不到纯净的任务窗口帧。这种"安静地降级"极难归因，故此处 fail fast，
+# 并直接给出两种修法。
+# ===========================================================================
+echo "=== 前置检查：设备连接与 Root 权限 ==="
+DEV_COUNT=$("$ADB" devices 2>/dev/null | grep -c -E '\bdevice$' || echo 0)
+if [ "$DEV_COUNT" -eq 0 ]; then
+    echo "❌ 未检测到已连接的设备。请先连接真机（USB 或无线调试），并确认 'adb devices' 能看到设备。"
+    exit 1
+fi
+echo "  ✅ 已连接设备 $DEV_COUNT 台"
+
+SHELL_UID=$("$ADB" shell 'id -u' 2>/dev/null | tr -d '\r' | tr -cd '0-9')
+if [ "$SHELL_UID" = "0" ]; then
+    echo "  ✅ adb shell 为 root（uid=0），特权守护链具备所需权限"
+else
+    echo "  ❌ adb shell 当前 uid=${SHELL_UID:-未知}，**不是 root**。"
+    echo ""
+    echo "     本项目特权守护链必须以 uid 0 运行（Task Snapshot 直读需要"
+    echo "     MANAGE_ACTIVITY_TASKS + READ_FRAME_BUFFER，二者均为 signature 级）。"
+    echo "     若强行继续，部署会「看起来成功」，但多任务卡片会静默退化为整屏截图。"
+    echo ""
+    echo "     请任选一种方式修复后重试："
+    echo "       ① 执行 adb root（LineageOS userdebug/eng 构建支持）"
+    echo "       ② 若为 user 构建仅有 Magisk：需改为经 su 拉起守护链，"
+    echo "          当前 deploy.sh 尚未支持该路径"
+    exit 1
+fi
+
 echo "=== [1/7] 编译 MeeGo Launcher Debug APK ==="
 cd "$PROJECT_ROOT"
 "$GRADLE_CMD" assembleDebug --console=plain

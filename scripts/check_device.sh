@@ -107,4 +107,34 @@ else
     else
         echo "  ⚠️ 无守护进程心跳文件 —— 守护进程从未启动过"
     fi
+
+    # ---------------------------------------------------------------------------
+    # 开机自启诊断（v1.8.41）
+    #
+    # 本机不存在 /system/etc/init/meego_daemon.rc 且 /system 受 dm-verity 保护
+    # 不可写，故开机自启改由 Magisk 的 service.d 钩子承担。此项决定了
+    # 「重启之后守护链还在不在」—— 必须能从诊断里直接看出来。
+    # ---------------------------------------------------------------------------
+    echo ""
+    echo "=== 开机自启诊断 ==="
+    if "$ADB" shell "su -c 'test -d /data/adb'" 2>/dev/null; then
+        if "$ADB" shell "su -c 'test -x /data/adb/service.d/meego_boot.sh'" 2>/dev/null; then
+            echo "  ✅ Magisk 开机钩子已安装（/data/adb/service.d/meego_boot.sh）"
+        else
+            echo "  ⚠️ Magisk 存在但开机钩子未安装 —— 重启后守护链不会自启（跑 deploy.sh 可安装）"
+        fi
+    else
+        echo "  ℹ️ 未检测到 Magisk（无 /data/adb）"
+    fi
+    if "$ADB" shell "test -f /system/etc/init/meego_daemon.rc" 2>/dev/null; then
+        echo "  ℹ️ 亦存在 init 路径 rc（/system/etc/init/meego_daemon.rc）"
+    fi
+    # 最近一次开机拉起的结果：由 meego_boot.sh 写入，是排查「重启后没起来」的第一现场
+    BOOTLOG=$("$ADB" shell "tail -n 4 /data/local/tmp/meego_boot.log 2>/dev/null" 2>/dev/null | tr -d '\r' || true)
+    if [ -n "$BOOTLOG" ]; then
+        echo "  最近一次拉起日志（/data/local/tmp/meego_boot.log）："
+        echo "$BOOTLOG" | sed 's/^/    /'
+    else
+        echo "  ℹ️ 无拉起日志（meego_boot.log 不存在，可能是升级前启动的守护链）"
+    fi
 fi

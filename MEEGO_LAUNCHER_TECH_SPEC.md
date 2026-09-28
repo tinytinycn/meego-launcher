@@ -1,6 +1,6 @@
 # MeeGo Harmattan 风格 Android 启动器 (MeeGo Launcher) 技术方案
 
-> **版本**：v1.8.40  
+> **版本**：v1.8.41  
 > **文档位置**：`MEEGO_LAUNCHER_TECH_SPEC.md`（项目根目录）  
 > **维护规范**：全程在 DSH 环境中进行自主开发，每次会话针对架构、需求、实现的任何调整，均需即时同步更新此文档。
 
@@ -105,6 +105,16 @@ systemProp.https.proxyPort=1087
 3. **USB 物理机免驱动即插即用**：
    - macOS 原生支持 Android 手机 USB 调试连接，无需配置 udev rules。
    - 若遇到无法识别，执行 `adb kill-server && adb start-server`。
+4. **⚠️ bash 3.2 的变量插值陷阱（本机实测踩中，务必遵守）**：
+   - macOS 自带的是 **GNU bash 3.2.57**（2007 年发布；Apple 因 GPLv3 不再更新它），其解析器存在缺陷：**当 `$VAR` 后面紧跟一个多字节（UTF-8）字符时，变量名边界被误判** —— 变量被当作未定义而展开为空，紧跟的那个中文字符还会被咬掉首字节，最终在终端上显示为乱码 `��`。
+   - 最小复现（本机 bash 3.2.57 实测）：
+     ```bash
+     V=11474
+     echo "PID=$V，watchdog"      # → PID=\xbc\x8cwatchdog           变量被吞
+     echo "PID=${V}，watchdog"    # → PID=11474\xef\xbc\x8cwatchdog   正确
+     ```
+   - **本项目硬性书写规范**：所有 shell 脚本中，**凡变量后紧跟中文（或多字节字符）一律写成 `${VAR}`**。这在本项目不是风格问题而是正确性问题 —— 全部脚本都往终端打印中文，踩中概率极高。
+   - 该陷阱在 v1.8.41 修复 `deploy.sh` 第 [7/7] 步输出乱码时被定位，完整推导见 §4.13.4。
 
 ### 2.5 Ubuntu 专用配置细节
 1. **Android SDK 部署**：
@@ -414,6 +424,7 @@ $$\left|\frac{x}{a}\right|^n + \left|\frac{y}{b}\right|^n = 1 \quad (n = 2.732)$
    - **两级快照仲裁：provisional 帧作临时占位、绝不覆盖稳定帧（v1.8.38）**：启动动画期快照的仲裁规则已由「一律排除 provisional」修正为「稳定池优先、provisional 仅作临时占位」。完整设计判据、返工教训与真机验证见 §4.10。
    - **划出画面时效性（v1.8.39）**：划出卡片取的是守护进程最后一次抓帧的结果，故「截图及时性」等价于「帧龄」。经实测将稳态刷新节奏由 10 降为 5，帧龄中位数由 3.0s 降至 2.0s；并附「按需抓帧不可行」的否证实验，见 §4.11。
    - **Task Snapshot 直读管线（v1.8.40）**：多任务卡片画面的像素来源由「`screencap` 抓整块物理屏幕」升级为「**直读 WMS 的 `TaskSnapshot`**」——后者**只含该任务窗口**，不含状态栏、导航栏与挖孔留白（本机实测杂质 105px + 66px），且延迟由 ≈650ms 降至 **275ms**。同时修复了一条**自升级以来静默失效**的系统快照同步链（Android 16 改为每用户 UUID 子目录，扁平路径零命中）。完整权限链、三个踩坑点与真机验证见 §4.12。
+   - **守护链开机自启（v1.8.41）**：此前**设备每次重启后守护链都不存在**（`meego_daemon.rc` 在本机根本不存在、且 `/system` 受 dm-verity 保护不可写），需手工跑 `deploy.sh` 才能恢复。现改由 Magisk `service.d` 钩子承担，并把「watchdog 先、主进程后」的顺序收敛到唯一的 `meego_boot.sh`（两条入口共用同一份，杜绝漂移）；钩子在开机路径下**自脱离**以防拖住开机。另修掉部署脚本两处输出缺陷，并定位一个 macOS bash 3.2 的多字节插值陷阱（已升级为脚本硬性规范）。见 §4.13。
    - **多任务网格状态持久化（Recents Columns Persistence & Snapping）**：
      - 将多任务 2×2 / 3×3 布局模式同步纳入 DataStore 持久化存储（`KEY_RECENTS_COLUMNS`）；
      - 双指缩放（Pinch-to-zoom）手势结束时，依据 $\text{pinchScale} \lessgtr 0.83$ 智能平滑吸附到 3×3 或 2×2，并实时持久化，彻底解决在主屏各页面滑动或重启后模式被重置的问题。
@@ -832,7 +843,116 @@ Task Snapshot 改善的是**帧龄上界**与**像素纯净度**，**不是**"�
   ⚠️ 守护进程心跳已过期 4396s —— 主进程已死，Task Snapshot 管线不会更新
 ```
 
-上线首日即以它**当场定位到两个既存故障**：同步链断裂与守护进程已死（因本机 `/system/etc/init/meego_daemon.rc` 不存在、`/data/adb/service.d/` 为空，**当前无开机自启能力**——此为既有状况，非本版引入，另行议题处理）。
+上线首日即以它**当场定位到两个既存故障**：同步链断裂与守护进程已死（因本机 `/system/etc/init/meego_daemon.rc` 不存在、`/data/adb/service.d/` 为空，当时**无开机自启能力**——v1.8.41 已补齐，见 §4.13）。
+
+---
+
+### 4.13 守护链开机自启与拉起器抽取（v1.8.41）
+
+> 现象：**设备每次重启后守护链都不存在** —— 多任务卡片拿不到新帧，删除任务只清 UI 不杀进程，直到手动跑一次 `deploy.sh`。
+
+#### 4.13.1 根因：开机自启这条路在本设备上从未成立
+
+`deploy.sh` 原本的注释是"依赖既有的 `meego_daemon.rc`"，但**本机 `/system/etc/init/meego_daemon.rc` 根本不存在**，且 `/system` 受 dm-verity 保护不可写 —— 也就是说这条自启路径从一开始就是空的，脚本只会打印一句"需由启动器首次运行时拉起"。
+
+而"由启动器拉起"同样不成立：`DaemonWatchdogClient` 自己就写明 App 无 `su` 权限、只能投递 `ENSURE_DAEMON` 指令，而**该指令依赖 watchdog 还活着** —— 若 watchdog 也随进程树一起消失（重启后必然如此），就彻底无人可拉起。
+
+结论：**重启后守护链永久缺失，除非手工部署。**
+
+#### 4.13.2 方案选择：为什么是 Magisk `service.d` 而不是自建模块
+
+Magisk 官方为「开机跑一个脚本」提供了现成钩子：
+
+| 目录 | 阶段 |
+|---|---|
+| `/data/adb/post-fs-data.d/` | 极早期（zygote 之前） |
+| `/data/adb/service.d/` | late_start service ← **本用途** |
+
+二者都是「放进目录即生效、无需 `module.prop`」的通用脚本位，正是为此场景设计的。
+
+**不选自建 Magisk 模块的理由**：模块需要额外维护 `module.prop` / 版本号 / `updateJson` 一整套打包元数据，而本项目的守护进程**不覆盖 `/system` 任何文件**，没有任何需要靠模块挂载才能实现的东西 —— 那纯粹是给「跑个脚本」套一层壳。`service.d` 一处 push、无元数据、随 Magisk 升级自然存活。
+
+**SELinux 上下文已核实**：`/data/adb/service.d` 目录本身标签即 `u:object_r:adb_data_file:s0`，我们的钩子与之同标签（Magisk 刻意如此标定），且实测在 `u:r:magisk:s0` 域下可直接执行 —— 无需任何 `chcon`。
+
+#### 4.13.3 关键设计：抽出唯一的拉起器 `scripts/meego_boot.sh`
+
+**要解决的问题**：拉起顺序「watchdog 先、主进程后」是 v1.8.35 用四次真机否决换来的结论（完整推导见 `meego_daemon.sh` 顶部）。若 `deploy.sh`（手动拉起）与开机钩子各写一份内联逻辑，两份迟早漂移 —— 而**顺序一旦漂移，watchdog 就会被"本次启动派生树"清理一并带走**，表现为「守护进程又失联了」，且这种回归只在开机路径上出现、极难复现。
+
+**解法**：把顺序逻辑收敛到 `meego_boot.sh` 单一实现，两条入口都调用它：
+
+```
+/data/local/tmp/meego_boot.sh      ← deploy.sh 立即拉起时执行（不等开机）
+/data/adb/service.d/meego_boot.sh  ← Magisk 开机时执行（先等 boot_completed）
+```
+
+**同一份文件、两处部署**，靠 `$0` 路径自识别区分行为（见下），因此不可能漂移。脚本**幂等**：watchdog 或主进程已就绪即跳过。
+
+**防砖保护（自脱离）**：开机路径下脚本要先等 `sys.boot_completed=1`，而该属性恰恰是**开机流程走完之后**才置位的。若上层（Magisk / init）会等待脚本返回，就构成死锁 —— 上层等脚本 → 脚本等 boot_completed → boot_completed 等上层放行 → **设备卡在开机永远完不成**。Magisk 当前用的是 `fork_dont_care()`（不等待），现实中不会触发；但这个失败模式代价是「设备卡开机」，且取决于第三方实现细节，**不能赌**。故钩子在开机路径下**无条件把自己转入后台后立即退出**：
+
+```
+09-28 15:16:32 detached from boot stage, will wait for boot_completed in background
+09-28 15:16:35 watchdog spawned
+09-28 15:16:38 main started (pid=23813, 1s)
+```
+
+实测调用耗时 **0s** 返回（对比原先若有等待则需 10s+），且后台子进程正常完成整条拉起。
+
+#### 4.13.4 顺带修掉的两处部署输出缺陷
+
+**缺陷一：`pgrep -f meego_daemon.sh` 的匹配面过宽。**
+该模式会同时命中 watchdog 与 `monitor_cmd_queue` / `process_fifo` / `monitor_current_app` 三个后台子 shell（它们 fork 自同一脚本、cmdline 完全相同），于是第 [6/7] 步把 6 个 PID 全打印出来、输出错乱。
+
+更隐蔽的是**第三类误匹配**：`setsid /system/bin/sh -c "... meego_daemon.sh ..."` 的**外层包装进程**——它的 `argv[2]` 是 `-c`，但 cmdline 里含脚本路径、`argv[3]` 为空，**看起来与主进程一模一样**。本次实测踩中：它被误判为"主进程已就绪"从而**跳过了真正的拉起**，最终整条链只剩一个 watchdog、没有任何主进程工作。
+
+修正后的判据（与 `meego_daemon.sh` 内部 `watchdog_alive()` 保持一致，必须**同时**校验）：
+- `argv[2] == $DAEMON` —— 排除 `-c` 包装进程
+- `argv[3] == __WATCHDOG` —— 区分 watchdog 与主进程
+
+另外主进程 PID 优先取**权威来源** `/data/local/tmp/meego_daemon.pid`：该文件由脚本用 `$$` 写入（`meego_daemon.sh` 第 228 行），而只有主进程会执行到那一行 —— watchdog 在其上方进入无限循环、永不抵达。这比任何启发式都精确。
+
+**缺陷二：`$_` 被当作循环变量，导致耗时打印成乱码。**
+原代码 `for _ in $(seq 1 25)` 后接 `~${_}s` —— `$_` 是 bash **特殊变量**（上一条命令的末参数），会在插值时展开成任意内容，输出 `~]s`。
+
+**缺陷三（最隐蔽）：bash 3.2 的多字节插值缺陷，见 §2.4 第 4 条。**
+修完前两处后第 [7/7] 步**仍然乱码**，形如 `PID=��watchdog PID=��主动 kill`。逐字节取证后定位到 macOS 自带 bash 3.2.57 的解析器缺陷：`$MAIN_PID_BEFORE，` 中变量紧跟全角逗号时，变量被吞、逗号前导字节 `\xef` 也被咬掉。对照实验证明 `PID=$V，` 坏而 `PID=${V}，` 好 —— **凡变量后接中文必须加花括号**。这条已升级为本项目 shell 脚本的硬性规范，写入 §2.4 并落进 `deploy.sh` 注释。
+
+> 留档价值：该缺陷同时解释了「为什么第 [6/7] 步一直是好的」—— 它恰好写的是 `${DAEMON_MAIN:-?}`，花括号形式绕开了缺陷。**偶然写对不是写对**，故固化为规范。
+
+#### 4.13.5 真机验证（Redmi K40 / LineageOS 23.2 / Android 16）
+
+| 验证项 | 结果 |
+|---|---|
+| 钩子安装 | `/data/adb/service.d/meego_boot.sh`（root:root 755，`adb_data_file` 标签） |
+| 域内可执行性 | `u:r:magisk:s0` 下直接执行成功 |
+| **自脱离不阻塞** | 调用耗时 **0s** 返回（未拖住开机路径） |
+| **冷启动从零拉起** | 清空整条链（含 watchdog）后执行钩子 → `watchdog spawned` → `main started (pid=23813, 1s)`，最终 watchdog + 主进程 + 3 个 monitor 齐备 |
+| 心跳对上 | `daemon.hb` 首字段 == 主进程 PID，且为当前时刻 |
+| 幂等性 | 链已就绪时执行 → `watchdog already alive, skip` / `main already alive, skip` |
+| 冷启动后功能 | 删除全部 `_sys.jpg` 后重新切应用，`690/691_sys.jpg` 自动重生，`recent_tasks.json` 正确优选 |
+| 第 [6/7] 步输出 | `主进程 PID=11474、watchdog PID=8650（同脚本进程共 7 个）` —— 单值、无冗余 |
+| 第 [7/7] 步输出 | `业务主进程 PID=11474，watchdog PID=8650；主动 kill -9 模拟崩溃…` —— **无乱码** |
+| 自愈仍有效 | kill 主进程后 `~1s` 内由 watchdog 拉起新主进程 |
+| 全流程 | `deploy.sh` 七步全绿 |
+
+#### 4.13.6 诊断能力补强
+
+`check_device.sh` 新增**开机自启诊断**段落，把「重启之后守护链还在不在」变成一条命令可查的事：
+
+```
+=== 开机自启诊断 ===
+  ✅ Magisk 开机钩子已安装（/data/adb/service.d/meego_boot.sh）
+  最近一次拉起日志（/data/local/tmp/meego_boot.log）：
+    09-28 15:16:32 detached from boot stage, will wait for boot_completed in background
+    09-28 15:16:35 watchdog spawned
+    09-28 15:16:38 main started (pid=23813, 1s)
+```
+
+日志由 `meego_boot.sh` 写入并自轮转（只保留最近 200 行），是排查「重启后没起来」的第一现场。
+
+#### 4.13.7 遗留说明
+
+- 本节的验证是**在已开机的系统上调用 service.d 钩子**完成的（等价于 Magisk 开机时的执行环境与域），**未做真实重启**：本机仅有无线 ADB（`adb-..._adb-tls-connect._tcp`），重启会断开调试通道且无线调试端口通常需在设备上重新配对，导致无法回连取证。若需要端到端重启验证，建议接 USB 后进行。
+- 钩子的健壮性边界：它依赖 `/data/local/tmp/meego_daemon.sh` 存在（该目录在 `/data` 上、跨重启保留）。若该文件被清掉，钩子会记录 `FATAL daemon script missing` 到 `meego_boot.log` 并退出，此时需重跑 `deploy.sh` —— 这是有意的：**不静默失败**。
 
 ---
 

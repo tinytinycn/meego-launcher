@@ -150,7 +150,9 @@ systemProp.https.proxyPort=1087
 4. **`scripts/deploy.sh`**（共 8 步）：
    - 自动执行构建、安装至已连接物理机、向 `/data/local/tmp` 部署**常驻快照服务 `meego_svc.dex`** 与 `meego_daemon.sh` 特权守护脚本、授予权限并冷启动 Launcher。
    - 末尾两步专门做验证：守护链自愈、以及**主动 ping 常驻快照服务**确认 IPC 真的通 —— 服务不工作时应用既不会崩也不会报错，只是所有卡片安静退化成图标，属典型的「安静地坏掉」，必须 fail fast。
-   - **硬约束：绝不写 `/system`**。`/system` 受 dm-verity 校验，改写会导致验证失败、设备无法开机。本脚本只做 `push` + `chmod` 到 `/data/local/tmp`；若设备上已存在 `meego_daemon.rc` 则沿用其开机自启，否则提示由启动器首次运行时拉起。早期版本曾 `remount` 并写入 `/system/bin` 与 `/system/etc/init/`，已彻底移除。
+   - **部署位置**：`push` + `chmod` 到 `/data/local/tmp`；开机自启由 Magisk `service.d` 钩子承担。
+   - **设备已安装 Magisk（30.7）**：系统层面已具备「不经 `adb root` 也能取得 root」的能力 —— 实测 `su -c id` → `uid=0(root)`、`context=u:r:magisk:s0`。当前 `deploy.sh` 的前置检查仍是「`adb shell` 必须为 uid 0」并 fail fast，**尚未**接入 `su` 分支；若要支持仅有 Magisk 的 `user` 构建，需在部署脚本中加入该分支。
+   - **需要改动 `/system` 内容时**（例如把启动器装成 privapp 以直接持有签名级权限），走 **Magisk 模块叠加（magic mount）**：它在挂载命名空间内叠加文件，**不写真实分区**。真实分区当前以 `ro` 挂载（`/proc/mounts`：`/dev/block/dm-1 / ext4 ro,…`），直接 `remount,rw` 后写真实分区不是受支持路径。
    - **部署顺序固定为「watchdog 先、主进程后」**：先以双重 `setsid` 预置一个独立 watchdog 并等其落定，再拉起主进程。顺序不可颠倒，原因见 §2.7.1。
 5. **`scripts/screenshot.sh`**：
    - 通过 ADB 执行底层 `exec-out screencap -p` 捕获物理机最新屏幕快照至 `screenshots/` 目录，供 UI 还原度核查。
@@ -168,7 +170,7 @@ systemProp.https.proxyPort=1087
    - 型号：Redmi K40 / POCO F3 (`alioth` / `M2012K11AC`)
    - 系统：LineageOS (Android 16 / SDK 36)
    - 屏幕规格：1080×2400 (20:9)，密度 440 DPI
-   - 特权链路：`adbd root` 已就绪，支持通过 `meego_daemon.sh` 伴侣进程提供实时硬件快照与应用任务切换/销毁。
+   - 特权链路：设备为 **Magisk 30.7**（`su` 可用，`context=u:r:magisk:s0`）且 `adb root` 亦已就绪，两种途径均可取得 uid 0。特权侧由 `meego_daemon.sh` + `TaskSnapService` 提供实时任务快照与应用任务切换/销毁。
 
 #### 2.7.1 守护进程存活模型与 watchdog 自愈（v1.8.35）
 
@@ -192,7 +194,9 @@ systemProp.https.proxyPort=1087
 
 #### 2.7.2 App 侧辅助唤醒（`DaemonWatchdogClient`）
 
-启动器启动时读心跳判断链路是否健在，仅在「主进程已死而 watchdog 尚存」时投递 `ENSURE_DAEMON`，省掉 15s 宽限等待。**只能辅助而非直接拉起**：设备无 `su` 二进制，App 进程（u0_a209）无法提权执行 `setprop`。
+启动器启动时读心跳判断链路是否健在，仅在「主进程已死而 watchdog 尚存」时投递 `ENSURE_DAEMON`，省掉 15s 宽限等待。
+
+**当前实现为何是「辅助」而非「直接拉起」**：早期该设备无 `su` 二进制，App 进程（u0_a209）无法提权执行 `setprop`，只能靠投递指令让 root 侧自己完成。**该前提已随 Magisk 安装而改变**（现有 `/product/bin/su`），故「App 经 `su -c` 直接拉起守护链」在系统层面已可行；代码尚未按新前提改造，故现行为仍是辅助式。
 
 心跳判据的两次修正：
 
@@ -631,7 +635,7 @@ PERMISSIONS_getTaskSnapshotManager = {
 | `10209`（`untrusted_app`，即启动器自身） | ❌ `SecurityException: Access denied, requires: allOf={MANAGE_ACTIVITY_TASKS, READ_FRAME_BUFFER}` |
 | `0`（adbd root / Magisk su） | ✅ 通过 |
 
-**这决定了架构**：特权能力收敛在 `meego_daemon.sh` 与 `TaskSnapService` 这一个 root 侧，**不新增特权面、不改 sepolicy、不写 `/system`**。App 进程无论如何都拿不到这两个权限（见 §4.10.2 实测）。
+**这决定了架构**：特权能力收敛在 `meego_daemon.sh` 与 `TaskSnapService` 这一个 root 侧，**不新增特权面、不改 sepolicy**。App 进程无论如何都拿不到这两个权限（见 §4.10.2 实测）—— 除非把启动器装成 **privapp**（需要 Magisk 模块叠加 `/system`，见 §2.6）。
 
 
 #### 4.10.3 取快照接口的三个坑（务必留档）
@@ -897,9 +901,11 @@ App 侧同步收敛：`RootTaskProvider` 的候选仲裁（约 110 行）与
 
 #### 4.11.1 根因：开机自启这条路在本设备上从未成立
 
-`deploy.sh` 原本的注释是"依赖既有的 `meego_daemon.rc`"，但**本机 `/system/etc/init/meego_daemon.rc` 根本不存在**，且 `/system` 受 dm-verity 保护不可写 —— 也就是说这条自启路径从一开始就是空的，脚本只会打印一句"需由启动器首次运行时拉起"。
+`deploy.sh` 原本的注释是"依赖既有的 `meego_daemon.rc`"，但**本机 `/system/etc/init/meego_daemon.rc` 根本不存在**（该 `.rc` 从未随构建刷入）—— 也就是说这条自启路径从一开始就是空的，脚本只会打印一句"需由启动器首次运行时拉起"。
 
-而"由启动器拉起"同样不成立：`DaemonWatchdogClient` 自己就写明 App 无 `su` 权限、只能投递 `ENSURE_DAEMON` 指令，而**该指令依赖 watchdog 还活着** —— 若 watchdog 也随进程树一起消失（重启后必然如此），就彻底无人可拉起。
+而"由启动器拉起"在当时同样不成立：`DaemonWatchdogClient` 写明 App 无法提权，只能投递 `ENSURE_DAEMON` 指令，而**该指令依赖 watchdog 还活着** —— 若 watchdog 也随进程树一起消失（重启后必然如此），就彻底无人可拉起。
+
+> **该限制已随 Magisk 的引入而改变**：本机现有 `su`（`/product/bin/su`），App 经 `su -c` 提权在系统层面已可行，只需在 Magisk 中授予该应用 root。也就是说「启动器自己把守护链拉起来」现在是一条**可选项**，不再是死路。当前代码与注释仍按「无 su」的旧前提编写，尚未改造。
 
 结论：**重启后守护链永久缺失，除非手工部署。**
 
@@ -915,6 +921,7 @@ Magisk 官方为「开机跑一个脚本」提供了现成钩子：
 二者都是「放进目录即生效、无需 `module.prop`」的通用脚本位，正是为此场景设计的。
 
 **不选自建 Magisk 模块的理由**：模块需要额外维护 `module.prop` / 版本号 / `updateJson` 一整套打包元数据，而本项目的守护进程**不覆盖 `/system` 任何文件**，没有任何需要靠模块挂载才能实现的东西 —— 那纯粹是给「跑个脚本」套一层壳。`service.d` 一处 push、无元数据、随 Magisk 升级自然存活。
+> 反之，若将来需要把启动器装成 **privapp** 以便直接持有 `MANAGE_ACTIVITY_TASKS` 等签名级权限，则**必须**改用模块叠加 —— 那种场景下模块是唯一正确工具。
 
 **SELinux 上下文已核实**：`/data/adb/service.d` 目录本身标签即 `u:object_r:adb_data_file:s0`，我们的钩子与之同标签（Magisk 刻意如此标定），且实测在 `u:r:magisk:s0` 域下可直接执行 —— 无需任何 `chcon`。
 

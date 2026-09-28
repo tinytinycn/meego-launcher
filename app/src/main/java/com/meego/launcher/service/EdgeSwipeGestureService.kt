@@ -787,9 +787,9 @@ class EdgeSwipeGestureService : AccessibilityService() {
         // 底层桌面保持 100% 不透明；其 1:1 贴回定位由 [applyDesktopBackgroundGeometry] 负责。
         //
         // 此处**只**叠加 GRID 专属的层级微缩放（见 [applyGridDepthScale]）：
-        // 缩放绕内容中心进行，故通过「先按缩放系数反推左上角偏移」来保持
-        // 快照中心在屏幕上不动 —— 表现为画面从 0.95 倍「长」回 1.0 倍，
-        // 而非整体朝某个角落漂移。Multitasking / Events Feed 恒为 1.0，不受影响。
+        // 缩放锚点已由 [applyDesktopScalePivot] 钉在物理屏幕中心，故画面表现为
+        // 从 0.95 倍「长」回 1.0 倍、四边对称内收，不会朝任何角落漂移。
+        // Multitasking / Events Feed 恒为 1.0，不受影响。
         desktopBackgroundImageView?.alpha = 1.0f
         applyGridDepthScale(progress)
     }
@@ -805,9 +805,17 @@ class EdgeSwipeGestureService : AccessibilityService() {
      * 故此判据同时精确排除了 **Multitasking View**（页序 2）与
      * **Events Feed**（页序 0），两者恒为 1.0。
      *
-     * 缩放锚点取快照矩形的**中心**：View 默认以左上角缩放，若直接改 scale，
-     * 画面会朝左上角漂移。故按 `s` 反推平移量 `t = center * (1 - s)`，
-     * 使 `t + s * center == center` 恒成立 —— 中心不动、四边对称内收。
+     * 缩放锚点取**物理屏幕中心**：见 [applyDesktopScalePivot]。
+     *
+     * 此处**只**改 `scaleX/scaleY`、且 `translation` 恒为 0：
+     * Android 的 `View.scaleX/scaleY` 本就绕 `pivot` 缩放（AOSP View#setPivotX
+     * 原文："By default, the pivot point is centered on the object"），
+     * 故当 pivot 被 [applyDesktopScalePivot] 钉在屏幕中心时，
+     * 改 scale 即自动满足「屏幕中心不动、四边对称内收」，无需任何平移补偿。
+     *
+     * 此前版本额外叠加了 `translation = center * (1 - s)`，那是**重复补偿**：
+     * 中心早已被 pivot 钉住，再加一次平移就把画面整体推向右下 —— 即用户报的
+     * 「缩放动画偏右下」。平移在此已彻底移除。
      *
      * @param progress 划出进度 0..1（0 = 刚起手，1 = 划过 1/3 屏）
      */
@@ -828,12 +836,39 @@ class EdgeSwipeGestureService : AccessibilityService() {
         }
 
         val s = GRID_DEPTH_START + (1f - GRID_DEPTH_START) * progress
-        val cx = iv.width * 0.5f
-        val cy = iv.height * 0.5f
         iv.scaleX = s
         iv.scaleY = s
-        iv.translationX = cx * (1f - s)
-        iv.translationY = cy * (1f - s)
+        iv.translationX = 0f
+        iv.translationY = 0f
+    }
+
+    /**
+     * 把桌面快照的缩放锚点（pivot）钉在**物理屏幕中心**。
+     *
+     * 为什么不直接用 Android 的默认锚点：默认 pivot 是 View **自身**的中心。
+     * 而本图层按 [applyDesktopBackgroundGeometry] 只覆盖桌面窗口那块矩形
+     * （挖孔机型上是 `[0,95][1080,2400]`，顶掉了 95px 挖孔），
+     * 其自身中心比屏幕中心低约 47px；绕它缩放，画面会整体朝下漂一点。
+     * 要真正「以屏幕为中心」，必须显式把 pivot 设到屏幕中心。
+     *
+     * 坐标系推导（View 本地坐标 → 物理屏幕）：
+     * `screen = view.left + scale * (p - pivot) + pivot`，
+     * 令屏幕中心 `C = overlayW/2` 为缩放不动点（对任意 scale 恒成立）得
+     * `pivotX = C - view.left`、`pivotY = C' - view.top`。
+     *
+     * 注：显式设置 pivot 会**永久关闭** Android 的自动居中行为
+     * （`mRenderNode.isPivotExplicitlySet()`），故本方法必须覆盖所有布局路径
+     * —— 由 [applyDesktopBackgroundGeometry] 在布局生效后统一调用，
+     * 含全屏兜底分支。
+     */
+    private fun applyDesktopScalePivot() {
+        val iv = desktopBackgroundImageView ?: return
+        val overlayW = cardOverlayLayout?.width ?: 0
+        val overlayH = cardOverlayLayout?.height ?: 0
+        if (overlayW <= 0 || overlayH <= 0 || iv.width <= 0 || iv.height <= 0) return
+
+        iv.pivotX = overlayW * 0.5f - iv.left
+        iv.pivotY = overlayH * 0.5f - iv.top
     }
 
     /** 滑出阈值：屏幕宽度的 1/3（见 [SWIPE_OUT_THRESHOLD_RATIO]）。 */
@@ -1005,6 +1040,9 @@ class EdgeSwipeGestureService : AccessibilityService() {
             )
             iv.translationX = 0f
             iv.translationY = 0f
+            // 兜底分支同样要钉 pivot：全屏时 View 中心 == 屏幕中心，
+            // 漏设会让 pivot 保持上一次手势的旧值而缩放跑偏
+            iv.post { applyDesktopScalePivot() }
             Log.w(TAG, "desktop bg rect $rect does not fit overlay ${overlayW}x$overlayH; fallback to full-bleed")
             return
         }
@@ -1015,6 +1053,10 @@ class EdgeSwipeGestureService : AccessibilityService() {
         }
         iv.translationX = 0f
         iv.translationY = 0f
+        // layoutParams 变更要到下一次 layout 才反映到 iv.left/iv.top，
+        // 故先 post 一次在布局后重算 pivot，再兜底补一次防首帧缺失
+        iv.post { applyDesktopScalePivot() }
+        applyDesktopScalePivot()
         Log.d(TAG, "desktop bg placed 1:1 at $rect (overlay ${overlayW}x$overlayH, bitmap ${bitmap.width}x${bitmap.height})")
     }
 

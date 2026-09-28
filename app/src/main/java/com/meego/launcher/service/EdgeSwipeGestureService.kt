@@ -30,7 +30,6 @@ import android.view.animation.DecelerateInterpolator
 import android.view.animation.OvershootInterpolator
 import android.widget.FrameLayout
 import android.widget.ImageView
-import androidx.core.graphics.drawable.toBitmap
 import androidx.core.view.ViewCompat
 import com.meego.launcher.MainActivity
 import com.meego.launcher.data.LauncherPreferences
@@ -38,6 +37,7 @@ import com.meego.launcher.model.LaunchOrigin
 import com.meego.launcher.model.LaunchOriginTracker
 import com.meego.launcher.model.LauncherPreviews
 import com.meego.launcher.model.TaskSnapshotCache
+import com.meego.launcher.util.AppIconRenderer
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -724,11 +724,8 @@ class EdgeSwipeGestureService : AccessibilityService() {
             } else null
 
             if (icon != null) {
-                val iconBmp = try {
-                    icon.toBitmap(192, 192)
-                } catch (e: Exception) {
-                    null
-                }
+                // 无快照时的兜底图标同样剥离系统圆形 mask，与桌面网格形状口径一致
+                val iconBmp = AppIconRenderer.toBitmap(icon, 192)
                 cardImageView?.setImageBitmap(iconBmp)
                 cardImageView?.scaleType = ImageView.ScaleType.CENTER
                 cardImageView?.setBackgroundColor(Color.parseColor("#1C1C1E"))

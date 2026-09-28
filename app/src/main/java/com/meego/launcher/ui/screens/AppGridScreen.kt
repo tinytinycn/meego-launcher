@@ -23,8 +23,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
-import androidx.compose.ui.graphics.ImageBitmap
-import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
@@ -37,7 +35,6 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.core.graphics.drawable.toBitmap
 import com.meego.launcher.model.AppItem
 import com.meego.launcher.model.LaunchOrigin
 import com.meego.launcher.model.LaunchOriginTracker
@@ -49,6 +46,7 @@ import com.meego.launcher.ui.components.rememberMeeGoFlingBehavior
 import com.meego.launcher.ui.theme.MeeGoCardBg
 import com.meego.launcher.ui.theme.MeeGoCyan
 import com.meego.launcher.ui.theme.MeeGoTextWhite
+import com.meego.launcher.util.AppIconRenderer
 import com.meego.launcher.util.ScreenCaptureHelper
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
@@ -309,13 +307,11 @@ private fun AppGridItem(
             )
     ) {
         // 预解码的 ImageBitmap 走主线程零分配直绘；仅当缺失时才准备 Drawable 回退位图。
+        // 回退路径同样经 AppIconRenderer 剥离自适应图标的系统 mask，
+        // 与 AppRepository 主路径保持同一形状来源，杜绝两条路径形状分裂。
         val iconBitmap = app.iconBitmap ?: if (app.icon != null) {
             remember(app.icon) {
-                try {
-                    app.icon.toBitmap(128, 128).asImageBitmap()
-                } catch (e: Exception) {
-                    null
-                }
+                AppIconRenderer.toImageBitmap(app.icon, 128)
             }
         } else {
             null

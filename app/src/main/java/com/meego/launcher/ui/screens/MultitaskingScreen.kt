@@ -57,7 +57,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.zIndex
-import androidx.core.graphics.drawable.toBitmap
 import com.meego.launcher.data.RootTaskProvider
 import com.meego.launcher.model.LaunchOrigin
 import com.meego.launcher.model.LaunchOriginTracker
@@ -70,6 +69,7 @@ import com.meego.launcher.ui.theme.MeeGoDarkGrey
 import com.meego.launcher.ui.theme.MeeGoRed
 import com.meego.launcher.ui.theme.MeeGoTextDim
 import com.meego.launcher.ui.theme.MeeGoTextWhite
+import com.meego.launcher.util.AppIconRenderer
 import com.meego.launcher.util.ScreenCaptureHelper
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
@@ -766,12 +766,9 @@ private fun RecentTaskCard(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         if (task.icon != null) {
+                            // 统一无 mask 渲染，与桌面网格形状口径一致
                             val iconBmp = remember(task.icon) {
-                                try {
-                                    task.icon.toBitmap(32, 32)
-                                } catch (e: Exception) {
-                                    null
-                                }
+                                AppIconRenderer.toBitmap(task.icon, 32)
                             }
                             if (iconBmp != null) {
                                 Image(
@@ -794,12 +791,9 @@ private fun RecentTaskCard(
             } else {
                 // 优雅的卡片占位
                 if (task.icon != null) {
+                    // 统一无 mask 渲染，避免卡片占位图标呈现系统圆形
                     val bitmap = remember(task.icon) {
-                        try {
-                            task.icon.toBitmap(96, 96)
-                        } catch (e: Exception) {
-                            null
-                        }
+                        AppIconRenderer.toBitmap(task.icon, 96)
                     }
                     if (bitmap != null) {
                         Image(

@@ -7,11 +7,11 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Typeface
-import android.graphics.drawable.Drawable
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import com.meego.launcher.R
 import com.meego.launcher.model.AppItem
+import com.meego.launcher.util.AppIconRenderer
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -29,7 +29,7 @@ class AppRepository(private val context: Context) {
 
         // 1. 注入 MeeGo Settings 专属应用入口
         val settingsDrawable = context.getDrawable(R.mipmap.ic_launcher)
-        val settingsBitmap = drawableToImageBitmap(settingsDrawable)
+        val settingsBitmap = AppIconRenderer.toImageBitmap(settingsDrawable)
         apps.add(
             AppItem(
                 packageName = ownPackageName,
@@ -46,7 +46,9 @@ class AppRepository(private val context: Context) {
             .filter { it.activityInfo.packageName != ownPackageName }
             .map { resolveInfo ->
                 val iconDrawable = resolveInfo.loadIcon(pm)
-                val iconBitmap = drawableToImageBitmap(iconDrawable)
+                // 统一无 mask 光栅化：剥离自适应图标的系统圆形 mask，
+                // 使全部图标都以「全幅方形」进入渲染层，再由 DefaultSquircleShape 统一裁形。
+                val iconBitmap = AppIconRenderer.toImageBitmap(iconDrawable)
                 AppItem(
                     packageName = resolveInfo.activityInfo.packageName,
                     activityName = resolveInfo.activityInfo.name,
@@ -101,19 +103,6 @@ class AppRepository(private val context: Context) {
         apps.addAll(testApps)
 
         apps
-    }
-
-    private fun drawableToImageBitmap(drawable: Drawable?, size: Int = 144): ImageBitmap? {
-        if (drawable == null) return null
-        return try {
-            val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
-            val canvas = Canvas(bitmap)
-            drawable.setBounds(0, 0, size, size)
-            drawable.draw(canvas)
-            bitmap.asImageBitmap()
-        } catch (e: Exception) {
-            null
-        }
     }
 
     private fun createTestAppIconBitmap(number: Int, color: Long, size: Int = 144): ImageBitmap {

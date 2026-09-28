@@ -80,16 +80,43 @@ import kotlin.math.sin
 /**
  * 多任务卡片删除动效统一参数。
  *
- * 需求：点击删除后，卡片先「消失」（线性缩小 20% + 透明度线性变淡至 50%），
+ * 需求：点击删除后，卡片先「消失」（缩小 20% + 透明度变淡至 50%），
  * 消失动画播放完毕后，其余卡片才开始补位（顺位移动）动画。
+ *
+ * 时长调校（原实现拖沓的三个成因已全部消除，总时长 ≈810ms → ≈440ms）：
+ *  1. 消失动画 260ms → 150ms；且由 LinearEasing 改为 FastOutSlowInEasing ——
+ *     线性缓动全程匀速，尾段视觉位移极小却仍在「占时」，显拖沓；
+ *     减速曲线把绝大部分位移压缩在前 1/3 时长内，感知上「一下就淡掉了」，
+ *     而总时长反而更短。
+ *  2. 消失动画结束后的数据源摘除曾被 IO 阻塞（FIFO 写入 join(100ms)）卡住，
+ *     补位动画要等这段阻塞结束才启动 —— 现改为「先摘 UI、后摘数据」，见
+ *     [onDeleteAnimFinished]，补位动画零等待启动。
+ *  3. 补位弹簧 140 → 300 刚度，收敛时间由 ~425ms 降至 ~290ms。
  */
 private object TaskDeleteAnim {
     /** 消失动画时长(ms) */
-    const val DURATION_MS = 260
+    const val DURATION_MS = 150
     /** 缩小比例：缩小 20% */
     const val SCALE_FACTOR = 0.8f
     /** 透明度终点：变淡 50% */
     const val MIN_ALPHA = 0.5f
+    /** 补位（顺位移动）弹簧阻尼比：接近临界阻尼，收敛干脆且无晃动感 */
+    const val REFLOW_DAMPING_RATIO = 0.95f
+    /** 补位（顺位移动）弹簧刚度：140 拖沓 → 300 利落 */
+    const val REFLOW_STIFFNESS = 300f
+}
+
+/**
+ * 编辑模式相关控件（删除角标 / 底部一键清理按钮）的显隐动效时长。
+ *
+ * 框架默认的 fadeIn/fadeOut 为 tween(300ms)、scaleIn/scaleOut 为弹簧，
+ * 叠加在删除动效上会让「点删除 → 角标收掉」显得明显滞后，故一并提速。
+ */
+private object EditModeAnim {
+    /** 删除角标显隐时长(ms) */
+    const val BADGE_MS = 150
+    /** 底部一键清理按钮显隐时长(ms) */
+    const val CLEAR_ALL_MS = 180
 }
 
 @OptIn(ExperimentalFoundationApi::class)
@@ -129,9 +156,11 @@ fun MultitaskingScreen(
         // 集合已空 => 必定处于「无人正在消失」的稳定态
         if (deletingTaskIds.isEmpty() && pendingClearAll) {
             pendingClearAll = false
+            // 同样遵循「先摘 UI、后摘数据」，与 onDeleteAnimFinished 保持一致
+            val doomed = tasks.toList()
+            onClearAll()
             coroutineScope.launch {
-                taskProvider.removeAllTasks(tasks)
-                onClearAll()
+                taskProvider.removeAllTasks(doomed)
             }
         }
     }
@@ -140,14 +169,26 @@ fun MultitaskingScreen(
      * 单张卡片的消失动画播放完毕后才被调用：此刻才真正把任务从数据源摘除，
      * 从而让剩余卡片的补位（顺位移动）动画严格发生在消失动画之后。
      *
+     * **关键时序（删除动效拖沓的根因修复）**：先摘 UI、后摘数据。
+     * 原实现把 `onTaskRemoved`（驱动补位动画）放在 `taskProvider.removeTask` **之后**，
+     * 而 removeTask 是 IO 挂起函数，内部 `sendCommand` 写 FIFO 最多 `join(100ms)`、
+     * 还要 `killBackgroundProcesses` + 改写 JSON 文件 —— 这段阻塞全部发生在
+     * UI 摘除之前，表现为「卡片淡完了却干等一两百毫秒，旁边的卡片才慢慢挪过来」。
+     * 现改为：
+     *   1) 同步摘除 UI（`onTaskRemoved`），补位动画**当帧即刻启动**，零等待；
+     *   2) 后台再走去杀进程 / 落盘的真实删除，两者不再互相阻塞。
+     * 顺序颠倒对正确性无影响：removeTask 内部不依赖 recentTasks 的当前状态。
+     *
      * 一键删除（pendingClearAll = true）时不逐张摘除：全部卡片的消失动画播完后
      * 统一走一次 removeAllTasks + onClearAll，避免逐个强杀的竞态与无谓开销。
      */
     val onDeleteAnimFinished: (Int, String) -> Unit = { taskId, packageName ->
         if (!pendingClearAll) {
+            // 1) 先摘 UI：补位动画立即启动，不被任何 IO 阻塞
+            onTaskRemoved(taskId)
+            // 2) 后摘数据：真实杀进程 / 落盘在 IO 线程完成
             coroutineScope.launch {
                 taskProvider.removeTask(taskId, packageName)
-                onTaskRemoved(taskId)
             }
         }
         // 移除标记：本卡片交回数据源接管，补位动画自此才开始
@@ -156,10 +197,13 @@ fun MultitaskingScreen(
             // 一键删除：所有卡片都已消失动画结束，此刻才真正清空数据源
             if (pendingClearAll) {
                 pendingClearAll = false
-                val doomed = tasks
+                // 必须快照一份：tasks 就是 MainActivity 的 recentTasks 本体（SnapshotStateList），
+                // 一旦 onClearAll() 清空，doomed 会同步变空，removeAllTasks 将收不到任何任务。
+                val doomed = tasks.toList()
+                // 同样先摘 UI 再清数据：卡片立即消失，真实清理由后台收尾
+                onClearAll()
                 coroutineScope.launch {
                     taskProvider.removeAllTasks(doomed)
-                    onClearAll()
                 }
             }
         }
@@ -525,16 +569,21 @@ fun MultitaskingScreen(
                                 val deleteProgress = remember { Animatable(1f) }
                                 val isDeleting = task.taskId in deletingTaskIds
 
-                                // 触发消失动画：线性缩小 20% + 线性变淡至 50%。
+                                // 触发消失动画：缩小 20% + 变淡至 50%。
                                 // 动画播放完毕（onDeleteAnimFinished）才真正移除数据源，
                                 // 从而保证补位动画严格发生在消失动画之后。
+                                //
+                                // 缓动由 LinearEasing 改为 FastOutSlowInEasing：线性缓动全程匀速，
+                                // 尾段卡片已经缩到 80%/50% 透明度（肉眼几乎看不出变化）却仍在消耗时长，
+                                // 这正是「拖沓」的直接观感来源；减速曲线把有效位移集中在前 1/3 时长，
+                                // 短时长下反而显得更干脆。
                                 LaunchedEffect(isDeleting) {
                                     if (isDeleting) {
                                         deleteProgress.animateTo(
                                             targetValue = 0f,
                                             animationSpec = tween(
                                                 durationMillis = TaskDeleteAnim.DURATION_MS,
-                                                easing = androidx.compose.animation.core.LinearEasing
+                                                easing = androidx.compose.animation.core.FastOutSlowInEasing
                                             )
                                         )
                                         onDeleteAnimFinished(task.taskId, task.packageName)
@@ -542,20 +591,22 @@ fun MultitaskingScreen(
                                 }
 
                                 // 卡片坐标平滑位移动画：当后台任务重新排序时，C卡片由后方顺滑移动至第一位，AB卡片向后顺位移位
-                                // 适当降低刚度（stiffness = 140f）并搭配临界轻阻尼（dampingRatio = 0.92f），使卡片在 C A B 顺序重排换位过程中动画时长自然延伸至约 400~450ms，视觉呈现优雅丝滑、无晃动感
+                                // 刚度 140 → 300、阻尼比 0.92 → 0.95：原参数使补位动画收敛需 ~425ms，
+                                // 叠加在删除动效后被感知为「慢半拍」；现收敛 ~290ms，
+                                // 阻尼比接近临界（无过冲、无来回晃动），依旧保持优雅顺滑的观感。
                                 val animX by animateDpAsState(
                                     targetValue = currentX,
                                     animationSpec = spring(
-                                        dampingRatio = 0.92f,
-                                        stiffness = 140f
+                                        dampingRatio = TaskDeleteAnim.REFLOW_DAMPING_RATIO,
+                                        stiffness = TaskDeleteAnim.REFLOW_STIFFNESS
                                     ),
                                     label = "card_x_${task.taskId}"
                                 )
                                 val animY by animateDpAsState(
                                     targetValue = currentY,
                                     animationSpec = spring(
-                                        dampingRatio = 0.92f,
-                                        stiffness = 140f
+                                        dampingRatio = TaskDeleteAnim.REFLOW_DAMPING_RATIO,
+                                        stiffness = TaskDeleteAnim.REFLOW_STIFFNESS
                                     ),
                                     label = "card_y_${task.taskId}"
                                 )
@@ -636,8 +687,10 @@ fun MultitaskingScreen(
         // 底部一键清理所有任务按钮 (MeeGo 原生交互：只有长按卡片进入编辑模式后才展示)
         AnimatedVisibility(
             visible = isEditMode && tasks.isNotEmpty(),
-            enter = fadeIn() + scaleIn(initialScale = 0.8f),
-            exit = fadeOut() + scaleOut(targetScale = 0.8f),
+            enter = fadeIn(animationSpec = tween(EditModeAnim.CLEAR_ALL_MS)) +
+                    scaleIn(initialScale = 0.8f, animationSpec = tween(EditModeAnim.CLEAR_ALL_MS)),
+            exit = fadeOut(animationSpec = tween(EditModeAnim.CLEAR_ALL_MS)) +
+                    scaleOut(targetScale = 0.8f, animationSpec = tween(EditModeAnim.CLEAR_ALL_MS)),
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .padding(bottom = 28.dp)
@@ -768,10 +821,13 @@ private fun RecentTaskCard(
         }
 
         // 右上角删除角标 (长按触发编辑模式后浮现)
+        // 显隐同样提速：点删除时角标的收拢若慢于卡片淡出，会露出「点了没反应」的迟滞感
         AnimatedVisibility(
             visible = isEditMode,
-            enter = scaleIn() + fadeIn(),
-            exit = scaleOut() + fadeOut(),
+            enter = scaleIn(animationSpec = tween(EditModeAnim.BADGE_MS)) +
+                    fadeIn(animationSpec = tween(EditModeAnim.BADGE_MS)),
+            exit = scaleOut(animationSpec = tween(EditModeAnim.BADGE_MS)) +
+                    fadeOut(animationSpec = tween(EditModeAnim.BADGE_MS)),
             modifier = Modifier
                 .align(Alignment.TopEnd)
                 .zIndex(10f)

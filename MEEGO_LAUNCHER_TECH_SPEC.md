@@ -1,6 +1,6 @@
 # MeeGo Harmattan 风格 Android 启动器 (MeeGo Launcher) 技术方案
 
-> **版本**：v1.8.36  
+> **版本**：v1.8.37  
 > **文档位置**：`MEEGO_LAUNCHER_TECH_SPEC.md`（项目根目录）  
 > **维护规范**：全程在 DSH 环境中进行自主开发，每次会话针对架构、需求、实现的任何调整，均需即时同步更新此文档。
 
@@ -632,6 +632,6 @@ flowchart TD
 
 变更日志已独立抽取并维护于 [changelog.md](./changelog.md)。
 
-- 最新版本：**v1.8.35**（2026-09-28）
+- 最新版本：**v1.8.37**（2026-09-28）
 - 历史版本条目全部见 `changelog.md`。
 

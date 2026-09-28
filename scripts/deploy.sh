@@ -122,7 +122,7 @@ else
     exit 1
 fi
 
-echo "=== [1/7] 编译 MeeGo Launcher Debug APK ==="
+echo "=== [1/8] 编译 MeeGo Launcher Debug APK ==="
 cd "$PROJECT_ROOT"
 "$GRADLE_CMD" assembleDebug --console=plain
 
@@ -134,72 +134,97 @@ fi
 
 echo "APK 构建成功: $APK_PATH"
 
-echo "=== [2/7] 推送并安装到物理机 ==="
+echo "=== [2/8] 推送并安装到物理机 ==="
 "$ADB" install -r -d "$APK_PATH"
 
-echo "=== [3/7] 编译并部署 Task Snapshot 直读桥 ==="
+echo "=== [3/8] 编译并部署常驻 Task Snapshot 服务 + 直读桥 ==="
 # ---------------------------------------------------------------------------------------
-# 编译 scripts/TaskSnapBridge.java -> classes.dex，供守护脚本经 app_process 按需调用。
+# 编译两个 dex：
+#   1. TaskSnapService.java —— **本版主链路**，常驻 root 进程，对齐 Quickstep 取帧原理
+#   2. TaskSnapBridge.java  —— 保留的一次性桥，仅供部署自检 / 排障兜底
 #
-# 【为什么必须在部署时编译，而不是提交一个预编译 dex】
+# 【为什么必须在部署时编译，而不是提交预编译 dex】
 #  dex 与设备 ROM 强绑定（ART 版本、hidden API 名单都会变）。提交二进制等于把
 #  它焊死在某一次刷机上；现编现用则永远跟随当次 deploy 的 SDK。
+#  TaskSnapService 尤其如此 —— 它大量使用反射访问 hidden API。
 #
-# 【失败不阻断部署】bridge 是**增强**而非依赖：缺了它守护脚本自动退回纯
-#  screencap 管线（capture_task_snapshot 见到 dex 不存在即 return 1），
-#  启动器一切照常。因此这里刻意 `|| echo`，不让 javac/d8 的环境问题阻断交付。
+# 【服务缺失的后果（与旧 bridge 不同）】
+#  旧 bridge 缺失只是「降级为 screencap」；而 v1.8.44 起 **TaskSnapshot 服务是
+#  唯一画面来源**，缺失意味着多任务卡片只剩应用图标。故此处失败会明确告警。
 # ---------------------------------------------------------------------------------------
-BRIDGE_DEX_LOCAL="$PROJECT_ROOT/.tmp-build/meego_daemon_bridge.dex"
+SVC_DEX_LOCAL="$PROJECT_ROOT/.tmp-build/meego_svc.dex"
+SVC_DEX_REMOTE="/data/local/tmp/meego_svc.dex"
 BRIDGE_DEX_REMOTE="/data/local/tmp/meego_daemon_bridge.dex"
 
-if [ -f "$SCRIPT_DIR/TaskSnapBridge.java" ]; then
-    # 选一个可用的 android.jar 作编译期 classpath（优先取项目 compileSdk）
-    ANDROID_JAR=""
-    for cand in \
-        "$ANDROID_HOME/platforms/android-35/android.jar" \
-        "$ANDROID_HOME/platforms/android-36.1/android.jar" \
-        "$ANDROID_HOME/platforms/android-36/android.jar" \
-        "$ANDROID_HOME/platforms/android-34/android.jar"
-    do
-        [ -f "$cand" ] && { ANDROID_JAR="$cand"; break; }
-    done
-    # 兜底：任意一个已安装的 platform
-    if [ -z "$ANDROID_JAR" ] && [ -d "$ANDROID_HOME/platforms" ]; then
-        ANDROID_JAR=$(ls -d "$ANDROID_HOME"/platforms/*/ 2>/dev/null | sort -V -r \
-            | while read -r d; do [ -f "$d/android.jar" ] && { echo "${d%/}/android.jar"; break; }; done)
-    fi
-    # d8 来自 build-tools
-    D8_BIN=$(ls -d "$ANDROID_HOME"/build-tools/*/ 2>/dev/null | sort -V -r \
-        | while read -r d; do [ -x "${d}d8" ] && { echo "${d}d8"; break; }; done)
+ANDROID_JAR=""
+for cand in \
+    "$ANDROID_HOME/platforms/android-35/android.jar" \
+    "$ANDROID_HOME/platforms/android-36.1/android.jar" \
+    "$ANDROID_HOME/platforms/android-36/android.jar" \
+    "$ANDROID_HOME/platforms/android-34/android.jar"
+do
+    [ -f "$cand" ] && { ANDROID_JAR="$cand"; break; }
+done
+# 兜底：任意一个已安装的 platform
+if [ -z "$ANDROID_JAR" ] && [ -d "$ANDROID_HOME/platforms" ]; then
+    ANDROID_JAR=$(ls -d "$ANDROID_HOME"/platforms/*/ 2>/dev/null | sort -V -r \
+        | while read -r d; do [ -f "$d/android.jar" ] && { echo "${d%/}/android.jar"; break; }; done)
+fi
+D8_BIN=$(ls -d "$ANDROID_HOME"/build-tools/*/ 2>/dev/null | sort -V -r \
+    | while read -r d; do [ -x "${d}d8" ] && { echo "${d}d8"; break; }; done)
 
-    if [ -n "$ANDROID_JAR" ] && [ -n "$D8_BIN" ] && [ -x "$JAVA_HOME/bin/javac" ]; then
-        rm -rf "$PROJECT_ROOT/.tmp-build/bridge"
-        mkdir -p "$PROJECT_ROOT/.tmp-build/bridge/classes" "$PROJECT_ROOT/.tmp-build/bridge/out"
-        if "$JAVA_HOME/bin/javac" -nowarn -source 17 -target 17 \
-             -classpath "$ANDROID_JAR" \
-             -d "$PROJECT_ROOT/.tmp-build/bridge/classes" \
-             "$SCRIPT_DIR/TaskSnapBridge.java" >/dev/null 2>&1 \
-           && "$D8_BIN" --min-api 28 --lib "$ANDROID_JAR" \
-             --output "$PROJECT_ROOT/.tmp-build/bridge/out" \
-             "$PROJECT_ROOT/.tmp-build/bridge/classes/TaskSnapBridge.class" >/dev/null 2>&1
-        then
-            "$ADB" push "$PROJECT_ROOT/.tmp-build/bridge/out/classes.dex" "$BRIDGE_DEX_REMOTE" >/dev/null
-            # root:root 755 是刻意形态：App uid 加载 dex 会被 ART 的
-            # "Writable dex file ... is not allowed" 拒绝，而本 bridge 恰恰
-            # 只该由 root 侧守护脚本调用。
-            "$ADB" shell "chown root:root $BRIDGE_DEX_REMOTE; chmod 755 $BRIDGE_DEX_REMOTE"
-            echo "  ✅ TaskSnapBridge 已部署 ($BRIDGE_DEX_REMOTE)"
-        else
-            echo "  ⚠️ bridge 编译失败，降级为纯 screencap 管线（不影响启动器运行）"
-        fi
-    else
-        echo "  ⚠️ 缺少 android.jar / d8 / javac，跳过 bridge，降级为纯 screencap 管线"
-    fi
+if [ -z "$ANDROID_JAR" ] || [ -z "$D8_BIN" ] || [ ! -x "$JAVA_HOME/bin/javac" ]; then
+    echo "  ❌ 缺少 android.jar / d8 / javac，无法编译常驻快照服务"
+    echo "     多任务卡片将只能显示应用图标（无真实画面）。请检查 Android SDK 环境。"
+elif [ ! -f "$SCRIPT_DIR/TaskSnapService.java" ]; then
+    echo "  ❌ 未找到 scripts/TaskSnapService.java —— 多任务卡片将无真实画面"
 else
-    echo "  ℹ️ 未找到 TaskSnapBridge.java，跳过 bridge"
+    rm -rf "$PROJECT_ROOT/.tmp-build/svc"
+    mkdir -p "$PROJECT_ROOT/.tmp-build/svc/classes" "$PROJECT_ROOT/.tmp-build/svc/out"
+    if "$JAVA_HOME/bin/javac" -nowarn -source 8 -target 8 \
+         -bootclasspath "$ANDROID_JAR" \
+         -classpath "$ANDROID_JAR" \
+         -d "$PROJECT_ROOT/.tmp-build/svc/classes" \
+         "$SCRIPT_DIR/TaskSnapService.java" >/dev/null 2>&1 \
+       && "$D8_BIN" --min-api 28 --lib "$ANDROID_JAR" \
+         --output "$PROJECT_ROOT/.tmp-build/svc/out" \
+         "$PROJECT_ROOT/.tmp-build/svc/classes/"*.class >/dev/null 2>&1
+    then
+        cp "$PROJECT_ROOT/.tmp-build/svc/out/classes.dex" "$SVC_DEX_LOCAL"
+        "$ADB" push "$SVC_DEX_LOCAL" "$SVC_DEX_REMOTE" >/dev/null
+        # root:root 755 是刻意形态：App uid 加载 dex 会被 ART 的
+        # "Writable dex file ... is not allowed" 拒绝，而本服务恰恰
+        # 只该由 root 侧守护脚本拉起。
+        "$ADB" shell "chown root:root $SVC_DEX_REMOTE; chmod 755 $SVC_DEX_REMOTE"
+        echo "  ✅ 常驻 TaskSnapService 已部署 ($SVC_DEX_REMOTE)"
+    else
+        echo "  ❌ 常驻快照服务编译失败 —— 多任务卡片将只能显示应用图标"
+    fi
 fi
 
-echo "=== [4/7] 部署特权守护脚本（不改动 /system 分区）==="
+# 旧的一次性桥：仅保留用于部署自检与排障，不再是主链路
+if [ -f "$SCRIPT_DIR/TaskSnapBridge.java" ] && [ -n "$ANDROID_JAR" ] && [ -n "$D8_BIN" ]; then
+    rm -rf "$PROJECT_ROOT/.tmp-build/bridge"
+    mkdir -p "$PROJECT_ROOT/.tmp-build/bridge/classes" "$PROJECT_ROOT/.tmp-build/bridge/out"
+    if "$JAVA_HOME/bin/javac" -nowarn -source 17 -target 17 \
+         -classpath "$ANDROID_JAR" \
+         -d "$PROJECT_ROOT/.tmp-build/bridge/classes" \
+         "$SCRIPT_DIR/TaskSnapBridge.java" >/dev/null 2>&1 \
+       && "$D8_BIN" --min-api 28 --lib "$ANDROID_JAR" \
+         --output "$PROJECT_ROOT/.tmp-build/bridge/out" \
+         "$PROJECT_ROOT/.tmp-build/bridge/classes/TaskSnapBridge.class" >/dev/null 2>&1
+    then
+        "$ADB" push "$PROJECT_ROOT/.tmp-build/bridge/out/classes.dex" "$BRIDGE_DEX_REMOTE" >/dev/null
+        "$ADB" shell "chown root:root $BRIDGE_DEX_REMOTE; chmod 755 $BRIDGE_DEX_REMOTE"
+        echo "  ✅ 一次性 TaskSnapBridge 已部署（自检/排障兜底）"
+    else
+        echo "  ⚠️ 一次性 bridge 编译失败（不影响主链路）"
+    fi
+else
+    echo "  ℹ️ 跳过一次性 bridge（仅自检/排障需要）"
+fi
+
+echo "=== [4/8] 部署特权守护脚本（不改动 /system 分区）==="
 # 【重要：绝不写 /system】
 # 本机 /system 受 dm-verity 校验，改写会导致验证失败进而无法开机。
 # 脚本与开机自启配置一律放在 /data/local/tmp，部署过程只做 push + chmod。
@@ -310,11 +335,11 @@ fi
 "$ADB" shell pm grant com.meego.launcher android.permission.DUMP 2>/dev/null || true
 "$ADB" shell pm grant com.meego.launcher android.permission.REAL_GET_TASKS 2>/dev/null || true
 
-echo "=== [5/7] 强制停止历史进程并冷启动应用 ==="
+echo "=== [5/8] 强制停止历史进程并冷启动应用 ==="
 "$ADB" shell am force-stop com.meego.launcher
 "$ADB" shell am start -n com.meego.launcher/.MainActivity
 
-echo "=== [6/7] 验证进程存活与前台状态 ==="
+echo "=== [6/8] 验证进程存活与前台状态 ==="
 sleep 2
 PID=$("$ADB" shell pidof com.meego.launcher 2>/dev/null | tr -d '\r' | awk '{print $1}')
 DAEMON_MAIN=$(daemon_main_pid)
@@ -343,7 +368,7 @@ fi
 
 # 6. 守护进程自愈能力验证：杀掉业务主进程，确认 watchdog 能把它拉回来
 # 这是 v1.8.35 修复的核心保证，部署后自动验证一次。
-echo "=== [7/7] 验证守护进程自愈（杀主进程后应自动恢复）==="
+echo "=== [7/8] 验证守护进程自愈（杀主进程后应自动恢复）==="
 MAIN_PID_BEFORE=$(daemon_main_pid)
 if [ -n "$MAIN_PID_BEFORE" ] && [ -n "$DAEMON_WD" ]; then
     echo "  业务主进程 PID=${MAIN_PID_BEFORE}，watchdog PID=${DAEMON_WD}；主动 kill -9 模拟崩溃…"
@@ -368,3 +393,57 @@ if [ -n "$MAIN_PID_BEFORE" ] && [ -n "$DAEMON_WD" ]; then
 else
     echo "ℹ️ 业务主进程与 watchdog 未双双就绪，跳过自愈验证"
 fi
+
+# 7. 常驻 Task Snapshot 服务验证（v1.8.44 新增）
+#
+# 【为什么必须单独验证】自 v1.8.44 起，多任务卡片的**唯一**画面来源是这个常驻服务。
+# 它若没起来，应用不会崩、不会报错，只是所有卡片安静地退化成应用图标 ——
+# 属于典型的「安静地坏掉」，必须在部署阶段就 fail fast。
+echo "=== [8/8] 验证常驻 Task Snapshot 服务（画面来源）==="
+sleep 2   # 给守护主循环一次拉起服务的机会
+
+SVC_STATUS=$("$ADB" shell '
+    if [ ! -f /data/local/tmp/meego_svc.pid ]; then echo "NOPID"; exit; fi
+    p=$(cat /data/local/tmp/meego_svc.pid 2>/dev/null | tr -d "\r\n ")
+    if [ -n "$p" ] && [ -d "/proc/$p" ]; then echo "ALIVE:$p"; else echo "DEAD"; fi
+' 2>/dev/null | tr -d '\r' | tail -1)
+
+case "$SVC_STATUS" in
+    ALIVE:*)
+        SVC_PID_ON_DEV="${SVC_STATUS#ALIVE:}"
+        echo "  ✅ 常驻快照服务存活（PID=${SVC_PID_ON_DEV}）"
+        # 主动 ping 一次，确认 IPC 通路真的通（而不只是进程在）
+        # 轮询等新行，不固定 sleep —— 抢跑会取到上一条旧响应（含 ok:true 却无 threads）
+        PING_OUT=$("$ADB" shell '
+            exec 3>/data/local/tmp/meego_snap_cmd 2>/dev/null || exit
+            before=$(wc -l < /data/local/tmp/meego_snap_out 2>/dev/null || echo 0)
+            echo "{\"cmd\":\"ping\"}" >&3
+            exec 3>&-
+            n=0
+            while [ "$n" -lt 30 ]; do
+                after=$(wc -l < /data/local/tmp/meego_snap_out 2>/dev/null || echo 0)
+                if [ "$after" -gt "$before" ]; then
+                    tail -n 1 /data/local/tmp/meego_snap_out
+                    exit
+                fi
+                sleep 0.05
+                n=$((n + 1))
+            done
+        ' 2>/dev/null | tr -d '\r' | tail -1)
+        case "$PING_OUT" in
+            *'"ok":true'*)
+                echo "  ✅ 服务 IPC 正常响应：${PING_OUT}"
+                ;;
+            *)
+                echo "  ⚠️ 服务进程在，但 ping 无响应：${PING_OUT:-<空>}"
+                echo "     画面将无法更新，检查 /data/local/tmp/meego_snap_out"
+                ;;
+        esac
+        ;;
+    *)
+        echo "  ❌ 常驻快照服务未运行（$SVC_STATUS）"
+        echo "     多任务卡片将只能显示应用图标。请检查："
+        echo "       · /data/local/tmp/meego_svc.dex 是否已部署"
+        echo "       · adb shell 是否为 root（TaskSnapshot 需要签名级权限）"
+        ;;
+esac

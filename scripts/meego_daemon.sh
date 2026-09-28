@@ -4,9 +4,9 @@
 # 职责：
 # 1. 维护 /data/local/tmp/recent_tasks.json 及 App 私有目录任务数据
 # 2. 监听 App 私有目录命令队列 (cmd_queue) 与 FIFO 管道，执行真实后台进程杀死 (am force-stop, pkill)
-# 3. 监听前台应用切换并捕获无水印实时快照
-# 4. 维护快照文件权限并同步至 App 私有目录
-# 5. 自愈并确保全屏边缘划出手势与无障碍顶级浮层生效
+# 3. 守护「常驻 Task Snapshot 服务」，并在其上驱动取帧（v1.8.44 起为本项目
+#    唯一画面来源，对齐 AOSP/LineageOS Quickstep 的 TaskSnapshot 取帧原理）
+# 4. 自愈并确保全屏边缘划出手势与无障碍顶级浮层生效
 # ==============================================================================
 
 FIFO="/data/local/tmp/meego_cmd"
@@ -20,8 +20,42 @@ LINK_DIR="/data/local/tmp/snapshots"
 # 故此处 root:root 755 恰是所需形态），由本脚本按需以 app_process 调用。
 BRIDGE_DEX="/data/local/tmp/meego_daemon_bridge.dex"
 
+# ---------------------------------------------------------------------------
+# 0.A 常驻 Task Snapshot 服务（v1.8.44 新增，本版主链路）
+# ---------------------------------------------------------------------------
+# 【为什么必须常驻 —— 实测数据】
+# 旧的一次性桥每次取帧都要 fork 一次 app_process，代价拆解为：
+#     binder 11ms + wrap 10ms + PNG 246ms = 内部 ~267ms
+#     + app_process 冷启动 ~1100ms        ← 真正的瓶颈
+#     = 端到端 real ~1.35s（`time` 实测 1.33~1.41s）
+#
+# 常驻后实测单帧 **11~42ms**（takeTaskSnapshot 路径），提升约 40 倍。
+# 且常驻进程内已持有 binder 代理与类加载结果，无需重复付出。
+#
+# 协议：stdin/stdout 逐行 JSON，命令见 scripts/TaskSnapService.java。
+# 【FIFO 的关键坑，已实测】写端一旦退出，服务端 readLine() 立刻读到 EOF。
+# 故这里用 `exec 9<>` 在**服务进程自身内部**同时持有读端与写端
+# （`9<>` = 以读写方式打开，永不产生 EOF），从而服务不会因调用方断开而退出。
+# 调用方则通过另一条 FIFO 写入指令，走行缓冲。
+SVC_DEX="/data/local/tmp/meego_svc.dex"
+SVC_FIFO="/data/local/tmp/meego_snap_cmd"
+SVC_OUT="/data/local/tmp/meego_snap_out"
+SVC_PID="/data/local/tmp/meego_svc.pid"
+# 注意：SVC_HB 依赖 APP_CMD_DIR，故**必须**在下方 APP_DIR/APP_CMD_DIR 定义之后再赋值。
+# 此前把它写在这一段里，导致解析期 APP_CMD_DIR 尚为空串、
+# SVC_HB 退化成 "/svc.hb"，写入被 2>/dev/null 静默吞掉（服务心跳文件恒不出现）。
+
+# 前台任务实时取帧的节奏（秒）。
+# 【取值依据】常驻服务下单帧仅需 11~42ms，0.3s 意味着稳态帧龄上界约
+# 「0.3s 等待 + 0.05s 取帧 + 0.25s 编码落盘」≈ 0.6s，比旧方案的 ~1.5s
+# 明显更跟手；同时常驻进程几乎不耗电（无 fork、无 dumpsys）。
+TAKE_INTERVAL=0.3
+
 APP_DIR="/data/user/0/com.meego.launcher/files"
 APP_CMD_DIR="$APP_DIR/cmd_queue"
+# 常驻服务心跳：由 capture_task_snapshot 每次成功取帧后刷新，
+# 供 check_device.sh 判断「服务是否真的在产出帧」（而非仅仅进程还在）。
+SVC_HB="$APP_CMD_DIR/svc.hb"
 APP_TASKS_JSON="$APP_DIR/recent_tasks.json"
 APP_SNAP_DIR="$APP_DIR/snapshots"
 
@@ -331,273 +365,202 @@ if [ -d "$SNAP_USER_DIR" ]; then
     chmod 644 "$SNAP_USER_DIR"/* 2>/dev/null || true
 fi
 
-# 4. 捕获当前屏幕画面到 snapshots/${target_tid}_live.png 与 current_app.png
-#    settled=0 -> 标记为 provisional（应用仍处于启动动画期，渲染层应降级为图标占位）
-#    settled=1 -> 清除 provisional 标记（已确认是应用稳定后的画面）
-capture_current_screen() {
-    target_tid="$1"
-    target_pkg="$2"
-    settled="${3:-1}"
+# ===========================================================================
+# 4. 常驻 Task Snapshot 服务：启动、IPC 与取帧（v1.8.44 重写）
+# ===========================================================================
+#
+# 【本版为何删除全部 screencap 采集】
+# 旧实现用 `screencap -p` 抓**整块物理屏幕**，带来两个硬伤：
+#   (a) 像素污染 —— 每张卡片都混进状态栏 / 导航栏 / 挖孔留白
+#       （本机实测 contentInsets=[0,105][0,66]）；
+#   (b) 性能 —— 单次 0.65s 闪存写，且必须靠 sleep 轮询猜「何时该抓」。
+# 而 Quickstep 的做法是向 WMS 索取**只含该任务窗口**的 TaskSnapshot，
+# 本机实测其像素与实时屏幕在应用区域**逐像素完全一致**（见 TECH_SPEC §4.14）。
+# 既然常驻服务已能把单帧压到 11~42ms，screencap 已无任何存在理由。
+#
+# 【产品行为变更（经确认）】
+# 失败即降级为**应用图标**，不再回退整屏 screencap 帧。
+# 代价：应用刚冷启动、系统尚未落盘任何快照的极短窗口内，卡片可能短暂显示图标；
+# 收益：画面永远不含系统栏杂质，且不会把整屏帧误当任务帧展示。
 
-    # 若手势正在进行中，坚决不捕获，避免截取到划出过程中带有桌面背景的画面。
-    #
-    # 【v1.8.39 重要澄清】曾在此为「按需抓帧」开过 DEMAND 豁免，**已撤销**。
-    # 实测证明该方案在物理上不可行：App 在 ACTION_DOWN 后约 30~50ms 就置位
-    # gesture_active，而最快的 `screencap`（RAW，0.18s）也远超该窗口 —— 手势开始后
-    # 才启动的抓帧，其像素**必然已含 Overlay 混合画面**，属于污染数据。
-    # 叠加下方「截屏耗时期间若 gesture_active 存在即丢弃」的后置守卫，产物会被丢弃，
-    # 白白浪费一次 0.65s 闪存写。结论：**画面的新鲜度只能靠手势开始前就已存在的帧
-    # 来保证**（见 STEADY_CAPTURE_EVERY），不存在「边滑边补抓」的有效解。
-    if [ -f /data/local/tmp/gesture_active ]; then
-        return
-    fi
+# --- 4.1 服务存活判定 -------------------------------------------------------
+svc_alive() {
+    [ -f "$SVC_PID" ] || return 1
+    sp=$(cat "$SVC_PID" 2>/dev/null | tr -d '\r\n ')
+    [ -n "$sp" ] && [ -d "/proc/$sp" ]
+}
 
-    # 临时文件按 tid 隔离：加密抓帧窗口与主循环可能并发抓取，共用同一临时文件会互相覆盖
-    if [ -n "$target_tid" ]; then
-        TMP_PNG="/data/local/tmp/current_app_${target_tid}.tmp.png"
-    else
-        TMP_PNG="/data/local/tmp/current_app.tmp.png"
-    fi
+# --- 4.1b 清理孤儿实例 ------------------------------------------------------
+# 【本函数解决一个已实测复现的严重缺陷】
+# `pgrep -f "app_process / TaskSnapService" | head -1` 取到的是**最老**的匹配项。
+# 若历史上手工/异常启动留下过一个 PPID=1 的孤儿实例，它会一直排在最前，于是：
+#   · 新实例拉起后，pidfile 里写下的仍是那个**早已存在的旧 PID**；
+#   · 随后 svc_alive 依据旧 PID 判定为「存活」，pidfile 永不被纠正；
+#   · 结果是两个服务并存、pidfile 与真实实例脱节，故障时无从判断谁活着。
+#
+# 拉起新实例**之前**先清掉所有旧实例即可根治：它们无需保留任何状态
+# （TaskSnapshotManager 只是 system_server 侧的一个代理，取帧状态本就在
+#  系统缓存里，服务自身无状态）。
+kill_orphan_svc() {
+    ko_pids=$(pgrep -f "app_process / TaskSnapService" 2>/dev/null || true)
+    [ -n "$ko_pids" ] || return 0
+    for ko in $ko_pids; do
+        kill -9 "$ko" 2>/dev/null || true
+    done
+    # 给 system_server 一点时间回收 binder 端点
+    sleep 0.2
+}
 
-    screencap -p "$TMP_PNG" 2>/dev/null
-    # 截屏耗时期间若手势被触发，立刻丢弃截屏
-    if [ -f /data/local/tmp/gesture_active ]; then
-        rm -f "$TMP_PNG"
-        return
-    fi
+# --- 4.2 拉起常驻服务 -------------------------------------------------------
+# 【FIFO EOF 陷阱，已实测踩坑】
+# 朴素写法 `app_process ... < fifo` 会在「当前没有写端」时立刻收到 EOF 而退出。
+# 正确做法：在服务进程内部用 `exec 9<>fifo` 以**读写方式**打开同一 FIFO，
+# 写端由此常驻永不关闭，服务则可持续存活等待指令。
+start_svc() {
+    svc_alive && return 0
+    [ -f "$SVC_DEX" ] || return 1
 
-    if [ -s "$TMP_PNG" ]; then
-        if [ -n "$target_tid" ]; then
-            # 【v1.8.40】自采帧只写 App 私有目录。原先还额外往
-            # /data/local/tmp/snapshots/ 写一份，而那个路径曾是通往系统快照目录的
-            # 软链 —— 修正软链指向后，它会把我们的整屏帧写进 AOSP 独占管理的
-            # 目录（真机实测产出过 691_live.png）。该副本本就无人可靠读取
-            # （App 侧候选列表优先读 filesDir），删除零功能损失。
-            mkdir -p "$APP_SNAP_DIR" 2>/dev/null || true
-            cp -f "$TMP_PNG" "$APP_SNAP_DIR/${target_tid}_live.png" 2>/dev/null || true
-            chown "$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null)" "$APP_SNAP_DIR/${target_tid}_live.png" 2>/dev/null || true
-            chmod 666 "$APP_SNAP_DIR/${target_tid}_live.png" 2>/dev/null || true
+    # 关键：先清孤儿，保证随后 pgrep 取到的第一个就是**本次新建**的实例，
+    # pidfile 因此始终与真实存活实例一一对应（见 kill_orphan_svc 注释）。
+    kill_orphan_svc
 
-            # provisional 标记：只维护在 App 私有目录（App 只能可靠读取自身 filesDir）
-            if [ "$settled" = "0" ]; then
-                touch "$APP_SNAP_DIR/${target_tid}_live.provisional" 2>/dev/null || true
-                chmod 666 "$APP_SNAP_DIR/${target_tid}_live.provisional" 2>/dev/null || true
-            else
-                rm -f "$APP_SNAP_DIR/${target_tid}_live.provisional" 2>/dev/null || true
+    mkdir -p "$APP_CMD_DIR" 2>/dev/null || true
+    rm -f "$SVC_FIFO" 2>/dev/null || true
+    mkfifo "$SVC_FIFO" 2>/dev/null || true
+    chmod 666 "$SVC_FIFO" 2>/dev/null || true
+    : > /dev/null 2>&1
+    rm -f "$SVC_OUT" 2>/dev/null || true
+
+    setsid /system/bin/sh -c "
+        exec 9<>'$SVC_FIFO'
+        CLASSPATH='$SVC_DEX' exec app_process / TaskSnapService <&9 > '$SVC_OUT' 2>&1
+    " </dev/null >/dev/null 2>&1 &
+
+    # 等待服务就绪：以 SVC_OUT 出现 ready 为准，最多等 3s
+    n=0
+    while [ "$n" -lt 30 ]; do
+        if [ -f "$SVC_OUT" ] && grep -q '"ready":true' "$SVC_OUT" 2>/dev/null; then
+            sp=$(pgrep -f "app_process / TaskSnapService" 2>/dev/null | head -1)
+            if [ -n "$sp" ]; then
+                echo "$sp" > "$SVC_PID" 2>/dev/null || true
+                chmod 666 "$SVC_PID" 2>/dev/null || true
+                return 0
             fi
-
-            echo "$target_tid" > /data/local/tmp/current_app_tid.txt
-            chmod 666 /data/local/tmp/current_app_tid.txt
-            echo "$target_tid" > "$APP_DIR/current_app_tid.txt" 2>/dev/null || true
-            chmod 666 "$APP_DIR/current_app_tid.txt" 2>/dev/null || true
         fi
-        if [ -n "$target_pkg" ]; then
-            echo "$target_pkg" > /data/local/tmp/current_app_pkg.txt
-            chmod 666 /data/local/tmp/current_app_pkg.txt
-            echo "$target_pkg" > "$APP_DIR/current_app_pkg.txt" 2>/dev/null || true
-            chmod 666 "$APP_DIR/current_app_pkg.txt" 2>/dev/null || true
-        fi
-        if [ -z "$target_tid" ]; then
-            mv -f "$TMP_PNG" /data/local/tmp/current_app.png
-            chmod 666 /data/local/tmp/current_app.png
-            cp -f /data/local/tmp/current_app.png "$APP_DIR/current_app.png" 2>/dev/null || true
-            chmod 666 "$APP_DIR/current_app.png" 2>/dev/null || true
-        else
-            # taskId 已隔离，无需再写全局 current_app.png：
-            # 该文件仅在无 tid 的 SNAP 指令路径下有语义，混写会污染全局所有权校验
-            rm -f "$TMP_PNG"
-        fi
-    else
-        rm -f "$TMP_PNG"
-    fi
-}
-
-# 4.2 退到后台采集（对齐 AOSP 语义）
-#     AOSP TaskSnapshotController 在任务"变不可见"那一刻抓取快照，本机实测证实：
-#     应用刚进前台时 /data/system_ce/0/snapshots/ 下尚无其快照，切走后立刻出现。
-#     本函数在检测到前台切换的瞬间，对**即将退到后台的旧应用**补抓一帧最终画面。
-#
-#     时序要点：检测到切换时旧应用刚失去前台、最后一帧仍完整可见，而屏幕已经开始
-#     渲染新应用——因此这次 screencap 抓到的就是旧应用的最终态，直接标记为 settled。
-#
-#     注意：本函数**只写旧应用自己的 ${tid}_live.png**，绝不触碰任何全局所有权文件
-#     （current_app_tid / current_app_pkg / current_app.png），否则会污染新应用的
-#     所有权校验链条，制造跨应用串扰。
-capture_backgrounding() {
-    bg_tid="$1"
-    bg_pkg="$2"
-    [ -z "$bg_tid" ] && return
-
-    # 若此刻正在手势划出，屏幕正被桌面遮罩覆盖，抓到的会是划出过程画面，直接放弃
-    if [ -f /data/local/tmp/gesture_active ]; then
-        return
-    fi
-
-    bg_tmp="/data/local/tmp/current_app_${bg_tid}.bg.png"
-    screencap -p "$bg_tmp" 2>/dev/null
-    if [ -f /data/local/tmp/gesture_active ]; then
-        rm -f "$bg_tmp"
-        return
-    fi
-
-    if [ -s "$bg_tmp" ]; then
-        # 【v1.8.40】同 capture_current_screen：不再经软链写系统快照目录
-        mkdir -p "$APP_SNAP_DIR" 2>/dev/null || true
-        cp -f "$bg_tmp" "$APP_SNAP_DIR/${bg_tid}_live.png" 2>/dev/null || true
-        chmod 666 "$APP_SNAP_DIR/${bg_tid}_live.png" 2>/dev/null || true
-
-        # 已离开前台，画面确定是最终态：清除 provisional 标记
-        rm -f "$APP_SNAP_DIR/${bg_tid}_live.provisional" 2>/dev/null || true
-    fi
-    rm -f "$bg_tmp"
-}
-
-# 4.4 provisional 标记兜底清理（TTL）
-#     极端情况下 settle 子 shell 可能被杀死（守护进程重启、任务被删等），
-#     导致 provisional 标记长期残留，使该任务永远降级为图标。
-#     超过 TTL 的 provisional 视为失效，直接清除。
-PROVISIONAL_TTL=15
-expire_stale_provisionals() {
-    now=$(date +%s 2>/dev/null || echo 0)
-    [ "$now" = "0" ] && return
-    for f in "$APP_SNAP_DIR"/*_live.provisional; do
-        [ -f "$f" ] || continue
-        m=$(stat -c %Y "$f" 2>/dev/null || echo 0)
-        [ "$m" = "0" ] && continue
-        if [ $(( now - m )) -gt "$PROVISIONAL_TTL" ]; then
-            rm -f "$f" 2>/dev/null || true
-        fi
+        sleep 0.1
+        n=$((n + 1))
     done
+    return 1
 }
 
-# 4.3 系统快照校正
-#     周期性地用系统权威快照刷新陈旧的 live 帧。系统快照内容与 mtime 均已实测可靠
-#     （实测某任务 _live.png 老化 3725s 而 _reduced.jpg 仅 0s），此处仅在系统快照
-#     确实更新时同步，避免无谓 I/O。
-#
-# 【v1.8.40 两处修复】
-#  (a) glob 由 "$SNAP_DIR"/*_reduced.jpg 改为 "$SNAP_USER_DIR"/*_reduced.jpg
-#      —— 前者在 Android 16 上零命中（见 0.0 节），本函数此前形同虚设。
-#  (b) 由「只搬 _reduced.jpg」扩展为**同时搬全分辨率 .jpg**。
-#      原实现只同步 reduced（540x1200，实测 28~41KB），而全分辨率
-#      （1080x2400，实测 70~198KB）才是多任务卡片真正该用的那一档 ——
-#      reduced 只是丢失细节的降级产物。此前全分辨率帧从未被搬进 App 目录。
-sync_from_system_snapshot() {
-    [ -d "$SNAP_USER_DIR" ] || return
-    for sf in "$SNAP_USER_DIR"/*.jpg; do
-        [ -f "$sf" ] || continue
-        b=$(basename "$sf")
-        case "$b" in
-            *_reduced.jpg) s_tid="${b%_reduced.jpg}" ;;
-            *.jpg)         s_tid="${b%.jpg}" ;;
-            *) continue ;;
-        esac
-        [ -z "$s_tid" ] && continue
-        mkdir -p "$APP_SNAP_DIR" 2>/dev/null || true
-        dest="$APP_SNAP_DIR/$b"
-        # 仅当 App 私有目录缺失或比系统快照更旧时才同步
-        if [ ! -f "$dest" ] || [ "$sf" -nt "$dest" ]; then
-            cp -f "$sf" "$dest" 2>/dev/null || true
-            # 属主对齐 App uid，否则 App（untrusted_app）读不到 root 拷贝的文件。
-            # 沿用 ensure_app_dirs 的做法：目录属主即 App uid。
-            chown "$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null)" "$dest" 2>/dev/null || true
-            chmod 666 "$dest" 2>/dev/null || true
+# --- 4.3 向服务发一条指令并取回最后一行响应 ---------------------------------
+svc_cmd() {
+    svc_alive || return 1
+    # 记录当前响应行数，以便只取「本次新增」的那一行
+    before=$(wc -l < "$SVC_OUT" 2>/dev/null || echo 0)
+    echo "$1" > "$SVC_FIFO" 2>/dev/null || return 1
+
+    n=0
+    while [ "$n" -lt 40 ]; do
+        after=$(wc -l < "$SVC_OUT" 2>/dev/null || echo 0)
+        if [ "$after" -gt "$before" ]; then
+            tail -n 1 "$SVC_OUT" 2>/dev/null
+            return 0
         fi
+        sleep 0.05
+        n=$((n + 1))
     done
+    return 1
 }
 
-# 4.5 真实任务快照直读（v1.8.40 新增，Task Snapshot 管线核心）
+svc_ping() {
+    svc_cmd '{"cmd":"ping"}'
+}
+
+# --- 4.4 取一帧并落盘 -------------------------------------------------------
+# live=1 → 优先 takeTaskSnapshot（仅对**可见**任务有效，取实时画面）
+# live=0 → 优先 getTaskSnapshot（系统缓存帧，后台任务用它）
+# 两者互为兜底：任一路径拿不到就试另一条，因此调用方不必关心任务可见性。
 #
-# 【与 screencap 的本质区别 —— 这是本函数存在的全部理由】
-# capture_current_screen 走 `screencap -p`，抓的是**整块物理屏幕**，于是
-# 每一张多任务卡片里都混进了状态栏、导航栏、挖孔留白（实测本机 contentInsets
-# 为 [0,105][0,66]，即顶部 105px 挖孔 + 底部 66px 导航栏），在纯黑 MeeGo
-# 卡片上一眼就能看出「这不是这个应用的画面」。
-#
-# AOSP 为每个任务维护了一份**只含该任务窗口**的真实快照，由
-# TaskSnapshotController 在任务「变不可见」那一刻抓取。本函数通过
-# TaskSnapBridge 走 IActivityTaskManager.getTaskSnapshotManager() 把那份
-# 快照的真实像素取出，绕过整屏污染。
-#
-# 【为何必须在 root 侧（实测结论，勿删本注释）】
-# getTaskSnapshotManager 权限为 allOf={MANAGE_ACTIVITY_TASKS,
-# READ_FRAME_BUFFER}，二者皆 signature 级。实测：
-#   uid=10209（untrusted_app）→ SecurityException: Access denied
-#   uid=0 / adb shell          → 通过
-#
-# 【性能】实测 275ms（binder 9ms + wrap 11ms + PNG 254ms），
-# 对比 screencap -p 的 ≈650ms，且像素只含任务窗口。
-#
-# 【与 §4.11.4「按需抓帧不可行」的关系】
-# 该否证结论依然成立：手势开始后 30~50ms 内无任何手段能产出干净像素。
-# 本函数改善的是**帧龄**与**像素纯净度**，不是手势期补抓，因此
-# 不接受 SNAPSHOT 指令的「手势期突发」用法。
-#
-# 产物：$APP_SNAP_DIR/${tid}_sys.jpg（仅任务窗口，1080x2400）
-# 失败：不留残留文件，返回非 0，由调用方决定是否回退到 screencap。
-SNAPSHOT_RESOLUTION=1
+# 产物固定写 $APP_SNAP_DIR/${tid}_sys.jpg —— 与 App 侧既有候选列表首位同名，
+# 故 App 侧**零改动**即可享受常驻服务产出的高帧率、纯净像素帧。
 capture_task_snapshot() {
-    st_tid="$1"
-    [ -z "$st_tid" ] && return 1
-    [ -f "$BRIDGE_DEX" ] || return 1
-
-    # 手势进行中不取：此刻任务仍可见，系统尚未为其抓快照，
-    # 强行调用只会得到 null，白白浪费一次 app_process 冷启动。
-    [ -f /data/local/tmp/gesture_active ] && return 1
+    cs_tid="$1"
+    cs_live="${2:-0}"
+    [ -z "$cs_tid" ] && return 1
+    svc_alive || return 1
 
     mkdir -p "$APP_SNAP_DIR" 2>/dev/null || true
-    st_out="$APP_SNAP_DIR/${st_tid}_sys.jpg"
+    cs_out="$APP_SNAP_DIR/${cs_tid}_sys.jpg"
 
-    st_json=$(CLASSPATH="$BRIDGE_DEX" app_process / TaskSnapBridge \
-                  "$st_tid" "$SNAPSHOT_RESOLUTION" "$st_out" 2>/dev/null | head -1)
+    # 手势进行中不取：此刻系统仍在为该任务抓快照，take 会拿到过渡态画面
+    [ -f /data/local/tmp/gesture_active ] && return 1
 
-    case "$st_json" in
+    cs_json=$(svc_cmd "{\"cmd\":\"write\",\"tid\":$cs_tid,\"out\":\"$cs_out\",\"live\":$cs_live}")
+
+    case "$cs_json" in
         *'"ok":true'*)
-            chown "$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null)" "$st_out" 2>/dev/null || true
-            chmod 666 "$st_out" 2>/dev/null || true
+            chown "$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null)" "$cs_out" 2>/dev/null || true
+            chmod 666 "$cs_out" 2>/dev/null || true
+            echo "$$ $(date +%s)" > "$SVC_HB" 2>/dev/null || true
+            chmod 666 "$SVC_HB" 2>/dev/null || true
+            chown "$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null)" "$SVC_HB" 2>/dev/null || true
             return 0
             ;;
         *)
-            # 失败时清掉可能存在的半成品，避免 App 把残缺文件当成有效帧
-            rm -f "$st_out" 2>/dev/null || true
+            # 失败不留残file，避免 App 把半张图当成有效帧
+            rm -f "$cs_out" 2>/dev/null || true
             return 1
             ;;
     esac
 }
 
-# 4.1 应用切换后的加密抓帧窗口
-#     应用启动后约 3-4s 才稳定（实测微信冷启动），单次抓帧只会拍到启动动画帧。
-#     此处在 SETTLE_WINDOW 秒内每 SETTLE_INTERVAL 秒补抓一帧，窗口结束时标记为稳定。
-#     必须后台化：主循环承担手势期前台检测，同步阻塞会导致滑出检测滞后最多 3s。
-SETTLE_WINDOW=3
-SETTLE_INTERVAL=0.5
-start_settle_window() {
-    s_tid="$1"
-    s_pkg="$2"
-    (
-        n=0
-        while [ "$n" -lt "$SETTLE_WINDOW" ]; do
-            sleep "$SETTLE_INTERVAL"
-            n=$((n+1))
-            # 用户可能已离开该应用，此时无须继续为其抓帧
-            cur=$(cat /data/local/tmp/current_task_id.txt 2>/dev/null | tr -d '\r\n ')
-            if [ "$cur" != "$s_tid" ]; then
-                break
+# --- 4.5 系统快照目录权限维持 -----------------------------------------------
+# AOSP TaskSnapshotController 的目录为 system:system 0700；本脚本以 root 读取
+# 需保证可遍历。此处只做 chmod，**不**再从中拷贝文件（取帧已全部走服务）。
+maintain_system_snapshot_perms() {
+    chmod 755 /data/system_ce /data/system_ce/0 2>/dev/null || true
+    chmod 755 "$SNAP_DIR" 2>/dev/null || true
+    if [ -d "$SNAP_USER_DIR" ]; then
+        chmod 755 "$SNAP_USER_DIR" 2>/dev/null || true
+    fi
+}
+
+# --- 4.6 前台任务实时取帧循环 -----------------------------------------------
+# 【为什么可以放心高频轮询】
+# 常驻服务下单帧 11~42ms，且没有 fork / dumpsys / 闪存整屏写，
+# 因此即使 0.3s 一次也远达不到需要节流的程度。
+# 【与旧 STEADY_CAPTURE_EVERY 的关系】
+# 旧节奏 5 次轮询 ≈1.8s 等待 + 0.65s 抓帧 ≈ 2.4s 帧龄 —— 那是为 0.65s 的
+# screencap 妥协的结果；换成常驻服务后该限制已消失。
+take_foreground_loop() {
+    tf_last=""
+    while true; do
+        tf_tid=$(cat /data/local/tmp/current_task_id.txt 2>/dev/null | tr -d '\r\n ')
+        if [ -n "$tf_tid" ] && [ "$tf_tid" != "$tf_last" ]; then
+            # 任务刚切到前台：立刻取一帧，避免首帧缺失
+            capture_task_snapshot "$tf_tid" 1
+            tf_last="$tf_tid"
+            tf_t=0
+        fi
+        if [ -n "$tf_tid" ] && [ "$tf_tid" = "$tf_last" ]; then
+            tf_t=$((tf_t + 1))
+            if [ "$tf_t" -ge 2 ]; then
+                tf_t=0
+                # live=1：对可见任务取实时帧
+                capture_task_snapshot "$tf_tid" 1
             fi
-            capture_current_screen "$s_tid" "$s_pkg" 0
-        done
-        # 窗口结束，无论是否提前 break，都以稳定帧收尾
-        capture_current_screen "$s_tid" "$s_pkg" 1
-    ) &
+        fi
+        sleep "$TAKE_INTERVAL"
+    done
 }
 
 # 5. 刷新任务列表为 JSON (防并发与原子落盘)
 update_tasks() {
-    chmod 755 /data/system_ce /data/system_ce/0 2>/dev/null || true
-    chmod 755 "$SNAP_DIR" 2>/dev/null || true
-    chmod 755 "$SNAP_USER_DIR" 2>/dev/null || true
-    chmod 644 "$SNAP_USER_DIR"/* 2>/dev/null || true
-
+    # 【v1.8.44】不再逐文件 chmod 整个系统快照目录。
+    # 旧实现每 2s 就对 $SNAP_USER_DIR 下**所有**文件 chmod 644，在任务多时是
+    # 可观的无谓元数据写；且自本版起我们根本不再读取该目录（取帧走常驻服务），
+    # 只需保证目录可遍历即可 —— 由 maintain_system_snapshot_perms 负责。
     TMP_FILE="/data/local/tmp/recent_tasks_${MY_PID}_${RANDOM}.tmp"
     echo "[" > "$TMP_FILE"
 
@@ -628,31 +591,16 @@ update_tasks() {
     ' | while IFS=":" read -r tid tpkg; do
         [ -z "$tid" ] && continue
 
-        # 同步系统真实快照到 App 私有目录并赋予可读权限
-        # 【v1.8.40】路径改指 $SNAP_USER_DIR（Android 16 的 UUID 子目录），
-        # 与 0.0 节 / sync_from_system_snapshot 保持一致，否则此处同样零命中。
+        # 【v1.8.44】系统快照目录不再被拷贝。
+        # 取帧已全部由常驻 Task Snapshot 服务完成，产物固定为
+        # $APP_SNAP_DIR/${tid}_sys.jpg。此前在此 cp 系统的 .jpg / _reduced.jpg
+        # 会带来两个问题：
+        #   (a) 它们是 AOSP TaskSnapshotController 的落盘产物，可能滞后于
+        #       「任务刚变不可见」的时刻，而服务取的正是那一刻的内存帧；
+        #   (b) 无谓的闪存拷贝（每个任务每次 update_tasks 都跑一遍）。
+        # 唯一画面来源即 _sys.jpg，App 侧候选列表亦已收敛到它。
         mkdir -p "$APP_SNAP_DIR" 2>/dev/null || true
-        for sys_snap in "$SNAP_USER_DIR/${tid}_reduced.jpg" "$SNAP_USER_DIR/${tid}.jpg"; do
-            [ -f "$sys_snap" ] || continue
-            b=$(basename "$sys_snap")
-            cp -f "$sys_snap" "$APP_SNAP_DIR/$b" 2>/dev/null || true
-            chown "$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null)" "$APP_SNAP_DIR/$b" 2>/dev/null || true
-            chmod 666 "$APP_SNAP_DIR/$b" 2>/dev/null || true
-        done
-
-        # 候选优先级：Task Snapshot 直读帧 > 退后台整屏帧 > 系统 reduced > 系统全分辨率
-        # 【v1.8.40】最末位的 /data/local/tmp/snapshots 回退已移除（软链不再存在，
-        # 见第 3 节）。App 侧 RootTaskProvider 同样以 filesDir 为首选来源。
         snap_path="$APP_SNAP_DIR/${tid}_sys.jpg"
-        if [ ! -f "$snap_path" ]; then
-            snap_path="$APP_SNAP_DIR/${tid}_live.png"
-            if [ ! -f "$snap_path" ]; then
-                snap_path="$APP_SNAP_DIR/${tid}_reduced.jpg"
-                if [ ! -f "$snap_path" ]; then
-                    snap_path="$APP_SNAP_DIR/${tid}.jpg"
-                fi
-            fi
-        fi
         has_snap="false"
         if [ -f "$snap_path" ]; then
             has_snap="true"
@@ -783,8 +731,12 @@ execute_command() {
             fi
             ;;
         SNAP)
-            # 无 tid 的显式抓帧路径：沿用全局 current_app.png 语义，直接标记为稳定帧
-            capture_current_screen "" "" 1
+            # 显式抓帧：v1.8.44 起统一走常驻服务。
+            # 无 tid 时对当前前台任务取一帧实时画面。
+            snap_tid=$(cat /data/local/tmp/current_task_id.txt 2>/dev/null | tr -d '\r\n ')
+            if [ -n "$snap_tid" ]; then
+                capture_task_snapshot "$snap_tid" 1
+            fi
             ;;
         ENABLE_A11Y)
             ensure_system_settings
@@ -855,22 +807,18 @@ monitor_current_app() {
             pkg=$(echo "$act" | cut -d/ -f1)
 
             if [ "$resumed_info" != "$LAST_RESUMED" ]; then
-                # ===== Phase 2：退到后台采集 =====
+                # ===== 退到后台采集（v1.8.44：改为常驻服务取缓存帧）=====
                 # 关键顺序：必须在覆写任何状态文件之前，先对"即将退到后台的旧应用"
                 # 补抓其最终画面。LAST_RESUMED 此时仍持有旧应用的 tid/pkg。
+                #
+                # 【为何此处 live=0】旧任务此刻**已不可见**，takeTaskSnapshot 对
+                # 不可见任务恒返回 null（实测），故必须走 getTaskSnapshot 取系统
+                # 在「任务变不可见」那一刻抓下的缓存帧 —— 那正是该任务的最终态。
                 if [ -n "$LAST_RESUMED" ]; then
                     old_tid=$(echo "$LAST_RESUMED" | cut -d: -f1)
                     old_pkg=$(echo "$LAST_RESUMED" | cut -d: -f2 | cut -d/ -f1)
                     if [ -n "$old_tid" ] && [ "$old_tid" != "$tid" ]; then
-                        capture_backgrounding "$old_tid" "$old_pkg"
-                        # ===== v1.8.40 新增：退后台瞬间取系统权威快照 =====
-                        # AOSP TaskSnapshotController 恰在「任务变不可见」这一刻
-                        # 抓取该任务快照，所以此刻调用 getTaskSnapshot 命中率最高、
-                        # 帧龄最小。产物 _sys.jpg 只含任务窗口，是卡片最该用的一档。
-                        # 与 capture_backgrounding 并列而非取代：后者是整屏
-                        # screencap（含系统栏），在应用刚退后台、系统尚未落盘时
-                        # 仍能立刻给出一帧；二者由 App 侧仲裁层按 mtime 取优。
-                        capture_task_snapshot "$old_tid"
+                        capture_task_snapshot "$old_tid" 0
                     fi
                 fi
 
@@ -889,28 +837,20 @@ monitor_current_app() {
                 echo "$pkg" > "$APP_DIR/current_app_pkg.txt" 2>/dev/null || true
                 chmod 666 "$APP_DIR/current_app_pkg.txt" 2>/dev/null || true
 
-                # ===== 进入前台采集：仅作为临时占位（provisional） =====
-                # 用户若在应用启动动画期内立刻滑出，此帧是唯一可用的"最新画面"，
-                # 供 Multitasking 卡片短暂显示；它带 provisional 标记，渲染层
-                # 会主动降级为图标，直到退后台采集或系统快照给出最终帧。
-                # 稳态低频刷新（settled=1）见下方 else 分支。
-                sleep 0.15
-                capture_current_screen "$tid" "$pkg" 0
-                # 启动加密抓帧窗口：补抓到应用稳定帧
-                start_settle_window "$tid" "$pkg"
+                # ===== 进入前台：立即取一帧实时画面 =====
+                # v1.8.44 起新任务**不再**有启动动画期空窗：常驻服务对可见任务
+                # 的 takeTaskSnapshot 只需 11~42ms，足以在应用还在启动动画时
+                # 就拿到当前这一帧。因此旧版的 provisional 标记机制与
+                # start_settle_window 加密抓帧窗口**整体删除** ——
+                # 取帧循环 take_foreground_loop 会持续以 TAKE_INTERVAL 刷新。
+                capture_task_snapshot "$tid" 1
                 count=0
                 update_tasks
             else
                 count=$((count + 1))
-                # 稳态刷新节奏（v1.8.39 由 10 降为 5）：
-                # 单次 PNG screencap 实测 ≈0.65s，故原 10 次轮询（≈1.8s 纯等待
-                # + 0.65s 抓帧 ≈2.4s）与实测观察到的 ≈3s 刷新间隔吻合 —— 这正是
-                # 「划出时截图不够及时」的根因。降到 5 次后稳态帧龄由 ≈3s 降至 ≈1.5s。
-                if [ "$count" -ge "$STEADY_CAPTURE_EVERY" ]; then
-                    count=0
-                    # 稳态刷新：应用已在前台稳定运行，此帧可直接标记为 settled
-                    capture_current_screen "$tid" "$pkg" 1
-                fi
+                # 稳态刷新由 take_foreground_loop 负责（独立子 shell，0.3s 一次），
+                # 主循环此处不再做取帧，避免与它争抢同一 FIFO。
+                :
             fi
         else
             # ===== Phase 2：无前台应用 = 用户滑出回到启动器（或应用全部退到后台） =====
@@ -920,19 +860,18 @@ monitor_current_app() {
                 old_tid=$(echo "$LAST_RESUMED" | cut -d: -f1)
                 old_pkg=$(echo "$LAST_RESUMED" | cut -d: -f2 | cut -d/ -f1)
                 if [ -n "$old_tid" ]; then
-                    # 手势进行中 gesture_active 存在，此时抓屏会拍到划出遮罩；
-                    # 但启动器首帧绘制完成后遮罩已在 60ms 内淡出，稍作等待再抓更可靠。
-                    if [ -f /data/local/tmp/gesture_active ]; then
-                        sleep 0.35
-                    fi
-                    capture_backgrounding "$old_tid" "$old_pkg"
-                    # 【v1.8.40】同上：退后台瞬间取系统权威快照。
-                    # 这里尤其重要 —— 它是「划出返回启动器」的主路径，
-                    # 也正是用户抱怨「卡片画面是几秒前的旧画面」的那条路径。
-                    # capture_backgrounding 自带 gesture_active 前置守卫，
-                    # 此刻遮罩已淡出，抓到的是应用最终态；随后系统快照落盘，
-                    # _sys.jpg 以更纯净的像素在同一仲裁层里顶掉它。
-                    capture_task_snapshot "$old_tid"
+                    # ===== 划出回桌面：这是本项目最关键的一条采集路径 =====
+                    # 用户抱怨的「卡片画面是几秒前的旧画面」正出在这里。
+                    # v1.8.44 起只需一次 getTaskSnapshot（实测 1ms）即可拿到
+                    # 系统在「任务变不可见」那一刻抓下的最终帧，
+                    # 不再需要 sleep 0.35 等遮罩淡出、不再需要 0.65s 的 screencap。
+                    #
+                    # 【为何这里不需要 gesture_active 等待】
+                    # 旧实现等待 0.35s 是为了让 screencap 避开划出遮罩；而
+                    # TaskSnapshot 取的是**该任务自身的窗口内容**，与当前屏幕上
+                    # 叠加了什么遮罩完全无关 —— 实测在通知栏浮窗覆盖时仍能取到
+                    # 底层任务的干净画面。故此处直接取，无需等待。
+                    capture_task_snapshot "$old_tid" 0
                     update_tasks
                 fi
                 LAST_RESUMED=""
@@ -948,7 +887,24 @@ monitor_cmd_queue &
 process_fifo &
 monitor_current_app &
 
-# 10. 首次立即刷新任务列表，随后定期维护
+# ===========================================================================
+# 10. 拉起常驻 Task Snapshot 服务并开始取帧（v1.8.44）
+# ===========================================================================
+#
+# 【启动顺序：先服务，后取帧】
+# take_foreground_loop 每 0.3s 就要发一条指令，若服务尚未就绪则会连环失败
+# 并刷满 $SVC_OUT。故此处先确认服务可用，再放行取帧循环。
+start_svc
+if ! svc_alive; then
+    echo "$(date '+%m-%d %H:%M:%S') TaskSnapService 未能启动，Task Snapshot 管线不可用" \
+        >> /data/local/tmp/daemon.log 2>/dev/null || true
+fi
+
+# 前台实时取帧循环独立成进程：它必须以 0.3s 节奏稳定运行，
+# 绝不能被主循环的 update_tasks / dumpsys 阻塞。
+take_foreground_loop &
+
+# 11. 首次立即刷新任务列表，随后定期维护
 update_tasks
 
 while true; do
@@ -961,10 +917,18 @@ while true; do
     # 存活心跳：App 侧读不到 /proc（hidepid=2），只能靠这个带时间戳的文件
     # 判断主进程是否健在；它同时是 App 侧 DaemonWatchdogClient 的唯一判据。
     write_daemon_heartbeat
+
+    # 常驻快照服务自愈：服务是本版画面来源，它死了就没有新帧。
+    # 与主进程不同，它没有 watchdog 兜底，只能由本主循环每 2s 巡检一次。
+    # 拉起动作本身耗时（等待 ready 最多 3s），故只在真的缺失时才做。
+    if ! svc_alive; then
+        start_svc && \
+            echo "$(date '+%m-%d %H:%M:%S') TaskSnapService 已自愈重启" \
+                >> /data/local/tmp/daemon.log 2>/dev/null
+    fi
+
     update_tasks
-    # 系统快照校正 + provisional TTL 兜底：保证 live 帧不会长期陈旧，
-    # 且不会因 settle 子 shell 意外死亡而永久停留在图标降级态
-    sync_from_system_snapshot
-    expire_stale_provisionals
+    # 系统快照目录权限维持（取帧已全部走服务，这里只保证可遍历）
+    maintain_system_snapshot_perms
     sleep 2.0
 done

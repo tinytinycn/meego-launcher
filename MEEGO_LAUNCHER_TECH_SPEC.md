@@ -1,8 +1,11 @@
 # MeeGo Harmattan 风格 Android 启动器 (MeeGo Launcher) 技术方案
 
-> **版本**：v1.8.41  
+> **版本**：v1.8.43  
 > **文档位置**：`MEEGO_LAUNCHER_TECH_SPEC.md`（项目根目录）  
 > **维护规范**：全程在 DSH 环境中进行自主开发，每次会话针对架构、需求、实现的任何调整，均需即时同步更新此文档。
+
+> ⚠️ **v1.8.43 文档校准说明（重要）**
+> 本次对全部 20 个 Kotlin 源文件（6349 行）逐行通读后，发现**本文档早期章节（§1.1、§3.2、§4.1~§4.3、§4.5）中若干条设计描述与当前代码实现已经脱节**——部分是早期规划从未落地，部分是实现在演进中改用了另一条路径。本版已逐条核对并在原处标注**「✅ 已落地 / ⚠️ 未实现（以代码为准） / 🔀 实际实现与本节描述不同」**，并给出代码中的真实位置与取值。**凡本文档与代码冲突，一律以代码为准。**
 
 ---
 
@@ -20,16 +23,16 @@
      - 标志性 Squircle（连续曲率圆角）图标、纯黑背景、纵向流畅惯性滑动。
      - **动态网格密度**：支持一行 4 个（经典）或一行 5 个（紧凑）自由切换。
      - **启动器设置中心**：桌面常驻“MeeGo Settings”图标，直达启动器设置面板配置列数及手势偏好。
-     - 长按编辑管理（图标抖动、快速卸载/隐藏）。
+     - ⚠️ **长按编辑管理（图标抖动、快速卸载/隐藏）在当前代码中未实现**。`AppGridScreen` 的 `AppGridItem` 仅用 `Modifier.clickable(interactionSource, indication = null, onClick = ...)`，全项目无 `combinedClickable` / `onLongClick` 命中于该文件（`onLongClick` 仅存在于 `MultitaskingScreen.kt`）。另注：`FeedScreen` 中一条 MOCK 文案写有“长按桌面进入编辑模式”，那是**假数据**，非实现。
   3. **Multitasking View（多任务/运行中应用）**：
      - **真实后台卡片实时预览**（由 Root 特权链路直连渲染硬件位图）。
      - **双指无级缩放（Pinch-to-zoom）**：在 2×2（大卡片视图）与 3×3（紧凑卡片视图）后台卡片网格间平滑无级过渡，动画无缝插值。
      - **长按删除角标**：长按卡片进入编辑模式，各卡片右上角出现删除角标，点击即刻销毁后台任务。
      - 单卡片上划终结、点击秒切前台、底部一键“全部关闭”浮动按键。
 - **Swipe UI 手势核心**：
-  - **Quick Launch Bar（快速启动底栏）**：屏幕底部轻微上划呼出 4 个常驻核心图标（电话、短信、相机、浏览器）。
+  - ⚠️ **Quick Launch Bar（快速启动底栏）在当前代码中不存在**。`HomeScreen` 的 `Column` 仅含两个子项：`HorizontalPager(weight = 1f)` 与（沉浸式关闭时的）三屏指示点 `Row`，无 dock / 底栏 / 快捷启动栏；全项目 grep `QuickLaunch|quickLaunch|Dock` 零命中。应用入口**只**存在于第 1 屏的 `LazyVerticalGrid` 内。（`FeedScreen` 中一条 MOCK 文案含“快捷”一词，属假数据。）
   - **全局应用内边缘滑回（In-App Edge Swipe-to-Switch-Back）**：
-    - 在运行任意第三方应用时，手指从手机屏幕左右两侧全部边缘（全高度 MATCH_PARENT）划入超过屏幕宽度的 1/2 松手，切出应用并精准回溯返回启动器。
+    - 在运行任意第三方应用时，手指从手机屏幕左右两侧全部边缘（全高度 MATCH_PARENT）划入**超过屏幕宽度的 1/3**（🔀 早期文档记为 1/2；v1.8.33 已收窄为 `SWIPE_OUT_THRESHOLD_RATIO = 1f / 3f`，且震动时机前移为「手指滑过阈值即刻」）松手，切出应用并精准回溯返回启动器。
     - **系统设置与穿透保障**：采用 `TYPE_ACCESSIBILITY_OVERLAY` 突破 Android 系统设置（`com.android.settings`）的 `PRIVATE_FLAG_HIDE_NON_SYSTEM_OVERLAY_WINDOWS` 屏蔽，消除原生系统返回手势冲突，实现系统设置与全系应用边缘划回。
     - **来源感知路由（Origin-Aware Return）**：若应用从 Application Grid 启动，则滑回返回 Application Grid；若从 Multitasking View 启动，则滑回返回 Multitasking View！
   - **桌面边缘滑动直达**：桌面三屏之间无界手势滑动。
@@ -219,72 +222,59 @@ App 被重装/清数据后 `/data/user/0/<pkg>/files` 会被删除，而旧脚�
 | **全局边缘划回手势** | `AccessibilityService` / Root 特权 Overlay 悬浮手势条 | 跨任意第三方应用捕获屏幕上半区左右边缘划入，实现切出应用返回对应启动源 |
 
 ### 3.2 模块化架构设计
+
+> 🔀 **v1.8.43 全量重写**：本节原先描述的是**早期规划目录树**（含 `core/recents/`、`ui/screens/feed/`、`MeeGoEdgeSwipeService.kt`、`MeeGoNotificationListener.kt` 等），这些路径在代码中**均不存在**。下表为按 2026-09-28 实际代码逐文件核对的结果（20 个 Kotlin 文件 / 6349 行）。
+
 ```
-test-android-launcher/
-├── build.gradle.kts
-├── settings.gradle.kts
-├── gradle/
-├── gradlew
+test-meego-launcher/
+├── build.gradle.kts / settings.gradle.kts / gradlew
+├── .build-env.sh                      # 沙箱内 Gradle 环境（GRADLE_USER_HOME 指向工作区副本）
 ├── scripts/
-│   ├── setup_env.sh             # 环境变量与 SDK 自动化就绪脚本
-│   ├── build.sh                 # 一键编译脚本
-│   ├── deploy.sh                # 部署安装脚本
-│   ├── check_device.sh          # 物理机连接与 Root 诊断脚本
-│   └── screenshot.sh            # 物理机屏幕快速回传脚本
-├── app/
-│   ├── build.gradle.kts
-│   └── src/main/
-│       ├── AndroidManifest.xml
-│       └── java/com/meego/launcher/
-│           ├── MainActivity.kt                  # 启动器单一宿主 Activity (全屏、手势捕获)
-│           ├── ui/
-│           │   ├── theme/                       # MeeGo Harmattan 主题规范
-│           │   │   ├── Color.kt                 # 纯黑背景、经典 Nokia 调色板
-│           │   │   ├── Shape.kt                 # Squircle 超椭圆曲线数学实现
-│           │   │   ├── Type.kt                  # Nokia Pure 字体排版尺度
-│           │   │   └── Motion.kt                # MeeGo 弹簧曲线与触觉反馈参数
-│           │   ├── components/                  # 通用原子组件
-│           │   │   ├── SquircleIcon.kt          # 自适应 MeeGo 图标容器与光泽效果
-│           │   │   ├── SwipePager.kt            # 三屏无缝平滑滑动器
-│           │   │   └── QuickLaunchBar.kt        # 经典上滑快捷底栏
-│           │   └── screens/
-│           │       ├── feed/                    # 屏1：事件与通知聚合流
-│           │       │   ├── FeedScreen.kt
-│           │       │   └── components/ClockWeatherCard.kt, NotificationItem.kt
-│           │       ├── grid/                    # 屏2：应用网格启动器
-│           │       │   ├── AppGridScreen.kt     # 支持 4 列 / 5 列动态切换
-│           │       │   └── components/AppGridItem.kt, EditModeOverlay.kt
-│           │       ├── recents/                 # 屏3：多任务动态卡片视图
-│           │       │   ├── RecentsScreen.kt
-│           │       │   └── components/
-│           │       │       ├── TaskCard.kt      # 包含真实 TaskSnapshot、长按右上角删除角标
-│           │       │       ├── PinchZoomGrid.kt # 双指 2×2 / 3×3 无级缩放控制器
-│           │       │       └── CloseAllButton.kt# 底部圆形“关闭全部”浮动按键
-│           │       └── settings/                # 启动器设置中心
-│           │           ├── SettingsScreen.kt    # 列数（4/5列）配置、手势偏好设置
-│           │           └── components/SettingItem.kt
-│           ├── core/
-│           │   ├── apps/                        # 应用列表加载、缓存与过滤 (LauncherApps)
-│           │   ├── notification/                # 通知捕获与同步管理
-│           │   ├── recents/                     # 运行中应用与多任务核心
-│           │   │   ├── TaskSnapshotProvider.kt  # 快照提供者统一接口
-│           │   │   ├── RootTaskSnapshotProvider.kt # Root 特权提取 TaskSnapshot 硬件位图
-│           │   │   ├── FallbackSnapshotProvider.kt # 无特权降级方案（图标与色板占位）
-│           │   │   ├── TaskSnapshotCache.kt     # LRU 高性能位图缓存与生命周期复用
-│           │   │   └── RecentTaskController.kt  # 任务切换 (am switch-to-task) 与终结控制
-│           │   ├── gestures/                    # 手势系统
-│           │   │   ├── MeeGoEdgeSwipeService.kt # 全局应用内上半屏边缘划回监听服务
-│           │   │   └── SwipeGestureDetector.kt  # 桌面内多指/边缘滑动算法
-│           │   └── navigation/
-│           │       └── LaunchOriginTracker.kt   # 启动来源追踪器 (GRID vs RECENTS)
-│           ├── data/
-│           │   └── preferences/
-│           │       └── LauncherPreferences.kt   # DataStore 偏好存储（4/5列设置）
-│           └── service/
-│               └── MeeGoNotificationListener.kt # 系统通知监听服务
+│   ├── setup_env.sh                   # 跨平台环境初始化（JDK17 / SDK / local.properties / License）
+│   ├── env_detect.sh                  # 跨平台环境自适应探针（Darwin / Linux）
+│   ├── run_build.sh -> build.sh       # 一键编译
+│   ├── deploy.sh                      # 一键部署（7 步：检查→编译→安装→桥→守护→启动→自愈验证）
+│   ├── check_device.sh                # 真机诊断（Root / 快照链路 / 开机自启）
+│   ├── meego_daemon.sh                # 特权守护主脚本（49713 B，watchdog + 主进程 + 3 个 monitor 子 shell）
+│   ├── meego_boot.sh                  # 唯一拉起器（幂等；开机钩子复用同一份）
+│   ├── TaskSnapBridge.java            # Task Snapshot 直读桥（部署时现编为 dex）
+│   ├── perf_grid.sh                   # 滑动性能对照基准
+│   ├── analyze_framestats.py          # framestats 逐帧分段解析
+│   └── screenshot.sh                  # 屏幕快照回传
+├── docs/  screenshots/
+└── app/src/main/
+    ├── AndroidManifest.xml
+    ├── res/values/strings.xml, themes.xml | res/values-v35/themes.xml | res/xml/accessibility_service_config.xml
+    └── java/com/meego/launcher/
+        ├── MeeGoApplication.kt        (15)     Application 单例
+        ├── MainActivity.kt            (431)    唯一宿主 Activity：窗口/沉浸/任务刷新/边缘服务授权
+        ├── model/Models.kt            (263)    LaunchOriginTracker / LauncherPreviews / TaskSnapshotCache / AppItem / RecentTask
+        ├── data/
+        │   ├── AppRepository.kt        (140)    应用列表装载 + 20 个测试图标注入
+        │   ├── LauncherPreferences.kt (70)     DataStore Preferences（meego_settings）
+        │   └── RootTaskProvider.kt    (662)    任务列表四级降级 + 快照两级仲裁 + 指令下发 + 任务增删切
+        ├── service/
+        │   └── EdgeSwipeGestureService.kt (1259) 无障碍边缘划回服务（全局最大文件）
+        ├── receiver/BootReceiver.kt   (39)     开机/换包广播预热
+        ├── util/
+        │   ├── AppIconRenderer.kt      (116)    统一无 mask 图标光栅化器（v1.8.42）
+        │   ├── ScreenCaptureHelper.kt  (150)    PixelCopy 抓桌面快照 + 窗口真实屏幕矩形
+        │   └── DaemonWatchdogClient.kt (109)    心跳判活 + ENSURE_DAEMON 投递
+        └── ui/
+            ├── theme/Theme.kt          (31)     MeeGo 调色板
+            ├── components/
+            │   ├── SquircleShape.kt    (217)    Lamé 超椭圆 + 有界全局 Outline 缓存
+            │   ├── MeeGoScrollPhysics.kt (396)  ScrollPhysicsConfig / MeeGoSmoothFlingBehavior / 橡皮筋回弹
+            │   └── TopSafeArea.kt      (44)     meeGoTopSafeArea（仅避让挖孔）
+            └── screens/
+                ├── HomeScreen.kt       (510)    三屏无限循环 Pager + 指示点
+                ├── AppGridScreen.kt    (380)    4/5 列应用网格
+                ├── FeedScreen.kt       (396)    事件流（MOCK 数据）
+                ├── MultitaskingScreen.kt (872)  多任务卡片 + 双指缩放 + 两段式删除
+                └── SettingsScreen.kt   (249)    启动器设置面板（纯受控）
 ```
 
----
+**分层与依赖方向**：`ui/` → `model/` + `data/` + `util/`；`service/` 独立于 Activity 生命周期，跨进程通过 `/data/local/tmp` 文件与 FIFO 与 `data/` 通信；`model/Models.kt` 中的 `object` 单例是三者的**唯一共享可变状态面**（详见 §4.5.2 来源感知的双字段设计）。
 
 ## 4. 1:1 MeeGo Harmattan 细节还原设计规范
 
@@ -298,7 +288,7 @@ $$\left|\frac{x}{a}\right|^n + \left|\frac{y}{b}\right|^n = 1 \quad (n = 2.732)$
 - **全局统一超椭圆设计语言（Universal Squircle Architecture）**：
   - **彻底废除系统默认圆角**：启动器内全面摒弃 Android 原生 `RoundedCornerShape` 与普通圆形 `CircleShape`，所有界面元素均统一遵循 $n = 2.732$ 黄金超椭圆曲率驱动。
   - **组件级细化覆盖**：
-    - **应用网格图标**：$58\text{dp} \times 58\text{dp}$（4列）/ $52\text{dp} \times 52\text{dp}$（5列）正方形全局黄金超椭圆裁切。
+    - **应用网格图标**：✅ 已落地。实际取值见 `AppGridScreen` 的 `GridMetrics`：`4列 -> (62.dp, 12.sp)`、`5列 -> (52.dp, 11.sp)`、其他 -> (56.dp, 12.sp)；横间距 12.dp、纵间距 18.dp。均为正方形全局黄金超椭圆裁切。
     - **后台卡片关闭角标（Delete Badge）**：长按编辑模式下浮现的 $26\text{dp}$ 红色叉号角标采用 `SquircleShape()` 超椭圆，还原 N9 原汁原味的微圆角小红方牌。
     - **底部一键清理按键（Close All Button）**：$52\text{dp}$ 浮动白叉按键采用经典暗灰 Squircle 超椭圆外壳。
     - **卡片头部信息胶囊与模式切换按键**：采用带超椭圆倒角（`cornerRadius = 10.dp ~ 16.dp`）的 Squircle 胶囊。
@@ -309,15 +299,20 @@ $$\left|\frac{x}{a}\right|^n + \left|\frac{y}{b}\right|^n = 1 \quad (n = 2.732)$
 - **水平视差与循环**：支持高帧率流畅手势跟随，无死区，具备边界阻尼回弹效果。
 - **Application Grid 动态网格与设置入口**：
   - **4 列 / 5 列动态切换**：
-    - 4 列模式（默认经典）：Squircle 图标更大（约 64dp），留白舒适，还原 N9 原汁原味比例。
-    - 5 列模式（紧凑长屏）：图标略微紧缩（约 54dp），充分利用现代 20:9 物理机长屏纵深，一屏容纳更多应用。
+    - 4 列模式（默认经典，`LauncherPreferences` 默认值）：图标 `62.dp` / 标签 `12.sp`。
+    - 5 列模式（紧凑长屏）：图标 `52.dp` / 标签 `11.sp`，充分利用现代 20:9 物理机长屏纵深。
   - **启动器设置入口（MeeGo Settings Icon）**：
     - 启动器自带内置“设置”Squircle 独立图标，点击打开原生 Jetpack Compose 设置页。
     - 提供“网格列数配置（4 列 / 5 列）”、“手势灵敏度”、“关于 MeeGo Launcher”等直观开关。
     - 配置通过 `LauncherPreferences (DataStore)` 实时响应式驱动重绘，无需重启应用。
-- **Quick Launch Bar**：
-  - 无论处于哪一屏，从屏幕底部边缘向上轻推 $\approx 32\text{dp}$，呼出毛玻璃渐隐底栏。
-  - 4 个标准快捷槽位：电话、短信、相机、浏览器。手指拖动即可直达释放，松手回弹收起。
+- ⚠️ **Quick Launch Bar 未实现**：`HomeScreen` 的 `Column` 只有 `HorizontalPager(weight = 1f)` 与指示点 `Row` 两个子项，无底栏。应用入口只存在于第 1 屏网格内。详见 §1.1 同名条目。
+
+- ✅ **三屏无限循环的真实实现（v1.8.43 补记，此前文档未记录）**：**不是** modulo 折叠，而是一条**超长 Pager**：
+  - `SCREEN_COUNT = 3`、`LOOP_COUNT = 10000` → `TOTAL_PAGES = 30000`，起点 `INITIAL_PAGE = (10000 / 2) * 3 + 1 = 15001`；用 `Math.floorMod(page, 3)` 映射到 0/1/2，故**永不触及 Pager 边界**。
+  - `HorizontalPager(userScrollEnabled = false, beyondBoundsPageCount = 1)`——**滚动不交给 Pager**，而由自研 `pointerInput(awaitEachGesture)` 在 `PointerEventPass.Initial` 驱动：`awaitFirstDown` 后**仅当落点在左右 36.dp 边缘区内**才继续探测，否则直接 `return@awaitEachGesture`（中央区域零阻断，图标点击不受影响）。
+  - 拖拽每帧 `pagerState.dispatchRawDelta(-deltaX)`；抬手判定取「**距离** `size.width * SWITCH_DISTANCE_FRACTION(0.12f)` **或速度** `SWITCH_VELOCITY(400f)`」的**或**（两项均可单独触发），松手速度取负号注入吸附弹簧。
+  - 吸附 `snapToPageWithoutBounce` 自实现：`stiffness = (CRITICAL_SETTLE_FACTOR(5.0f) / durationSec)²`，`durationSec = (0.15f + (0.26f - 0.15f) * frac) * scale`，阻尼比 `SNAP_DAMPING_RATIO = 1.0f`（临界阻尼、零过冲）。**为何不用 `animateScrollToPage`**：项目锁定 foundation `1.6.2`，其 `animateScrollToPage` **不接受 `initialVelocity`**，松手速度被丢弃导致顿挫。
+- **三屏指示点**：仅在沉浸式 UI 关闭时渲染（`Row` 的 `padding(bottom = 30.dp)`，每点 `padding(8.dp, 6.dp)`，选中 8.dp / 未选 5.dp，`MeeGoCyan` / `#444444`，`clip(SquircleShape())`）；点击同样走最短路（±2 折成 ∓1）且 `durationScale = DOT_TAP_SPEED_SCALE(0.85f)`。
 
 ### 4.3 多任务（Recents）动态双模交互与真实后台快照体系
 - **Root 赋能的真实后台卡片实时预览（Live Task Snapshot）**：
@@ -349,7 +344,7 @@ $$\left|\frac{x}{a}\right|^n + \left|\frac{y}{b}\right|^n = 1 \quad (n = 2.732)$
   - **退出编辑模式**：点击卡片之外的空白暗色背景，或再次轻触卡片，即可平滑退出编辑模式。
   - **删除不退出编辑模式（v1.8.34 修复）**：删除动作与「退出编辑模式」严格解耦——`onDelete` 仅向 `deletingTaskIds` 登记 taskId，绝不触碰 `isEditMode`。此前删除角标是卡片 `combinedClickable` 的子节点，点击落点落在 26dp 红点之外（外层 48dp 命中盒或卡片本体）时会被卡片本体接管并触发「退出编辑模式」，导致底部一键删除浮键随之消失；修复后底部按钮的存活只取决于 `isEditMode`，删除流程无法再将其置空。
 - **两段式删除动画（消失 → 补位，v1.8.34）**：
-  - **第一段·消失动画**：点击删除后**不立即**从数据源摘除任务，而是先把 taskId 加入 `deletingTaskIds`。对应卡片以 `zIndex = 100f` 浮至最上层，以 `LinearEasing` **线性缩小 20%**（`SCALE_FACTOR = 0.8f`）且**线性变淡至 50%**（`MIN_ALPHA = 0.5f`），阴影同步衰减，全程 `DURATION_MS = 260ms`。
+  - **第一段·消失动画**：点击删除后**不立即**从数据源摘除任务，而是先把 taskId 加入 `deletingTaskIds`。对应卡片以 `zIndex = 100f` 浮至最上层，**线性缩小 20%**（`SCALE_FACTOR = 0.8f`）且**线性变淡至 50%**（`MIN_ALPHA = 0.5f`），阴影同步衰减。🔀 **v1.8.37 已调整**：`DURATION_MS` 由 `260ms` → **`150ms`**，缓动由 `LinearEasing` 改为 **`FastOutSlowInEasing`**（线性缓动尾段位移极小却仍在占时，观感拖沓；减速曲线把位移压进前 1/3 时长）。配套常量 `EditModeAnim.BADGE_MS = 150` / `CLEAR_ALL_MS = 180`。
   - **第二段·补位动画**：消失动画播放完毕才回调 `onDeleteAnimFinished` 真正执行 `removeTask` + `onTaskRemoved`。「先消失、后补位」由此成为**结构性保证而非时序妥协**——卡片在整个消失动画期间始终留在 `tasks` 中占据原索引，其余卡片的 `i` 不变、坐标纹丝不动；只有动画结束、列表长度真正缩短之后索引才整体前移，既有 `animateDpAsState` 弹簧补位动画才得以启动。
   - **一键删除复用同一套表现**：点击底部按钮时将全部 taskId 一次性加入 `deletingTaskIds`，所有卡片同步播放完全相同的消失动画；待最后一张播完，才统一走一次 `removeAllTasks` + `onClearAll()`。此处刻意**不逐张调用 `removeTask`**——逐个强杀会产生 N 轮竞态与无谓开销。`pendingClearAll` 标记承载该收尾流程。
   - **健壮性兜底**：`LaunchedEffect(tasks, deletingTaskIds)` 监听两侧集合，若守护进程轮询等外部因素把任务从数据源直接抹掉，则清理 `deletingTaskIds` 中的陈旧 id，并在集合空且 `pendingClearAll` 仍为 true 时补做收尾，杜绝「一键删除永远等不到最后一张卡片」的死锁。
@@ -359,7 +354,7 @@ $$\left|\frac{x}{a}\right|^n + \left|\frac{y}{b}\right|^n = 1 \quad (n = 2.732)$
   - **一键清理所有（Close All）**：底部常驻 MeeGo 经典圆形浮动按键，点击后伴随卡片序列依次渐隐飞出动效，一键释放后台内存。
 - **卡片顺位重排与后移位移物理动效（Card Reordering & Layout Transition Animation）**：
   - 当用户从前台应用划出返回 Multitasking View，或者最近任务顺序发生重排（如 A B C $\rightarrow$ C A B）时，卡片采用专属的 `animateDpAsState` 弹簧物理动画（$animX$ 与 $animY$）。
-  - **动力学刚度与阻尼模型**：刚度设为 `stiffness = 140f`，阻尼比设为 `dampingRatio = 0.92f`（接近临界阻尼），将卡片移位视觉耗时平滑拉长至约 400~450ms，彻底消除生硬急促感与多余回弹，配合浮层 $zIndex = 25f$ 呈现顺畅飞升与顺位后移的高级流体质感。
+  - **动力学刚度与阻尼模型**：🔀 **v1.8.37 已调整**（原为 `stiffness = 140f` / `dampingRatio = 0.92f`）：现为 `TaskDeleteAnim.REFLOW_STIFFNESS = 300f` / `REFLOW_DAMPING_RATIO = 0.95f`——收敛时间由 ~425ms 降至 ~290ms（临界阻尼收敛时间 ≈ 5/√stiffness），阻尼比保持接近临界、无过冲无来回晃动。配合浮层 $zIndex = 25f$ 呈现顺畅飞升与顺位后移的流体质感。
   - **分层交互隔离**：通过 `if (isPinching) currentX else animX` 隔离双指缩放，确保用户主动交互时保持绝对零延迟直接跟手。
 
 
@@ -427,7 +422,7 @@ $$\left|\frac{x}{a}\right|^n + \left|\frac{y}{b}\right|^n = 1 \quad (n = 2.732)$
    - **守护链开机自启（v1.8.41）**：此前**设备每次重启后守护链都不存在**（`meego_daemon.rc` 在本机根本不存在、且 `/system` 受 dm-verity 保护不可写），需手工跑 `deploy.sh` 才能恢复。现改由 Magisk `service.d` 钩子承担，并把「watchdog 先、主进程后」的顺序收敛到唯一的 `meego_boot.sh`（两条入口共用同一份，杜绝漂移）；钩子在开机路径下**自脱离**以防拖住开机。另修掉部署脚本两处输出缺陷，并定位一个 macOS bash 3.2 的多字节插值陷阱（已升级为脚本硬性规范）。见 §4.13。
    - **多任务网格状态持久化（Recents Columns Persistence & Snapping）**：
      - 将多任务 2×2 / 3×3 布局模式同步纳入 DataStore 持久化存储（`KEY_RECENTS_COLUMNS`）；
-     - 双指缩放（Pinch-to-zoom）手势结束时，依据 $\text{pinchScale} \lessgtr 0.83$ 智能平滑吸附到 3×3 或 2×2，并实时持久化，彻底解决在主屏各页面滑动或重启后模式被重置的问题。
+      - 双指缩放（Pinch-to-zoom）手势结束时，依据 🔀 **`animProgress.value < 0.5f`** 智能平滑吸附到 3×3（`p = 0`）或 2×2（`p = 1`），吸附弹簧为 `spring(dampingRatio = 0.96f, stiffness = 450f)`，并经 `onColumnsChanged` 实时持久化到 DataStore。（**原文档记为阈值 `0.83`，与代码不符**，本次已校准。捏合灵敏度常量 `680f`：双指间距需变化 680px 才走完整个 `p ∈ [0,1]`，较早期的 260px 更平缓细致。）
 
 ### 4.6 启动器桌面底部系统小横条屏蔽与纯净沉浸遮罩架构（Zero-Side-Effect Bottom Bar Masking System）
 1. **背景痛点与废弃方案根因剖析**：
@@ -954,6 +949,329 @@ Magisk 官方为「开机跑一个脚本」提供了现成钩子：
 - 本节的验证是**在已开机的系统上调用 service.d 钩子**完成的（等价于 Magisk 开机时的执行环境与域），**未做真实重启**：本机仅有无线 ADB（`adb-..._adb-tls-connect._tcp`），重启会断开调试通道且无线调试端口通常需在设备上重新配对，导致无法回连取证。若需要端到端重启验证，建议接 USB 后进行。
 - 钩子的健壮性边界：它依赖 `/data/local/tmp/meego_daemon.sh` 存在（该目录在 `/data` 上、跨重启保留）。若该文件被清掉，钩子会记录 `FATAL daemon script missing` 到 `meego_boot.log` 并退出，此时需重跑 `deploy.sh` —— 这是有意的：**不静默失败**。
 
+### 4.14 文档-代码一致性全面校准（v1.8.43）
+
+> 本节记录 2026-09-28 对全部 20 个 Kotlin 源文件（6349 行）逐行通读后的校准结果。**本项目的文档长期领先于实现**，本节把差异固化为显式条目，避免后续再次把「规划」误当「现状」。
+
+#### 4.14.1 三类差异的判定标准
+
+| 标记 | 含义 |
+|---|---|
+| ✅ 已落地 | 文档描述与代码一致，已核对 |
+| ⚠️ 未实现 | 文档描述的功能在代码中**不存在**（早期规划，从未落地） |
+| 🔀 实际实现不同 | 功能**存在**但实现路径/取值与文档所述不同 |
+
+#### 4.14.2 ⚠️ 规划中但从未落地的功能（3 项）
+
+| 文档位置 | 描述的功能 | 核查结论 |
+|---|---|---|
+| §1.1、§4.2 | **Quick Launch Bar**（底部快捷启动栏，上划呼出电话/短信/相机/浏览器） | **不存在**。`HomeScreen` 的 `Column` 仅有 `HorizontalPager(weight=1f)` + 指示点 `Row`；全项目 grep `QuickLaunch\|quickLaunch\|Dock\|dock` 零命中。应用入口只存在于第 1 屏 `LazyVerticalGrid`。 |
+| §1.1 | **应用网格长按编辑**（图标抖动、快速卸载/隐藏） | **不存在**。`AppGridScreen` 的 `AppGridItem` 用 `Modifier.clickable(interactionSource, indication=null, onClick=...)`，无 `combinedClickable`/`onLongClick`；全项目 `onLongClick` 仅命中 `MultitaskingScreen.kt`（L646/730/739-741）。 |
+| §3.2 | `core/`、`ui/screens/{feed,grid,recents,settings}/` 分包、`MeeGoEdgeSwipeService.kt`、`MeeGoNotificationListener.kt` | **全部不存在**，实际扁平结构见 §3.2 重写后的目录树。 |
+
+> ⚠️ **一个必须留档的陷阱**：`FeedScreen.kt` 内含 MOCK 数据，其中一条文案写着「图标列数已更新为 4 列，**长按桌面进入编辑模式**」，另有一条写「快捷…」。**这两条都是演示用假数据，不是实现**。本项目早期曾据此误判「功能已存在」，故在此显式留档。
+
+#### 4.14.3 🔀 实现路径/取值与文档不符的条目（6 项）
+
+| # | 文档所述 | 代码实际 |
+|---|---|---|
+| 1 | §1.1 边缘划回阈值 = 屏宽 **1/2** | `SWIPE_OUT_THRESHOLD_RATIO = 1f / 3f`（v1.8.33 已收窄） |
+| 2 | §4.5「多任务网格吸附阈值 `pinchScale < 0.83`」 | `animProgress.value < 0.5f`（中点） |
+| 3 | §4.1 网格图标 58dp(4列) / 52dp(5列) | `GridMetrics`：4列 `(62.dp, 12.sp)`、5列 `(52.dp, 11.sp)`、其他 `(56.dp, 12.sp)` |
+| 4 | §4.3 消失动画 `DURATION_MS = 260ms` + `LinearEasing` | `150ms` + `FastOutSlowInEasing`（v1.8.37） |
+| 5 | §4.3 补位弹簧 `spring(0.92f, 140f)` | `REFLOW_DAMPING_RATIO = 0.95f` / `REFLOW_STIFFNESS = 300f`（v1.8.37） |
+| 6 | §4.5「双层揭示系统」中桌面底板按 `MATCH_PARENT + FIT_XY` 铺满 | 已由 v1.8.28 改为**按窗口真实矩形 1:1 贴回**，并在 §4.5 有专述；此处为早期残留表述 |
+
+#### 4.14.4 ✅ 本次校准补记的实现细节（此前文档完全缺失）
+
+- **三屏循环的真实机制**：30000 页超长 Pager + 起点 15001 + `Math.floorMod(page, 3)`，而非 modulo 折叠（见 §4.2）。
+- **`snapToPageWithoutBounce` 为何自实现**：foundation 1.6.2 的 `animateScrollToPage` **不接受 `initialVelocity`**，松手速度被丢弃产生顿挫。
+- **快照候选文件命名约定**（`EdgeSwipeGestureService.snapshotCandidates` / `RootTaskProvider`）：`{taskId}_sys.jpg`（TaskSnapBridge 直读，v1.8.40 新增，列在最前）> `{taskId}_live.png`（screencap 整屏抓帧，启动动画期内带 `.provisional` 标记）> `{taskId}_reduced.jpg` > `{taskId}.jpg`。**App 私有目录是唯一权威来源**——`/data/local/tmp/snapshots` 软链已由守护脚本移除（它曾指向系统快照目录，导致自采帧污染 AOSP 独占目录）。
+- **`TaskSnapshotCache` 的四级降级**：`getRecentTasks()` 的任务来源依次为 ① 守护进程 JSON（私有目录 → `/data/local/tmp`）② 本地持久化缓存 `recent_tasks_cache.json` ③ `UsageStatsManager` ④ `ActivityManager.appTasks`。
+- **`LauncherPreferences` 四个 key 与默认值**：`grid_columns`=4、`recents_columns`=2、`edge_swipe`=true、`immersive_ui`=false；DataStore 文件名 `meego_settings`。注：`recents_columns` 有完整存储通路，但 `SettingsScreen` 未暴露对应 UI（双指缩放会经 `onColumnsChanged` 写入）。
+- **顶部安全区**：用 `meeGoTopSafeArea(minTop = 4.dp)`（`displayCutoutPadding()` + 4.dp），**不再用 `statusBarsPadding()`**——系统栏已被 `WindowInsetsControllerCompat` 真正隐藏，再按 105px 避让会把首行图标推到 y=117。
+- **系统栏屏蔽方式**：`MainActivity` 真正 `hide(systemBars())` + `BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE`；§4.6 描述的无障碍底部遮罩（`bottomMaskView`）**已从代码中移除**，注释保留于 `EdgeSwipeGestureService`。当前三屏指示点 `padding(bottom = 30.dp)`。
+
+#### 4.14.5 本次的真机验证（Redmi K40 / LineageOS 23.2 / Android 16 / 1080x2400）
+
+`deploy.sh` 全 7 步通过，实测输出：
+
+```
+=== 前置检查：设备连接与 Root 权限 ===
+  ✅ adb shell 为 root（uid=0），特权守护链具备所需权限
+=== [3/7] 编译并部署 Task Snapshot 直读桥 ===
+  ✅ TaskSnapBridge 已部署 (/data/local/tmp/meego_daemon_bridge.dex)
+=== [4/7] 部署特权守护脚本（不改动 /system 分区）===
+  ✅ 已安装 Magisk 开机自启钩子（/data/adb/service.d/meego_boot.sh）
+✅ 特权守护进程已就绪（主进程 PID=32196、watchdog PID=23800）
+=== [6/7] 验证进程存活与前台状态 ===
+✅ MeeGo Launcher 启动成功！PID: 19419
+=== [7/7] 验证守护进程自愈（杀主进程后应自动恢复）===
+✅ 自愈成功：watchdog 已在 ~1s 内拉起新主进程 PID=32282
+```
+
+自愈验证后复测：`meego_daemon.sh` 共 4 个进程（watchdog 23800 + 主进程 32282 + 2 个 monitor 子 shell），`cmd_queue/daemon.hb` 与 `watchdog.hb` 心跳均为当前时刻，`mCurrentFocus` 指向 `com.meego.launcher/.MainActivity`。**编译零错误、零新增警告。**
+
+> ⚠️ **本节记录的是 v1.8.43 当时的输出，步骤编号已过时。**
+> v1.8.44 起 `deploy.sh` 增至 **8 步**：第 [3/7] 步改为「编译并部署常驻 Task Snapshot 服务 + 直读桥」，
+> 并新增第 **[8/8]** 步「验证常驻 Task Snapshot 服务（画面来源）」。当前输出见 §4.15.11 与 README。
+
+### 4.15 常驻 Task Snapshot 服务：对齐 Quickstep 取帧原理（v1.8.44）
+
+> 目标：把多任务卡片的画面采集，从「每次 fork 一个 `app_process` + 靠 `dumpsys` 轮询猜时机」
+> 改造为 **AOSP / LineageOS Quickstep 同源的取帧原理**，并顺手修掉五处真实缺陷
+> （其中两处为本版自查发现，见 §4.15.7）。
+
+#### 4.15.1 先说结论：三条实测数据
+
+| 指标 | 旧方案（v1.8.40 `TaskSnapBridge`） | 新方案（v1.8.44 `TaskSnapService`） |
+| :--- | :--- | :--- |
+| 单帧端到端 | **~1.35 s**（`time` 实测 1.33~1.41s） | **11~42 ms**（取帧）；含落盘 54 ms |
+| 冷启动代价 | 每次 `app_process` 冷启 ~1.1 s | **0**（服务常驻，只付一次） |
+| 像素纯净度 | 只含任务窗口 ✅ | 只含任务窗口 ✅（实测逐像素一致） |
+
+旧方案 1.35s 的构成，是本次调研最有价值的拆解：
+
+```
+binder 取快照        11 ms
+wrapHardwareBuffer   10 ms
+PNG 编码            246 ms      ← 内部合计 ~267ms
+---------------------------
+app_process 冷启动 ~1100 ms     ← 真正的瓶颈，占比 81%
+---------------------------
+端到端 real        ~1.35 s
+```
+
+**结论：瓶颈从来不在取帧，而在「每次都要重新起一个 JVM 进程」。** 常驻化之后，
+内部那 267ms 里的 246ms（PNG）也一并被换成 JPEG（40ms），于是得到上表的数字。
+
+#### 4.15.2 原理：改用 Quickstep 自己的接入点
+
+v1.8.40 直接操纵 `IActivityTaskManager$Stub`。v1.8.44 改为使用 **Quickstep 在 ROM 里
+实际使用的那套封装**：
+
+```java
+android.window.TaskSnapshotManager.getInstance()
+    .takeTaskSnapshot(taskId, updateCache)          // 可见任务 → 实时帧
+    .getTaskSnapshot(taskId, resolution)            // 后台任务 → 系统缓存帧
+    .registerTaskSnapshotListener(TaskSnapshotListener)
+```
+
+**这不是推测，而是从 ROM 里验证出来的**：把 `Launcher3QuickStep.apk` 拉下来反查 dex，
+其中确实存在
+
+```
+Lcom/android/systemui/shared/system/TaskStackChangeListeners$Impl$TaskSnapshotListenerImpl;
+    Superclass: 'Landroid/window/TaskSnapshotListener;'
+```
+
+即 ROM 的 Quickstep 自己继承 `android.window.TaskSnapshotListener` 并覆写
+`onTaskSnapshotChanged` / `onTaskSnapshotInvalidated`。也就是说，本服务走的是
+**与系统 Recents 完全同一条通路**，而非另辟蹊径。
+
+之所以仍用**反射**：这些是 `@hide` 类，在 `compileSdk 35` 下无法直接 `import`；
+反射则可在任意 SDK 下用 `javac` 现编（与 `TaskSnapBridge` 同一策略，
+dex 随 ROM 走，不提交预编译二进制）。
+
+#### 4.15.3 关键实测发现：`takeTaskSnapshot` 对**可见**任务也能取帧
+
+这推翻了 §4.11.4 与 §4.12.8 的一条旧结论。旧文档写道：
+
+> 「TaskSnapshot 在应用**仍可见**时**根本不存在**」
+
+**该结论对 `getTaskSnapshot` 成立，对 `takeTaskSnapshot` 不成立。** 实测：
+
+| 调用 | 任务状态 | 结果 |
+| :--- | :--- | :--- |
+| `takeTaskSnapshot` | **可见**（`mCurrentFocus` 指向它） | ✅ 8~42 ms，`isRealSnapshot=true`，1080x2400 |
+| `takeTaskSnapshot` | 已转后台 | ❌ 恒返回 `null` |
+| `getTaskSnapshot` | 已转后台 | ✅ 返回系统在「变不可见」那刻抓的缓存帧 |
+| `getTaskSnapshot` | 可见 | ✅（但拿到的是旧的缓存帧，不是当前画面） |
+
+因此本服务对两种状态分别取帧，互为兜底（`write` 命令的 `live` 参数决定优先顺序）。
+
+**附带验证的一个反直觉点**：把通知栏拉下来盖住屏幕后，对被覆盖的任务调
+`takeTaskSnapshot` **仍然成功且拿到的是该任务窗口的干净画面**。这说明
+TaskSnapshot 取的是**任务自身窗口的缓冲**，与屏幕上叠了什么浮窗无关 ——
+这正是它能彻底消除「划出遮罩污染」的原因（旧 `screencap` 方案无法做到）。
+
+#### 4.15.4 像素纯净度：逐像素比对验证
+
+不靠肉眼、不靠 OCR，直接用像素级比对。同一时刻对同一任务：
+
+```bash
+adb shell screencap -p /data/local/tmp/full.png     # 整屏抓图（含系统栏）
+# 服务取帧 → live.jpg（只含任务窗口）
+```
+
+逐区域统计差异像素比例：
+
+| 区域 | 差异像素 | 说明 |
+| :--- | :--- | :--- |
+| y 0–105（状态栏区） | **0 / 39960（0.0%）** | 完全一致 |
+| y 105–400 | **0 / 189000（0.0%）** | 完全一致 |
+| y 400–1800 | **0 / 72090（0.0%）** | 完全一致 |
+| y 1800–2334 | 368 / 8910（4.1%） | 轻微差异（动画帧时序差） |
+
+即：**任务快照在应用区域与实时屏幕逐像素完全相同**，而它不含系统栏 ——
+因为 `contentInsets=[0,105][0,66]` 那两条本就是系统栏占用的区域，
+AOSP 给出的快照天然不带它们。
+
+#### 4.15.5 监听器：注册成功，但回调**永不触发**（重要否证）
+
+`registerTaskSnapshotListener` 是本方案最初希望采用的「事件驱动」路径：不轮询，
+系统一有新快照就推给我们。**实测证明它在第三方应用上走不通**，排查过程如下：
+
+1. 注册调用**成功**，无异常、无警告 —— 极易误判为「已生效」。
+2. 进程 Binder 线程池**已就绪**：`app_process` **默认不建池**（`/proc/<pid>/task`
+   实测只有 1 个线程），导致入站回调无人接收。主动调 `Binder.joinThreadPool()`
+   后线程数升到 **11~12**。
+3. 系统侧**确实在持续抓快照**：`/data/system_ce/0/snapshots/*/` 下 jpg/proto 持续刷新。
+4. 但连续 8 次以上应用切换 + 等待 8s，`lastEvent` **恒为空** ——
+   两个回调一次都没被调用。
+
+根因（AOSP 源码交叉确认）：系统只把回调投递给**平台侧登记的 recents 组件**。
+`config_recentsComponentName` 解析出 recents 包名后，还要经
+`filterOnlySystemPackages()` **丢弃一切非系统包**。本项目是第三方应用
+（即便以 root 运行也不改变其包身份），因此不在名单内。
+
+> **留档价值**：这个 API「注册成功但永不回调」的特征极具迷惑性 ——
+> 若不做端到端触发验证，很容易上线一个「看起来接上了、实际永远收不到事件」的链路。
+> 本服务因此**不以监听器为主路径**，`watch` 命令保留为可选能力
+> （将来若本应用被预置为系统应用即可直接生效），默认调度由守护脚本的
+> 前台 `take` 轮询驱动。
+
+#### 4.15.6 JPEG 替代 PNG：编码耗时降为 1/5
+
+实测同一帧（1080x2400）两种编码：
+
+| 编码 | 耗时 | 产物 |
+| :--- | :--- | :--- |
+| `PNG 95` | **~200 ms** | 192 KB |
+| `JPEG 92` | **~40 ms** | 170 KB |
+
+`write` 命令总耗时因此从 **213 ms → 54 ms**。且产物文件名本来就是 `_sys.jpg`，
+此前用 PNG 编码写进 `.jpg` 文件属于名实不符。卡片显示宽度约 1/3 屏（~350px），
+JPEG 92 的压缩伪影在该尺寸下不可见。
+
+> 附带说明：实测 `takeTaskSnapshot(..., lowResolution=true)` **并不会**返回
+> 低分辨率缓冲（仍是 1080x2400，且 `mIsLowResolution=false`），故不能靠它省开销；
+> 真正的省钱手段是 JPEG + 常驻化。
+
+#### 4.15.7 修掉的五处真实缺陷
+
+**(a) 孤儿服务实例导致 pidfile 错乱（本版引入后自查发现）**
+
+`pgrep -f "app_process / TaskSnapService" | head -1` 取的是**最老**的匹配项。
+若历史上遗留过一个 `PPID=1` 的孤儿实例，它会一直排在最前，于是：
+
+- 新实例拉起后，pidfile 里写下的仍是那个**早已存在的旧 PID**；
+- 随后 `svc_alive` 依据旧 PID 判定为「存活」，pidfile 永不被纠正；
+- 实测复现：**两个服务并存，pidfile 指向已被 kill 的那个**。
+
+修法：拉起新实例**之前**先 `kill_orphan_svc` 清掉所有旧实例。服务自身无状态
+（`TaskSnapshotManager` 只是 system_server 侧的代理），清理零代价。
+修复后实测：kill 服务 → 守护主循环 2s 内自愈 → pidfile 正确指向**唯一**新实例。
+
+**(b) 划出卡片的候选列表漏了 `_sys.jpg`（v1.8.40 遗留）**
+
+`EdgeSwipeGestureService.snapshotCandidates` 列的是 `_live.png` / `_reduced.jpg` /
+`.jpg`，**唯独漏了唯一「只含任务窗口」的 `_sys.jpg`**。后果是同一次采集的结果
+在两处 UI 上不一致：多任务卡片（`RootTaskProvider`）用纯净帧，而**划出卡片**
+反而退回混入系统栏的整屏帧。本版两处统一为 `_sys.jpg`。
+
+**(c) `SVC_HB` 变量引用早于定义，服务心跳恒不出现（自查发现）**
+
+服务心跳路径写成 `SVC_HB="$APP_CMD_DIR/svc.hb"`，却**排在 `APP_CMD_DIR` 定义之前**。
+shell 解析到该行时 `APP_CMD_DIR` 尚为空串，于是 `SVC_HB` 退化成 `/svc.hb`——
+写入被 `2>/dev/null || true` 静默吞掉，表现为「服务明明在产出帧，心跳文件却永远不存在」。
+
+这类缺陷的隐蔽性在于：**它不报错、不影响功能，只是让一个诊断信号永远失真**。
+修法是把 `SVC_HB` 的赋值移到 `APP_CMD_DIR` 之后，并在原处补注说明依赖顺序。
+
+**(d) 诊断脚本 ping「固定 sleep 后 tail」与服务处理赛跑（自查发现）**
+
+`check_device.sh` / `deploy.sh` 的 ping 原本写作「写指令 → `sleep 0.3` → `tail -n 1`」。
+服务处理耗时与服务负载相关，抢跑时会取到**上一条**早已存在的响应——例如启动横幅
+`{"ok":true,"ready":true,"listening":false}`。它同样含 `"ok":true`，**能骗过 case 判断**，
+却**不含 `"threads"`**，于是打印出 `Binder 线程数=?` 这种「看起来通过了、其实没验到」的结果。
+
+修法：改为「**先记行数 → 发指令 → 轮询等新行**」，最多等 1.5s。
+这与守护脚本 `svc_cmd()` 用的是同一套判据，两处口径统一。
+
+**（附）帧龄诊断的一个假警报，顺手修掉**
+
+`check_device.sh` 的「最新帧 N 秒前」在超过 120s 时会告警「采集循环可能已停止」。
+但取帧循环**只对前台的应用取帧**——用户停在桌面（`com.meego.launcher` 在最前）时
+本就没有可采任务，那是**正常静息态**。不区分这一点，就会在用户最常处的状态打出假警报。
+
+**假警报比不报更糟**：它会训练用户忽略这条诊断，等真的坏了也不再有人看。
+现改为先取 `mCurrentFocus`，桌面在最前时输出 `ℹ️ 桌面在最前，无可采任务（正常静息态）`。
+两态均已实测（桌面 → 提示；应用 → 允许告警）。
+
+#### 4.15.8 删除的代码：整条 screencap 采集层
+
+新链路是唯一画面来源，故以下内容**整段删除**（`meego_daemon.sh` 减少约 260 行）：
+
+| 删除项 | 原职责 | 为何不再需要 |
+| :--- | :--- | :--- |
+| `capture_current_screen` | `screencap -p` 整屏抓帧 | 像素必然混入系统栏；且 0.65s/次 |
+| `capture_backgrounding` | 退后台瞬间整屏补抓 | `getTaskSnapshot` 直接给出最终态 |
+| `start_settle_window` | 启动动画期加密抓帧（3s 窗口） | `take` 对可见任务实时取帧，无空窗 |
+| `expire_stale_provisionals` | provisional 标记 TTL 清理 | provisional 机制整体消失 |
+| `sync_from_system_snapshot` | 从系统快照目录拷文件 | 不再读该目录，改由服务直取内存帧 |
+| `_live.png` / `_live.provisional` / `_reduced.jpg` 候选链 | 四级仲裁 | 收敛为 `_sys.jpg` 单一来源 |
+
+App 侧同步收敛：`RootTaskProvider` 的候选仲裁（约 110 行）与
+`EdgeSwipeGestureService` 的 provisional 两级仲裁一并删除。
+
+**产品行为变更（经确认）**：失败即降级为**应用图标**，不再回退整屏 screencap 帧。
+理由是「与其展示一张混入状态栏的截图，不如诚实地只显示图标」。
+
+#### 4.15.9 FIFO 的一个实测陷阱
+
+朴素写法 `app_process ... < fifo` 会在「当前没有写端」时**立刻收到 EOF 而退出**。
+正确做法是在服务进程内部用 `exec 9<>fifo` 以**读写方式**打开同一 FIFO
+（`<>` 同时持有读端与写端，永不产生 EOF），调用方再另开写端投递指令。
+
+#### 4.15.10 新增诊断能力
+
+`check_device.sh` 的「快照链路诊断」重写为常驻服务诊断，五项：
+
+```
+=== 常驻快照服务诊断 (TaskSnapService) ===
+  ✅ 服务进程存活（PID=30219）
+  ✅ IPC 正常响应（Binder 线程数=12，>1 才具备回调能力）
+  最新帧: 758_sys.jpg（1s 前）  ✅
+  产物总数: 11 张
+  ✅ 全部产物尺寸正常（无 <20KB 的可疑小图）
+```
+
+`deploy.sh` 新增第 [8/8] 步：主动 `ping` 服务确认 IPC 真的通（而不只是进程在）。
+这一步是必要的 —— 服务未工作时应用**不会崩、不会报错**，只是所有卡片安静地
+退化成图标，属于典型的「安静地坏掉」。
+
+#### 4.15.11 真机端到端验证（Redmi K40 / LineageOS 23.2 / Android 16）
+
+| 验证项 | 结果 |
+| :--- | :--- |
+| 常驻服务启动 | ✅ `/data/local/tmp/meego_snap_out` 输出 `{"ok":true,"ready":true}` |
+| 单帧延迟 | ✅ `take` 11~42ms（连续 10 次实测 11~28ms） |
+| 后台任务取帧 | ✅ `get` 1ms |
+| 落盘耗时 | ✅ `write` total 54ms（writeMs 40~41ms，JPEG 92） |
+| 像素纯净度 | ✅ 应用区域与整屏抓图**逐像素 0.0% 差异** |
+| 帧刷新节奏 | ✅ 前台任务下 mtime 每秒推进 |
+| 服务自愈 | ✅ kill -9 后守护主循环 ~2s 内拉起，pidfile 正确指向唯一新实例 |
+| 孤儿清理 | ✅ 不再出现双实例 / pidfile 错乱 |
+| 诊断脚本 | ✅ 五项全绿 |
+| 构建 | ✅ `:app:assembleDebug` 零错误 |
+
+> **写入量说明（诚实的取舍）**：前台应用时每帧落盘约 170 KB，节奏约 1s/帧。
+> 对比旧方案（整屏 PNG ~650 KB / ~1.5~2.4s ≈ 270~430 KB/s），
+> 本方案写入量**更低**，且延迟、纯净度同时更优。若未来需要进一步降低，
+> 可在服务内对 `TaskSnapshot.mCaptureTime` 去重（画面未变则不重写），
+> 但实测 `take` 每次都会产生新的 captureTime，故该优化对可见任务无效。
+
 ---
 
 ## 5. DSH 全程自主开发实施路线图
@@ -985,19 +1303,20 @@ flowchart TD
   - 调用 Android `LauncherApps` 异步加载已安装应用。
   - 实现 4 列 / 5 列自适应网格，支持 DataStore 响应式动态配置。
   - 桌面内置“MeeGo Settings”启动器设置入口与设置页面。
-- **Phase 5: Quick Launch Bar 与全局应用内边缘划回服务**
-  - 实现全局底层手势识别器，底部上划展开 4 个主打快捷图标。
-  - 针对物理机系统手势冲突进行排除区域适配。
-  - 实现 `MeeGoEdgeSwipeService` 与 `LaunchOriginTracker`，在第三方 App 运行期间捕获上半屏边缘滑动（划入 1/2 屏宽松手），精准回退到 Grid 或 Recents。
-- **Phase 6: Events Feed 屏**
-  - 实现时间、天气面板。
-  - 接入 `NotificationListenerService`，聚合展示来自微信、短信、未接电话等通知。
+- **Phase 5: 全局应用内边缘划回服务**（Quick Launch Bar 未实现，见 §4.14.2）
+  - ⚠️ 原计划的「底部上划展开 4 个快捷图标」**已取消**。
+  - 针对物理机系统手势冲突进行排除区域适配（触发区 `systemGestureExclusionRects`，API ≥ Q）。
+  - 实现 `EdgeSwipeGestureService` 与 `LaunchOriginTracker`（`model/Models.kt`），在第三方 App 运行期间捕获全高左右边缘滑动，划入**超过 1/3 屏**松手，精准回退到 Grid 或 Recents。
+- **Phase 6: Events Feed 屏**（数据仍为 MOCK，未接真实源）
+  - 实现时间面板（真实，每秒刷新）。
+  - ⚠️ 天气与通知为 **MOCK 假数据**：`NotificationListenerService` **未实现**，代码中无该服务类。
 - **Phase 7: 多任务实时卡片屏（Root 实时快照 + 双指缩放 + 删除角标）**
   - 接入 `RootTaskSnapshotProvider`，实时提取后台 TaskSnapshot 硬件位图。
   - 实现双指缩放无级手势（2×2 $\longleftrightarrow$ 3×3 卡片网格平滑无级过渡）。
   - 实现长按卡片进入编辑模式，右上角浮现红色删除角标，点击终结后台进程；支持底部“一键全部关闭”。
 - **Phase 8: 物理机全面联调与性能打磨**
   - 通过 ADB 持续进行真机 UI 验证、高刷手势掉帧排查（120Hz 满帧调优）与触觉反馈对齐。
+  - 特权链路侧的收尾：watchdog 自愈（§2.7.1）、Task Snapshot 直读（§4.12）、开机自启（§4.13）、图标统一光栅化（v1.8.42）。
 
 ---
 
@@ -1015,6 +1334,6 @@ flowchart TD
 
 变更日志已独立抽取并维护于 [changelog.md](./changelog.md)。
 
-- 最新版本：**v1.8.39**（2026-09-28）
+- 最新版本：**v1.8.43**（2026-09-28）
 - 历史版本条目全部见 `changelog.md`。
 

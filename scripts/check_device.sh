@@ -32,62 +32,117 @@ else
     echo -n "屏幕密度 (DPI): " && "$ADB" shell wm density 2>/dev/null || true
     echo -n "Root 状态: " && ("$ADB" shell id 2>/dev/null || echo "非 Root/不可用")
 
-    # ---------------------------------------------------------------------------
-    # 快照链路健康诊断（v1.8.40 新增）
+    # 常驻 Task Snapshot 链路健康诊断（v1.8.44 重写）
     #
-    # 背景：Android 16 把系统快照改为「每用户 UUID 子目录」布局，此前守护脚本
-    # 按扁平路径取帧，导致系统快照同步链路**静默全失效**（ls 无报错、glob 零命中）。
-    # 这类"安静地坏掉"的故障必须能被一条命令看出来，故固化到此。
+    # 背景：自本版起，多任务卡片的**唯一**画面来源是常驻特权服务
+    # meego_svc.dex。它不工作时应用不会崩、不会报错，只是所有卡片安静地
+    # 退化成应用图标 —— 典型的「安静地坏掉」，必须能被一条命令看出来。
     # ---------------------------------------------------------------------------
     echo ""
-    echo "=== 快照链路诊断 (Task Snapshot) ==="
+    echo "=== 常驻快照服务诊断 (TaskSnapService) ==="
 
-    SNAP_ROOT="/data/system_ce/0/snapshots"
-    # 复刻守护脚本的子目录探测（flat 布局则退回根目录本身）
-    SNAP_USER_DIR=$("$ADB" shell "for d in $SNAP_ROOT/*/; do [ -d \"\$d\" ] && echo \"\${d%/}\" && break; done" 2>/dev/null | tr -d '\r' | head -1)
-    [ -z "$SNAP_USER_DIR" ] && SNAP_USER_DIR="$SNAP_ROOT"
-
-    if [ "$SNAP_USER_DIR" = "$SNAP_ROOT" ]; then
-        echo "  布局: 扁平（Android 15 及更早的布局，兼容模式）"
-    else
-        echo "  布局: 每用户 UUID 子目录 ✅ (Android 16)"
-        echo "        $SNAP_USER_DIR"
-    fi
-
-    SYS_SNAP_COUNT=$("$ADB" shell "ls $SNAP_USER_DIR/*.jpg 2>/dev/null | wc -l" 2>/dev/null | tr -d '\r ' || echo 0)
-    echo -n "  系统快照张数: $SYS_SNAP_COUNT"
-    if [ "$SYS_SNAP_COUNT" = "0" ]; then
-        echo "  ⚠️ 为 0 —— 同步链路必然失效（检查守护脚本是否在跑）"
-    else
-        echo "  ✅"
-    fi
-
-    # 同步时效：App 私有目录里最新一帧 与 系统侧最新一帧 的 mtime 差
     APP_SNAP_DIR="/data/user/0/com.meego.launcher/files/snapshots"
-    NEWEST_APP=$("$ADB" shell "ls -t $APP_SNAP_DIR/*.jpg 2>/dev/null | head -1" 2>/dev/null | tr -d '\r')
-    NEWEST_SYS=$("$ADB" shell "ls -t $SNAP_USER_DIR/*.jpg 2>/dev/null | head -1" 2>/dev/null | tr -d '\r')
-    if [ -n "$NEWEST_APP" ] && [ -n "$NEWEST_SYS" ]; then
-        # 直接 stat 完整路径（basename 会被 /data/local/tmp 之类的前缀干扰，
-        # 且在设备侧没有对应 cwd）
-        T_APP=$("$ADB" shell "stat -c %Y '$NEWEST_APP' 2>/dev/null" 2>/dev/null | tr -d '\r' || echo 0)
-        T_SYS=$("$ADB" shell "stat -c %Y '$NEWEST_SYS' 2>/dev/null" 2>/dev/null | tr -d '\r' || echo 0)
-        if [ -n "$T_APP" ] && [ -n "$T_SYS" ] && [ "$T_SYS" -gt 0 ] 2>/dev/null; then
-            LAG=$((T_SYS - T_APP))
-            if [ "$LAG" -gt 0 ]; then
-                echo "  ⚠️ App 侧快照落后系统侧 ${LAG}s —— 同步未生效（守护进程可能已死，见下方心跳）"
+
+    # --- 1. 服务进程存活 ---
+    SVC_PID=$("$ADB" shell 'cat /data/local/tmp/meego_svc.pid 2>/dev/null | tr -d "\r\n "' 2>/dev/null | tr -cd '0-9')
+    if [ -n "$SVC_PID" ] && "$ADB" shell "test -d /proc/$SVC_PID" 2>/dev/null; then
+        echo "  ✅ 服务进程存活（PID=${SVC_PID}）"
+    else
+        echo "  ❌ 服务进程未运行 —— 卡片将只能显示应用图标"
+        echo "     排查：· /data/local/tmp/meego_svc.dex 是否存在"
+        echo "          · adb shell 是否 root（TaskSnapshot 需签名级权限）"
+        echo "          · /data/local/tmp/daemon.log 末尾是否有 'TaskSnapService 未能启动'"
+    fi
+
+    # --- 2. 服务 IPC 活性（ping 往返）---
+    # ping 往返必须「先记行数、再发指令、轮询等新行」，不能固定 sleep 后 tail。
+    # 固定 sleep 会与服务处理耗时赛跑 —— 抢跑时 tail 取到的是**上一条**早已存在的
+    # 响应（例如启动横幅 {"ok":true,"ready":true}），它同样含 "ok":true 能骗过
+    # case 判断，却**不含 "threads"**，于是打印出 `线程数=?` 这种似是而非的结果。
+    SVC_PING=$("$ADB" shell '
+        exec 3>/data/local/tmp/meego_snap_cmd 2>/dev/null || exit
+        before=$(wc -l < /data/local/tmp/meego_snap_out 2>/dev/null || echo 0)
+        echo "{\"cmd\":\"ping\"}" >&3
+        exec 3>&-
+        n=0
+        while [ "$n" -lt 30 ]; do
+            after=$(wc -l < /data/local/tmp/meego_snap_out 2>/dev/null || echo 0)
+            if [ "$after" -gt "$before" ]; then
+                tail -n 1 /data/local/tmp/meego_snap_out
+                exit
+            fi
+            sleep 0.05
+            n=$((n + 1))
+        done
+    ' 2>/dev/null | tr -d '\r' | tail -1)
+    case "$SVC_PING" in
+        *'"ok":true'*)
+            THREADS=$(echo "$SVC_PING" | sed -n 's/.*"threads":\([0-9-]*\).*/\1/p')
+            echo "  ✅ IPC 正常响应（Binder 线程数=${THREADS:-?}，>1 才具备回调能力）"
+            ;;
+        *)
+            echo "  ⚠️ ping 无响应：${SVC_PING:-<空>}"
+            echo "     检查 /data/local/tmp/meego_snap_out"
+            ;;
+    esac
+
+    # --- 3. 产物新鲜度：最新 _sys.jpg 距今多久 ---
+    #
+    # 【为什么必须先看「当前前台是谁」再判定陈旧】
+    # 取帧循环只对**前台的应用**取帧；桌面（com.meego.launcher）自己在最前时，
+    # 根本没有可采的任务，帧自然不再刷新 —— 那是**正常静息态**，不是故障。
+    # 不区分这一点就会在用户最常处的桌面状态打出「⚠️ 帧已陈旧 —— 采集循环可能已停止」
+    # 的假警报。此类假警报比不报更糟：它会训练用户忽略这条诊断。
+    CUR_FOCUS=$("$ADB" shell "dumpsys activity activities 2>/dev/null | grep -m1 mCurrentFocus" 2>/dev/null | tr -d '\r')
+    case "$CUR_FOCUS" in
+        *com.meego.launcher*) AT_HOME=1 ;;
+        *)                    AT_HOME=0 ;;
+    esac
+
+    NEWEST=$("$ADB" shell "ls -t $APP_SNAP_DIR/*_sys.jpg 2>/dev/null | head -1" 2>/dev/null | tr -d '\r')
+    if [ -n "$NEWEST" ]; then
+        T_APP=$("$ADB" shell "stat -c %Y '$NEWEST' 2>/dev/null" 2>/dev/null | tr -d '\r')
+        NOW=$("$ADB" shell "date +%s" 2>/dev/null | tr -d '\r')
+        if [ -n "$T_APP" ] && [ -n "$NOW" ] && [ "$T_APP" -gt 0 ] 2>/dev/null; then
+            AGE=$((NOW - T_APP))
+            echo -n "  最新帧: $(basename "$NEWEST")（${AGE}s 前）"
+            # 前台任务由 take_foreground_loop 以 0.3s 节奏刷新；
+            # 若长期无新帧，通常是守护主循环或服务已死。
+            if [ "$AGE" -gt 120 ] 2>/dev/null; then
+                if [ "$AT_HOME" -eq 1 ]; then
+                    echo "  ℹ️ 桌面在最前，无可采任务（正常静息态）"
+                else
+                    echo "  ⚠️ 帧已陈旧 —— 采集循环可能已停止"
+                fi
             else
-                echo "  ✅ 快照同步正常（App 侧不落后系统侧）"
+                echo "  ✅"
             fi
         fi
-        echo "    App 最新: $(basename "$NEWEST_APP")"
-        echo "    Sys 最新: $(basename "$NEWEST_SYS")"
+        FRAME_COUNT=$("$ADB" shell "ls $APP_SNAP_DIR/*_sys.jpg 2>/dev/null | wc -l" 2>/dev/null | tr -d '\r ')
+        echo "  产物总数: ${FRAME_COUNT:-0} 张"
+    else
+        echo "  ⚠️ 尚无任何 _sys.jpg 产物"
     fi
 
-    # TaskSnapBridge 存在性
+    # --- 4. 取帧产物是否纯净（尺寸应为任务窗口，1080x2400）---
+    # 用 sips/ImageIO 在设备侧不便，改用文件大小量级做粗判：
+    # 一张 1080x2400 的 TaskSnapshot JPEG 通常 > 20KB；
+    # 若全部是很小的文件，多半取帧失败或写出了空图。
+    TINY=$("$ADB" shell "find $APP_SNAP_DIR -name '*_sys.jpg' -size -20k 2>/dev/null | wc -l" 2>/dev/null | tr -d '\r ')
+    TOTAL=$("$ADB" shell "ls $APP_SNAP_DIR/*_sys.jpg 2>/dev/null | wc -l" 2>/dev/null | tr -d '\r ')
+    if [ -n "$TOTAL" ] && [ "$TOTAL" != "0" ]; then
+        if [ "$TINY" = "0" ]; then
+            echo "  ✅ 全部产物尺寸正常（无 <20KB 的可疑小图）"
+        else
+            echo "  ⚠️ 有 ${TINY}/${TOTAL} 张产物 < 20KB —— 取帧可能失败"
+        fi
+    fi
+
+    # --- 5. 一次性 bridge（仅自检/排障兜底，非主链路）---
     if "$ADB" shell "test -f /data/local/tmp/meego_daemon_bridge.dex" 2>/dev/null; then
-        echo "  ✅ TaskSnapBridge 已部署"
+        echo "  ✅ 一次性 TaskSnapBridge 已部署（自检/排障兜底）"
     else
-        echo "  ℹ️ TaskSnapBridge 未部署（纯 screencap 降级模式，仍可用）"
+        echo "  ℹ️ 一次性 TaskSnapBridge 未部署（不影响主链路）"
     fi
 
     # 守护进程心跳（心跳落在 App 私有目录：/data/local/tmp 属 shell_data_file，

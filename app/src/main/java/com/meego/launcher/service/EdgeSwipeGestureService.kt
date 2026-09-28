@@ -1068,57 +1068,6 @@ class EdgeSwipeGestureService : AccessibilityService() {
         }
     }
 
-    /**
-     * 判定某个 taskId 的 live 帧是否仍处于启动动画期（provisional）。
-     *
-     * 守护进程在应用刚进入前台时抓到的第一帧必然是 splash / 过渡帧，
-     * 它在 `settle_window` 结束前一直带此标记；渲染层遇到 provisional 帧应降级为图标占位，
-     * 绝不展示误导性的半渲染画面。
-     */
-    private fun isProvisional(taskId: Int): Boolean {
-        return try {
-            File(filesDir, "snapshots/${taskId}_live.provisional").exists()
-        } catch (e: Exception) {
-            false
-        }
-    }
-
-    private data class SnapshotCandidate(
-        val file: File,
-        val isProvisional: Boolean
-    )
-
-    /**
-     * 按**新鲜度**仲裁快照来源。
-     *
-     * 此前实现按固定优先级取 `${tid}_live.png` 并直接返回，导致一张陈旧的过渡帧
-     * 仅凭优先级就能压过系统刚刚写好的新鲜快照（实测：任务 192 的 live 帧老化 3725s，
-     * 而同任务的系统 `_reduced.jpg` 仅 0s）。现在改为：同池候选中取 mtime 最大者，
-     * 且 provisional 帧被排除在仲裁之外。
-     */
-    private fun pickFreshestFile(candidates: List<File>, taskId: Int): Pair<File, Boolean>? {
-        val provisional = isProvisional(taskId)
-        var best: File? = null
-        var bestTime = Long.MIN_VALUE
-        for (f in candidates) {
-            try {
-                if (!f.exists() || !f.canRead() || f.length() <= 0) continue
-                val t = f.lastModified()
-                if (t > bestTime) {
-                    bestTime = t
-                    best = f
-                }
-            } catch (e: Exception) {
-                // ignore
-            }
-        }
-        if (best == null) return null
-
-        // 标记只针对 live 类文件；系统快照（_reduced.jpg / .jpg）视为稳定帧
-        val isLive = best.name.endsWith("_live.png")
-        return Pair(best, isLive && provisional)
-    }
-
     private fun loadLatestSnapshot(): Bitmap? {
         return try {
             val currentTaskId = getCurrentTaskId() ?: return null
@@ -1136,45 +1085,31 @@ class EdgeSwipeGestureService : AccessibilityService() {
                 }
             }
 
-            // b. 文件仲裁：优先在「已稳定」池中取 mtime 最大者，跳过 provisional 帧
-            val files = snapshotCandidates(currentTaskId, curPkg)
-            val stablePool = files.filter { !isProvisionalLive(it, currentTaskId) }
-
-            val chosen = pickFreshestFile(stablePool, currentTaskId)
-                // b1. 稳定池里**没有真正可用的文件**（应用仍处于启动动画期，live 帧被标记
-                //     为 provisional，而系统快照尚未落盘）时，改取最新的 provisional 帧作为
-                //     **临时占位**真实展示。
-                //
-                // 关键产品决策修复（v1.8.38）：此前此处直接降级为应用图标，实测导致
-                // **「刚进入应用、立刻边缘划出」时划出卡片只显示应用图标**，而非应用画面。
-                // 但此刻用户正看着这台设备完成启动 —— 我们手里的 provisional 帧
-                // 恰恰就是**他刚刚看到的那个画面**。把一个正在被注视的真实画面替换成
-                // 一个图标，是信息量上的净损失；且此时根本没有别的候选可用。
-                //
-                // 判据必须是「稳定池**解析不出**文件」而非「稳定池**列表**为空」：
-                // 候选列表里通常已含 `${tid}.jpg` / `${tid}_reduced.jpg` 等路径，
-                // 它们在应用刚启动时**并不存在**，列表非空却无一可用。
-                //
-                // 该帧以 `isSettled = false` 写入内存缓存，绝不进入稳定帧权威通道；
-                // 应用稳定后守护进程的退后台采集 / 稳态低频刷新会以更新的 mtime
-                // 在下一次仲裁中自然顶掉它 —— 与 AOSP `TaskThumbnailUiState.SnapshotSplash`
-                // 「splash 仅作临时占位、真实快照到达即替换」的语义一致。
-                ?: pickFreshestFile(files, currentTaskId)
+            // b. 文件路径：唯一来源 ${tid}_sys.jpg（常驻服务产物）。
+            //
+            // 【为何不再需要「稳定池 / provisional 帧」两级仲裁】
+            // 那是为 screencap 整屏帧设计的：启动动画期抓到的帧带
+            // _live.provisional 标记，需与系统快照分开仲裁。而常驻服务对
+            // **可见**任务走 takeTaskSnapshot（11~42ms），应用还在启动动画时
+            // 就能取到当前这一帧；**后台**任务走 getTaskSnapshot，拿到的就是
+            // 系统在「任务变不可见」那一刻抓下的最终态。两种来源都是「真实」帧，
+            // 不存在「半渲染过渡帧」这一档，故 provisional 机制整体失去存在意义。
+            //
+            // 【为何取不到时直接返回 null，而不是找替代品】
+            // 唯一候选不存在 ⇒ 此刻确实没有任何画面。返回一个图标占位，比返回
+            // 一张混入状态栏/导航栏的整屏截图更诚实（产品已确认该行为）。
+            val chosen = snapshotCandidates(currentTaskId, curPkg)
+                .firstOrNull { it.exists() && it.canRead() && it.length() > 0 }
 
             if (chosen != null) {
-                val (file, prov) = chosen
-                val bmp = loadBitmapFromFile(file.absolutePath)
+                val bmp = loadBitmapFromFile(chosen.absolutePath)
                 if (bmp != null) {
                     TaskSnapshotCache.put(
                         currentTaskId, bmp, curPkg,
-                        captureTimeMs = file.lastModified(),
-                        isSettled = !prov
+                        captureTimeMs = chosen.lastModified(),
+                        isSettled = true
                     )
-                    if (prov) {
-                        Log.d(TAG, "Using provisional live frame ${file.name} as a real placeholder for task $currentTaskId ($curPkg)")
-                    } else {
-                        Log.d(TAG, "Picked freshest snapshot ${file.name} for task $currentTaskId ($curPkg) settled=true")
-                    }
+                    Log.d(TAG, "Picked task snapshot ${chosen.name} for task $currentTaskId ($curPkg)")
                     return bmp
                 }
             }
@@ -1190,32 +1125,24 @@ class EdgeSwipeGestureService : AccessibilityService() {
         }
     }
 
-    private fun snapshotCandidates(taskId: Int, curPkg: String?): List<File> {
-        val list = mutableListOf<File>()
-        // App 私有目录优先：Android 16 SELinux 严格隔离 /data/local/tmp/snapshots 软链
-        list.add(File(filesDir, "snapshots/${taskId}_live.png"))
-        list.add(File(filesDir, "snapshots/${taskId}_reduced.jpg"))
-        list.add(File(filesDir, "snapshots/${taskId}.jpg"))
-        list.add(File("/data/local/tmp/snapshots/${taskId}_live.png"))
-        list.add(File("/data/local/tmp/snapshots/${taskId}_reduced.jpg"))
-        list.add(File("/data/local/tmp/snapshots/${taskId}.jpg"))
-
-        // 全局 current_app.png 需严格校验所有权，防止跨应用串扰
-        val tidFromTidFile = readIntFromFile(File(filesDir, "current_app_tid.txt"))
-            ?: readIntFromFile(File("/data/local/tmp/current_app_tid.txt"))
-        val pkgFromPkgFile = readTextFromFile(File(filesDir, "current_app_pkg.txt"))
-            ?: readTextFromFile(File("/data/local/tmp/current_app_pkg.txt"))
-        val ownershipVerified = (tidFromTidFile == taskId) ||
-                (curPkg != null && pkgFromPkgFile == curPkg)
-        if (ownershipVerified) {
-            list.add(File(filesDir, "current_app.png"))
-            list.add(File("/data/local/tmp/current_app.png"))
-        }
-        return list
-    }
-
-    private fun isProvisionalLive(file: File, taskId: Int): Boolean {
-        return file.name.endsWith("_live.png") && isProvisional(taskId)
+    /**
+     * 划出卡片的画面来源（v1.8.44 收敛为唯一一项）。
+     *
+     * 【本方法此前存在一处真实缺陷，本次一并修掉】
+     * 它列的是 `_live.png` / `_reduced.jpg` / `.jpg`（filesDir 与
+     * /data/local/tmp 两套），**唯独漏了 `_sys.jpg`** —— 也就是 v1.8.40
+     * 引入的、唯一「只含任务窗口、无系统栏污染」的那一档。于是：
+     *   · `RootTaskProvider`（多任务卡片）认 `_sys.jpg`；
+     *   · `EdgeSwipeGestureService`（划出卡片）**不认**。
+     * 同一次采集的结果在两处 UI 上表现不一致 —— 划出时反而退回混入
+     * 状态栏/导航栏的整屏帧。v1.8.44 既然把采集收敛到 `_sys.jpg`，
+     * 此处只保留它，两处 UI 的口径从此严格一致。
+     *
+     * 保留内存快路径（`loadLatestSnapshot` 的分支 a）：它不经过本列表，
+     * 直接用 `TaskSnapshotCache` 里的帧，可省去一次解码。
+     */
+    private fun snapshotCandidates(taskId: Int, @Suppress("UNUSED_PARAMETER") curPkg: String?): List<File> {
+        return listOf(File(filesDir, "snapshots/${taskId}_sys.jpg"))
     }
 
     private fun vibrate() {

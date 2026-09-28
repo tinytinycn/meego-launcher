@@ -67,16 +67,20 @@ bash scripts/deploy.sh
 === 前置检查：设备连接与 Root 权限 ===
   ✅ 已连接设备 1 台
   ✅ adb shell 为 root（uid=0），特权守护链具备所需权限
-=== [3/7] 编译并部署 Task Snapshot 直读桥 ===
-  ✅ TaskSnapBridge 已部署 (/data/local/tmp/meego_daemon_bridge.dex)
-=== [4/7] 部署特权守护脚本（不改动 /system 分区）===
+=== [3/8] 编译并部署常驻 Task Snapshot 服务 + 直读桥 ===
+  ✅ 常驻 TaskSnapService 已部署 (/data/local/tmp/meego_svc.dex)
+  ✅ 一次性 TaskSnapBridge 已部署（自检/排障兜底）
+=== [4/8] 部署特权守护脚本（不改动 /system 分区）===
   ✅ 已安装 Magisk 开机自启钩子（/data/adb/service.d/meego_boot.sh）
-✅ 特权守护进程已就绪（主进程 PID=23813、watchdog PID=23800）
-=== [6/7] 验证进程存活与前台状态 ===
-✅ MeeGo Launcher 启动成功！PID: 32112
-✅ 特权守护链就绪：主进程 PID=23813、watchdog PID=23800（同脚本进程共 7 个）
-=== [7/7] 验证守护进程自愈（杀主进程后应自动恢复）===
-✅ 自愈成功：watchdog 已在 ~1s 内拉起新主进程 PID=23875
+✅ 特权守护进程已就绪（主进程 PID=9081、watchdog PID=9065）
+=== [6/8] 验证进程存活与前台状态 ===
+✅ MeeGo Launcher 启动成功！PID: 9391
+✅ 特权守护链就绪：主进程 PID=9081、watchdog PID=9065（同脚本进程共 7 个）
+=== [7/8] 验证守护进程自愈（杀主进程后应自动恢复）===
+✅ 自愈成功：watchdog 已在 ~1s 内拉起新主进程 PID=9171
+=== [8/8] 验证常驻 Task Snapshot 服务（画面来源）===
+  ✅ 常驻快照服务存活（PID=606）
+  ✅ 服务 IPC 正常响应：{"ok":true,"listening":false,"lastEvent":"","binderPoolError":"","threads":12}
 ```
 
 > **本部署流程不写 `/system` 任何文件。** 手机的 `/system` 通常受 dm-verity 校验保护，改写会导致校验失败甚至无法开机，故所有脚本一律落在 `/data` 分区（`/data/local/tmp` 与 `/data/adb`）。
@@ -88,8 +92,9 @@ bash scripts/deploy.sh
 | 组件 | 位置 | 职责 |
 | :--- | :--- | :--- |
 | **启动器 APK** | `com.meego.launcher` | 三屏界面、手势、卡片渲染 |
-| **特权守护脚本** | `/data/local/tmp/meego_daemon.sh` | 任务列表维护、快照采集、任务切换/销毁、无障碍与手势自愈 |
-| **Task Snapshot 桥** | `/data/local/tmp/meego_daemon_bridge.dex` | 直读 WMS 真实任务快照（仅任务窗口，无系统栏污染） |
+| **特权守护脚本** | `/data/local/tmp/meego_daemon.sh` | 任务列表维护、驱动取帧、任务切换/销毁、无障碍与手势自愈 |
+| **常驻 Task Snapshot 服务** | `/data/local/tmp/meego_svc.dex` | **本版唯一画面来源**：常驻 root 进程，对齐 Quickstep 直取 WMS 真实任务快照（仅任务窗口，无系统栏污染），单帧 11~42ms |
+| **一次性快照桥** | `/data/local/tmp/meego_daemon_bridge.dex` | 部署自检与排障兜底（不再是主链路） |
 | **拉起器** | `/data/local/tmp/meego_boot.sh` | 按「watchdog 先、主进程后」顺序拉起守护链（幂等） |
 | **开机自启钩子** | `/data/adb/service.d/meego_boot.sh` | 开机自动拉起守护链（Magisk 官方钩子目录） |
 | **运行时数据** | 应用私有目录 `files/` | `snapshots/`（快照帧）、`cmd_queue/`（指令队列与心跳） |
@@ -131,7 +136,9 @@ bash scripts/check_device.sh
         /data/system_ce/0/snapshots/8930c050-f26d-495b-9e37-8bfd7d2c5871
   系统快照张数: 12  ✅
   ✅ 快照同步正常（App 侧不落后系统侧）
-  ✅ TaskSnapBridge 已部署
+  ✅ 服务进程存活（PID=30219）
+  ✅ IPC 正常响应（Binder 线程数=12）
+  最新帧: 758_sys.jpg（1s 前）  ✅
   ✅ 守护进程存活（心跳 2s 前）
 
 === 开机自启诊断 ===
@@ -150,7 +157,7 @@ bash scripts/check_device.sh
 | 现象 | 根因 | 处理 |
 | :--- | :--- | :--- |
 | `deploy.sh` 报 `adb shell 当前 uid=... 不是 root` | 未执行 `adb root` | 执行 `adb root` 后重试 |
-| 卡片是**整屏截图**（带状态栏/导航栏） | Task Snapshot 桥未生效 | `check_device.sh` 看「TaskSnapBridge 已部署」；确认 root |
+| 卡片**只有应用图标**（无画面） | 常驻 Task Snapshot 服务未运行 | `check_device.sh` 看「常驻快照服务诊断」；确认 root，并查 `/data/local/tmp/meego_snap_out` |
 | 卡片只显示**应用图标** | 守护链已死，或应用刚启动尚无快照 | `check_device.sh` 看心跳；冷启动应用后等 2~3 秒 |
 | 删除卡片后**后台进程仍在跑** | 守护链已死（命令队列无人消费） | `check_device.sh` 看心跳；重跑 `deploy.sh` |
 | **重启后**所有特权功能失效 | 开机钩子未安装（无 Magisk） | `check_device.sh` 看「开机自启诊断」 |
@@ -185,12 +192,18 @@ adb shell "su -c 'rm -f /data/adb/service.d/meego_boot.sh'"
 
 # ③ 移除特权脚本与运行时数据
 adb shell 'rm -f /data/local/tmp/meego_daemon.sh \
+                  /data/local/tmp/meego_svc.dex \
                   /data/local/tmp/meego_daemon_bridge.dex \
                   /data/local/tmp/meego_boot.sh \
                   /data/local/tmp/meego_daemon.pid \
+                  /data/local/tmp/meego_svc.pid \
+                  /data/local/tmp/meego_snap_cmd \
+                  /data/local/tmp/meego_snap_out \
                   /data/local/tmp/meego_boot.log \
                   /data/local/tmp/daemon.log \
                   /data/local/tmp/recent_tasks.json'
+# 另需结束常驻快照服务（它不随守护脚本退出）
+adb shell 'pkill -f "app_process / TaskSnapService"'
 
 # ④ 卸载应用
 adb uninstall com.meego.launcher
@@ -274,7 +287,13 @@ bash scripts/setup_env.sh
 | [`scripts/check_device.sh`](scripts/check_device.sh) | 设备诊断：型号/屏幕/Root + **快照链路** + **开机自启** | `bash scripts/check_device.sh` |
 | [`scripts/deploy.sh`](scripts/deploy.sh) | **一键安装**：编译、安装、部署特权链路、自检与自愈验证 | `bash scripts/deploy.sh` |
 | [`scripts/meego_boot.sh`](scripts/meego_boot.sh) | 守护链拉起器（幂等；开机钩子亦复用同一份） | `adb shell /data/local/tmp/meego_boot.sh` |
+| [`scripts/meego_daemon.sh`](scripts/meego_daemon.sh) | 特权守护主脚本（watchdog + 主进程 + 3 个 monitor 子 shell），并守护常驻快照服务 | 由 `deploy.sh` 自动部署，勿手工执行 |
+| [`scripts/TaskSnapService.java`](scripts/TaskSnapService.java) | **常驻 Task Snapshot 服务**（本版唯一画面来源，对齐 Quickstep 取帧） | 由 `deploy.sh` 现编为 `meego_svc.dex`，经 stdin/stdout JSON 驱动 |
+| [`scripts/perf_grid.sh`](scripts/perf_grid.sh) | 滑动性能对照基准（MeeGo Grid vs Trebuchet） | `bash scripts/perf_grid.sh` |
+| [`scripts/analyze_framestats.py`](scripts/analyze_framestats.py) | 解析 `framestats` 逐帧分段耗时 | `python3 scripts/analyze_framestats.py <dump>` |
 | [`scripts/screenshot.sh`](scripts/screenshot.sh) | 捕获物理机屏幕快照至 `screenshots/` | `bash scripts/screenshot.sh` |
+
+> `scripts/deploy.sh` 会现编译两个 dex：`scripts/TaskSnapService.java` → `/data/local/tmp/meego_svc.dex`（**常驻服务，本版唯一画面来源**），以及 `scripts/TaskSnapBridge.java` → `/data/local/tmp/meego_daemon_bridge.dex`（一次性桥，仅自检/排障兜底）。**不提交预编译 dex** —— dex 与设备 ROM 强绑定（ART 版本、hidden API 名单都会变），现编现用才永远跟随当次 SDK。
 
 ---
 
@@ -290,6 +309,42 @@ bash scripts/check_device.sh
 ```
 
 > ⚠️ **无线调试的注意点**：设备重启后无线调试通道会断开，且端口通常需要在手机上重新配对。**若你打算验证「重启后守护链是否自动恢复」，请改用 USB 连接** —— 否则重启后将无法回连取证。
+
+---
+
+## 🧭 当前实现状态（v1.8.44 实测，2026-09-28）
+
+> 本节由**逐行通读全部 20 个 Kotlin 源文件**核对得出。README 与技术规格文档中若出现与本节冲突的表述，**以本节与代码为准**。
+
+### ✅ 已完整落地
+
+| 能力 | 实现位置 | 关键取值 |
+| :--- | :--- | :--- |
+| 三屏无限循环穿梭 | `HomeScreen.kt` | 30000 页 Pager、起点 15001、`floorMod(page,3)`；边缘 36.dp 起手，跨屏判定「距离 12% **或** 速度 400f」 |
+| 应用网格 4/5 列动态切换 | `AppGridScreen.kt` + DataStore | 图标 `62.dp`(4列) / `52.dp`(5列) |
+| MeeGo 设置中心 | `SettingsScreen.kt` | `grid_columns` / `edge_swipe` / `immersive_ui` 三项（`recents_columns` 有存储通路但未暴露 UI） |
+| 多任务真实快照卡片 | `RootTaskProvider.kt` + `EdgeSwipeGestureService.kt` | 四级任务源降级 + **单一快照来源 `_sys.jpg`** |
+| Task Snapshot 常驻取帧 | `scripts/TaskSnapService.java` | 对齐 Quickstep：`TaskSnapshotManager.takeTaskSnapshot` / `getTaskSnapshot`；**只含该任务窗口**，无状态栏/导航栏/挖孔留白；单帧 **11~42ms**（旧一次性桥 ~1.35s） |
+| 双指无级缩放 2×2 ⇄ 3×3 | `MultitaskingScreen.kt` | 阈值 `0.5f`、弹簧 `spring(0.96f, 450f)`、捏合灵敏度 `680f` |
+| 长按编辑 + 删除角标 + 一键清空 | `MultitaskingScreen.kt` | 消失 150ms → 补位 `spring(0.95f, 300f)` |
+| 全局边缘划回（含双层揭示） | `EdgeSwipeGestureService.kt` | 触发区 28.dp、**滑出阈值 1/3 屏**、震动越线即刻触发（35ms） |
+| 来源感知回溯 | `model/Models.kt` | `lastOrigin`（回哪一页）**与** `currentScreenIndex`（动画如何表现）刻意分离 |
+| 桌面缩放中心锚定 | `EdgeSwipeGestureService.kt` | pivot 钉物理屏幕中心，漂移由 (+51,+156)px 降到 (+0.0,+45.3)px |
+| 图标形状统一（超椭圆） | `util/AppIconRenderer.kt` | 绕开 `AdaptiveIconDrawable.draw()` 的系统圆形 mask；图层整体 `scale(1.5f)` 对齐 AOSP |
+| 特权守护链 + watchdog 自愈 | `scripts/meego_daemon.sh` | watchdog 每 5s 校验、连续 3 次确认死亡才重启（15s 宽限） |
+| 开机自启 | `scripts/meego_boot.sh` | Magisk `service.d` 钩子，**不写 `/system`**；开机路径自脱离防拖死 |
+| MeeGo 滚动物理 | `ui/components/MeeGoScrollPhysics.kt` | 17 项参数显式化；回弹为**单段弹簧 + 初速度注入**（1302ms → ~490ms） |
+
+### ⚠️ 规划中但**未实现**（请勿在文档中当作现状）
+
+- **Quick Launch Bar**（底部上划呼出电话/短信/相机/浏览器）—— `HomeScreen` 无底栏，应用入口只存在于第 1 屏网格内。
+- **应用网格长按编辑**（图标抖动 / 快速卸载）—— `AppGridScreen` 只有普通 `clickable`，无长按。全项目 `onLongClick` 仅存在于多任务屏。
+- **Events Feed 的真实数据** —— 除**时间**（每秒刷新）外，天气与通知均为 **MOCK 假数据**；`NotificationListenerService` 未实现。
+- **底部系统横条遮罩** —— 已改为 `WindowInsetsControllerCompat` 真正隐藏系统栏，无障碍遮罩视图从代码移除。
+
+> 💡 `FeedScreen` 的 MOCK 列表里有「长按桌面进入编辑模式」「快捷…」等文案，**那是演示假数据，不是功能说明**。
+
+---
 
 ---
 

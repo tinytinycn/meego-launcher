@@ -67,125 +67,56 @@ class RootTaskProvider(private val context: Context) {
                         val taskId = obj.getInt("taskId")
                         val pkgName = normalizePackageName(obj.getString("packageName"))
 
-                        val snapPath = obj.optString("snapshotPath", "")
+                        // 【v1.8.44 收敛为唯一来源】常驻 Task Snapshot 服务的产物。
+                        //
+                        // 此前这里是四级候选仲裁（_sys.jpg / _live.png / _reduced.jpg /
+                        // .jpg）+ provisional 两级占位机制，约 110 行。之所以能整体删除，
+                        // 是因为**采集侧已经换掉了**，旧候选各自的问题：
+                        //   · _live.png 来自 `screencap -p` 抓**整块物理屏幕**，必然混入
+                        //     状态栏 / 导航栏 / 挖孔留白（本机实测 105px + 66px），
+                        //     在纯黑卡片上一眼就能看出「这不是这个应用的画面」；
+                        //   · _reduced.jpg / .jpg 是 AOSP 落盘的滞后产物，需 root 跨目录
+                        //     拷贝，帧龄不可控。
+                        //
+                        // 而 _sys.jpg 现在由常驻服务（meego_daemon.sh 守护）持续刷新：
+                        // 对**可见**任务走 takeTaskSnapshot 取实时帧（11~42ms），
+                        // 对**后台**任务走 getTaskSnapshot 取系统缓存帧（1ms），
+                        // 像素只含该任务窗口。
+                        //
+                        // 【失败即降级图标】此刻若无文件（应用刚冷启动、系统尚未落盘任何
+                        // 快照），保留 snapshot=null，渲染层显示应用图标 —— 产品选定行为。
                         var snapshotBitmap: Bitmap? = null
                         var snapshotTimeMs = 0L
-                        var snapshotIsSettled = true
 
-                        // 1.1 收集全部候选（私有目录优先，规避 Android 16 对
-                        //     /data/local/tmp/snapshots 软链的 SELinux 隔离）
-                        //
-                        // 【v1.8.40 新增 ${taskId}_sys.jpg】
-                        // 它由特权守护脚本经 TaskSnapBridge 直读 WMS 的
-                        // TaskSnapshot 产出，是**只含该任务窗口**的真实画面 ——
-                        // 不含状态栏 / 导航栏 / 挖孔留白（实测本机
-                        // contentInsets=[0,105][0,66]），而 _live.png 走
-                        // `screencap -p` 抓的是整块物理屏幕，必然混入这些杂质。
-                        // 放在列表最前：同 mtime 时优先取它（仲裁取 mtime 最大者，
-                        // 同 mtime 时保留先出现者）。而一旦它更新（退后台瞬间生成，
-                        // mtime 必然更新），就会自然压过 _live.png —— 无需改仲裁逻辑。
-                        // 【v1.8.40】/data/local/tmp/snapshots 软链已由守护脚本移除
-                        //     （它曾指向系统快照目录，导致自采帧污染 AOSP 独占目录），
-                        //     故不再作为候选来源。App 私有目录是唯一权威来源。
-                        val candidateFiles = listOfNotNull(
-                            File(context.filesDir, "snapshots/${taskId}_sys.jpg"),
-                            File(context.filesDir, "snapshots/${taskId}_live.png"),
-                            File(context.filesDir, "snapshots/${taskId}_reduced.jpg"),
-                            File(context.filesDir, "snapshots/${taskId}.jpg"),
-                            if (snapPath.isNotEmpty()) File(snapPath) else null
-                        )
-
-                        // 1.2 该任务 live 帧是否仍处于启动动画期（provisional）
-                        val isProvisional = try {
-                            File(context.filesDir, "snapshots/${taskId}_live.provisional").exists()
-                        } catch (e: Exception) {
-                            false
-                        }
-
-                        // 1.3 同池取 mtime 最大者。
-                        //
-                        // 关键（v1.8.38）：**稳定池优先，provisional 帧不与之竞争，但绝不丢弃**。
-                        // 先在非 provisional 候选中仲裁出最优帧；只有当该池**为空**（应用仍处于
-                        // 启动动画期、系统快照尚未落盘）时，才退而取最新的 provisional 帧作为
-                        // **临时占位**真实展示。
-                        //
-                        // 此前实现把 provisional 帧从仲裁中整个排除并让 `snapshot` 保持 null，
-                        // 卡片遂降级为纯图标 —— 实测表现为「刚进入应用、立刻边缘划出时，
-                        // 划出卡片与多任务卡片都只显示应用图标」。但此刻用户刚刚亲眼看着这台
-                        // 设备完成启动，他手里的 provisional 帧正是他**刚刚看到的那个画面**，
-                        // 用图标替换它是信息量的净损失。故此处对齐 AOSP
-                        // `TaskThumbnailUiState.SnapshotSplash` 语义：临时占位、真实帧到达即替换。
-                        //
-                        // 时效性保证：provisional 帧以 `isSettled = false` 写入内存缓存，
-                        // 不污染稳定帧权威通道；应用稳定后守护进程的退后台采集 / 稳态低频
-                        // 刷新会以更新的 mtime 在下一次仲裁中自然顶掉它。
-                        var bestFile: File? = null
-                        var bestTime = Long.MIN_VALUE
-                        val stableCandidates = if (isProvisional) {
-                            candidateFiles.filterNot { it.name.endsWith("_live.png") }
-                        } else {
-                            candidateFiles
-                        }
-                        // 先在稳定池仲裁
-                        for (file in stableCandidates) {
+                        val sysFile = File(context.filesDir, "snapshots/${taskId}_sys.jpg")
+                        if (sysFile.exists() && sysFile.canRead() && sysFile.length() > 0) {
                             try {
-                                if (!file.exists() || !file.canRead() || file.length() <= 0) continue
-                                val t = file.lastModified()
-                                if (t > bestTime) {
-                                    bestTime = t
-                                    bestFile = file
-                                }
-                            } catch (e: Exception) {
-                                // ignore
-                            }
-                        }
-                        // 稳定池为空时才动用 provisional 帧作临时占位
-                        if (bestFile == null && isProvisional) {
-                            for (file in candidateFiles) {
-                                try {
-                                    if (!file.exists() || !file.canRead() || file.length() <= 0) continue
-                                    val t = file.lastModified()
-                                    if (t > bestTime) {
-                                        bestTime = t
-                                        bestFile = file
-                                    }
-                                } catch (e: Exception) {
-                                    // ignore
-                                }
-                            }
-                        }
-
-                        if (bestFile != null) {
-                            try {
-                                val bmp = BitmapFactory.decodeFile(bestFile.absolutePath)
+                                val bmp = BitmapFactory.decodeFile(sysFile.absolutePath)
                                 if (bmp != null) {
                                     snapshotBitmap = bmp
-                                    snapshotTimeMs = bestTime
-                                    // 系统快照（_reduced.jpg / .jpg）视为稳定帧；
-                                    // provisional live 帧仅作临时占位
-                                    snapshotIsSettled = !bestFile.name.endsWith("_live.png")
+                                    // 用文件 mtime 作为「抓取时刻」：它由守护脚本在每次
+                                    // 成功取帧后更新，反映真实新鲜度，供手势/多任务层观测。
+                                    snapshotTimeMs = sysFile.lastModified()
                                     TaskSnapshotCache.put(
                                         taskId, bmp, null,
                                         captureTimeMs = snapshotTimeMs,
-                                        isSettled = snapshotIsSettled
+                                        isSettled = true
                                     )
                                 }
                             } catch (e: Exception) {
                                 // ignore
                             }
                         }
-
-                        // 1.4 次选：从内存缓存获取该 taskId 的专属快照
+                        // 次选：从内存缓存获取该 taskId 的专属快照
                         if (snapshotBitmap == null) {
                             val memEntry = TaskSnapshotCache.getEntry(taskId)
                             if (memEntry != null && memEntry.isSettled) {
                                 snapshotBitmap = memEntry.bitmap
                                 snapshotTimeMs = memEntry.captureTimeMs
-                                snapshotIsSettled = true
                             }
                         }
 
-                        // 1.5 严格回退：手势刚滑出的任务专属快照
+                        // 再次选：手势刚滑出的任务专属快照
                         // 取局部变量 smart-cast，避免反复解包；activeSwipe() 已内建有效期判定
                         val swiped = TaskSnapshotCache.activeSwipe()
                         val swipedBitmap = swiped?.bitmap
@@ -194,7 +125,6 @@ class RootTaskProvider(private val context: Context) {
                         ) {
                             snapshotBitmap = swipedBitmap
                             // 滑出画面对应的是过渡态，不得标记为稳定帧
-                            snapshotIsSettled = false
                             TaskSnapshotCache.put(
                                 taskId, swipedBitmap, null,
                                 captureTimeMs = System.currentTimeMillis(),
@@ -202,9 +132,10 @@ class RootTaskProvider(private val context: Context) {
                             )
                         }
 
-                        // 1.6 全部候选均为 provisional（应用仍处于启动动画期）：
-                        //     保持 snapshot 为 null，卡片自动降级为图标占位，
-                        //     绝不展示误导性的半渲染过渡画面。
+                        // 三级来源全空（应用刚冷启动、系统尚未落盘任何快照）：
+                        //     保持 snapshot 为 null，卡片自动降级为图标占位。
+                        //     这是 v1.8.44 明确选定的产品行为 —— 与其展示一张混入
+                        //     状态栏/导航栏的整屏截图，不如诚实地只显示应用图标。
 
                         val label = try {
                             val appInfo = packageManager.getApplicationInfo(pkgName, 0)
@@ -226,8 +157,7 @@ class RootTaskProvider(private val context: Context) {
                                 label = label,
                                 icon = icon,
                                 snapshot = snapshotBitmap,
-                                snapshotTimeMs = snapshotTimeMs,
-                                snapshotIsSettled = snapshotIsSettled
+                                snapshotTimeMs = snapshotTimeMs
                             )
                         )
                     }
@@ -366,51 +296,26 @@ class RootTaskProvider(private val context: Context) {
                     null
                 }
 
-                // 尝试从持久化快照目录中读取快照
-                // provisional 帧仅作**临时占位**、不进入稳定帧权威通道（见主路径 1.3 的同源决策）：
-                // 应用稳定后守护进程产出的稳定帧会以更新的 mtime 在下一次仲裁中自然顶掉它。
-                val localProvisional = try {
-                    File(context.filesDir, "snapshots/${taskId}_live.provisional").exists()
-                } catch (e: Exception) {
-                    false
-                }
+                // 尝试从持久化快照目录中读取快照。
+                // 【v1.8.44】与主路径同构：唯一来源是常驻服务的 ${tid}_sys.jpg。
+                // 冷启动 / 守护进程尚未落盘时，本方法才是唯一通路。
                 var snapshotBitmap = TaskSnapshotCache.getEntry(taskId)
                     ?.takeIf { it.isSettled }
                     ?.bitmap
                 if (snapshotBitmap == null && taskId > 0) {
-                    // 【v1.8.40】与主路径 getRecentTasks 的候选列表保持同构，
-                    // 首位同样是 _sys.jpg（真实任务窗口，无系统栏污染）。
-                    // 冷启动 / 守护进程尚未落盘时，本方法才是唯一通路，
-                    // 若漏了它会出现「刚开机卡片退回整屏截图」的观感倒退。
-                    val candidateFiles = listOf(
-                        File(context.filesDir, "snapshots/${taskId}_sys.jpg"),
-                        File(context.filesDir, "snapshots/${taskId}_live.png"),
-                        File(context.filesDir, "snapshots/${taskId}_reduced.jpg"),
-                        File(context.filesDir, "snapshots/${taskId}.jpg")
-                    )
-                    // 稳定池优先；为空时才取 provisional live 帧作临时占位
-                    val ordered = if (localProvisional) {
-                        candidateFiles.filterNot { it.name.endsWith("_live.png") } + candidateFiles.filter { it.name.endsWith("_live.png") }
-                    } else {
-                        candidateFiles
-                    }
-                    for (file in ordered) {
-                        if (file.exists() && file.canRead()) {
-                            // 稳定池已取到帧后，provisional live 帧不再参与
-                            if (localProvisional && file.name.endsWith("_live.png") && snapshotBitmap != null) continue
-                            try {
-                                snapshotBitmap = BitmapFactory.decodeFile(file.absolutePath)
-                                if (snapshotBitmap != null) {
-                                    TaskSnapshotCache.put(
-                                        taskId, snapshotBitmap, null,
-                                        captureTimeMs = file.lastModified(),
-                                        isSettled = !file.name.endsWith("_live.png")
-                                    )
-                                    break
-                                }
-                            } catch (e: Exception) {
-                                // ignore
+                    val sysFile = File(context.filesDir, "snapshots/${taskId}_sys.jpg")
+                    if (sysFile.exists() && sysFile.canRead() && sysFile.length() > 0) {
+                        try {
+                            snapshotBitmap = BitmapFactory.decodeFile(sysFile.absolutePath)
+                            if (snapshotBitmap != null) {
+                                TaskSnapshotCache.put(
+                                    taskId, snapshotBitmap, null,
+                                    captureTimeMs = sysFile.lastModified(),
+                                    isSettled = true
+                                )
                             }
+                        } catch (e: Exception) {
+                            // ignore
                         }
                     }
                 }
@@ -509,11 +414,9 @@ class RootTaskProvider(private val context: Context) {
         try {
             Log.d(TAG, "removeTask requested for taskId=$taskId, pkg=$packageName")
             TaskSnapshotCache.remove(taskId)
-            // 【v1.8.40】软链已移除，清理范围收敛到 App 私有目录。
+            // 【v1.8.44】清理范围收敛为常驻服务的唯一产物 _sys.jpg。
             // 守护脚本的 REMOVE / CLEAR_ALL 分支负责系统侧，这里只管自己的缓存。
-            for (name in listOf("_sys.jpg", "_live.png", "_reduced.jpg", ".jpg")) {
-                File(context.filesDir, "snapshots/${taskId}$name").delete()
-            }
+            File(context.filesDir, "snapshots/${taskId}_sys.jpg").delete()
 
             // 1. 优先通过应用私有目录命令队列向特权守护发送彻底杀死命令 (无 SELinux 阻碍，零阻塞)
             enqueueCommand("REMOVE $taskId $packageName")

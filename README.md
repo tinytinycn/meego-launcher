@@ -70,7 +70,7 @@ bash scripts/deploy.sh
 === [3/8] 编译并部署常驻 Task Snapshot 服务 + 直读桥 ===
   ✅ 常驻 TaskSnapService 已部署 (/data/local/tmp/meego_svc.dex)
   ✅ 一次性 TaskSnapBridge 已部署（自检/排障兜底）
-=== [4/8] 部署特权守护脚本（不改动 /system 分区）===
+=== [4/8] 部署特权守护脚本（全部落在 /data 分区）===
   ✅ 已安装 Magisk 开机自启钩子（/data/adb/service.d/meego_boot.sh）
 ✅ 特权守护进程已就绪（主进程 PID=9081、watchdog PID=9065）
 === [6/8] 验证进程存活与前台状态 ===
@@ -83,7 +83,9 @@ bash scripts/deploy.sh
   ✅ 服务 IPC 正常响应：{"ok":true,"listening":false,"lastEvent":"","binderPoolError":"","threads":12}
 ```
 
-> **本部署流程不写 `/system` 任何文件。** 手机的 `/system` 通常受 dm-verity 校验保护，改写会导致校验失败甚至无法开机，故所有脚本一律落在 `/data` 分区（`/data/local/tmp` 与 `/data/adb`）。
+> **本部署流程当前不写 `/system` 任何文件**，所有脚本一律落在 `/data` 分区（`/data/local/tmp` 与 `/data/adb`），因此可直接 `adb install` 迭代、无需重刷。
+>
+> 设备已安装 **Magisk（30.7，`su` 可用）**。若确需改动 `/system` 内容（例如把启动器装成 privapp），正确做法是 **Magisk 模块叠加（magic mount）**——它在挂载命名空间内叠加文件，不写真实分区；而真实分区当前以 `ro` 挂载，直接 `remount,rw` 后写真实分区不是受支持路径。
 
 ---
 
@@ -332,7 +334,7 @@ bash scripts/check_device.sh
 | 桌面缩放中心锚定 | `EdgeSwipeGestureService.kt` | pivot 钉物理屏幕中心，漂移由 (+51,+156)px 降到 (+0.0,+45.3)px |
 | 图标形状统一（超椭圆） | `util/AppIconRenderer.kt` | 绕开 `AdaptiveIconDrawable.draw()` 的系统圆形 mask；图层整体 `scale(1.5f)` 对齐 AOSP |
 | 特权守护链 + watchdog 自愈 | `scripts/meego_daemon.sh` | watchdog 每 5s 校验、连续 3 次确认死亡才重启（15s 宽限） |
-| 开机自启 | `scripts/meego_boot.sh` | Magisk `service.d` 钩子，**不写 `/system`**；开机路径自脱离防拖死 |
+| 开机自启 | `scripts/meego_boot.sh` | Magisk `service.d` 钩子（放 `/data/adb`，无需模块）；开机路径自脱离防拖死 |
 | MeeGo 滚动物理 | `ui/components/MeeGoScrollPhysics.kt` | 17 项参数显式化；回弹为**单段弹簧 + 初速度注入**（1302ms → ~490ms） |
 
 ### ⚠️ 规划中但**未实现**（请勿在文档中当作现状）

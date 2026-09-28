@@ -152,8 +152,8 @@ STEADY_CAPTURE_EVERY=5
 # 重启的短暂空窗）确认死亡后，重新拉起【当前这份脚本】。
 #
 # 【为什么不用 setprop ctl.start 重启】
-# init 的 meego_daemon.rc 指向 /system/bin/meego_daemon.sh，而 /system 受
-# dm-verity 保护无法更新 —— 那里永远停留在首次刷入时的旧版本。实测 ctl.start
+# init 的 meego_daemon.rc 指向 /system/bin/meego_daemon.sh，而真实分区以只读挂载、
+# 无法就地更新（要改须走 Magisk 模块叠加）—— 那里永远停留在首次刷入时的旧版本。实测 ctl.start
 # 拉起的正是那份旧脚本（既不写心跳也没有本版修复），自愈一次就等于回退一次。
 # 故统一改为直接拉起当前正在运行的这份脚本。
 DAEMON_SCRIPT="$0"
@@ -173,7 +173,8 @@ cmdline_field() {
 # 是否存在【与本进程同源】的 watchdog。
 #
 # 刻意要求脚本路径一致，而不是「存在任意 watchdog 即可」：/system/bin 下可能
-# 残留着早先部署写入的旧副本（/system 受 dm-verity 保护，无法更新或删除），
+# 残留着早先部署写入的旧副本（真实分区只读，无法就地更新或删除；
+# 若确要清理，需走 Magisk 模块叠加），
 # 开机时 init 会按 .rc 启动那份旧脚本，于是它也会 fork 出指向自己的 watchdog。
 # 若这里只按 __WATCHDOG 标记判定，就会误以为「watchdog 已存在」而不启动自己
 # 的，紧接着单实例逻辑又把旧 watchdog 清掉 —— 结果是两个都没了。旧副本的
@@ -228,7 +229,7 @@ if [ "$1" = "__WATCHDOG" ]; then
                 MISS_COUNT=0
                 # 注意：这里【不能】用 setprop ctl.start。
                 # init 的 meego_daemon.rc 指向 /system/bin/meego_daemon.sh，
-                # 而 /system 受 dm-verity 保护不可更新 —— 那里永远是首次刷入时的
+                # 而真实分区只读、无法就地更新 —— 那里永远是首次刷入时的
                 # 旧版本。经实测，ctl.start 拉起的正是 /system 旧版，它既不写
                 # .alive 心跳，也缺少后续修复，一旦被拉起就等于回退。
                 # 故直接拉起当前这份脚本（/data/local/tmp，由 deploy.sh 推送）。

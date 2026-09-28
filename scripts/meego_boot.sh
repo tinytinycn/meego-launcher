@@ -160,8 +160,9 @@ fi
 # 2. 拉起主进程
 #
 # 刻意不用 `setprop ctl.start`：init 的 meego_daemon.rc 指向
-# /system/bin/meego_daemon.sh，而 /system 受 dm-verity 保护无法更新，
-# 那里永远停留在首次刷入时的旧版本 —— ctl.start 拉起的是那份旧脚本，
+# /system/bin/meego_daemon.sh，而真实分区以只读挂载、无法就地更新
+# （要改须走 Magisk 模块叠加），那里永远停留在首次刷入时的旧版本 ——
+# ctl.start 拉起的是那份旧脚本，
 # 自愈一次等于回退一次。故一律直接执行 /data/local/tmp 下的当前版本。
 # ------------------------------------------------------------------------------
 M_PID=$(main_pid || true)

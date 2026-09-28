@@ -224,16 +224,19 @@ else
     echo "  ℹ️ 跳过一次性 bridge（仅自检/排障需要）"
 fi
 
-echo "=== [4/8] 部署特权守护脚本（不改动 /system 分区）==="
-# 【重要：绝不写 /system】
-# 本机 /system 受 dm-verity 校验，改写会导致验证失败进而无法开机。
-# 脚本与开机自启配置一律放在 /data/local/tmp，部署过程只做 push + chmod。
+echo "=== [4/8] 部署特权守护脚本（全部落在 /data 分区）==="
+# 【部署位置：一律 /data，不写真实分区】
+# 脚本与开机自启配置都放 /data/local/tmp 与 /data/adb，部署过程只做 push + chmod，
+# 因此可直接 adb install 迭代、无需重刷。
+# 真实分区当前以只读挂载（/proc/mounts: /dev/block/dm-1 / ext4 ro），
+# 直接 remount,rw 后写真实分区不是受支持路径；
+# 若将来确需改动 /system 内容（例如把启动器装成 privapp），走 Magisk 模块叠加。
 if [ -f "$SCRIPT_DIR/meego_daemon.sh" ]; then
     "$ADB" push "$SCRIPT_DIR/meego_daemon.sh" /data/local/tmp/meego_daemon.sh
     "$ADB" shell chmod 755 /data/local/tmp/meego_daemon.sh
 
     # 开机自启：依赖既有的 meego_daemon.rc（若设备上已存在）。
-    # 不再尝试写入 /system/etc/init —— 那是 dm-verity 保护区，不能碰。
+    # 不再尝试写入 /system/etc/init —— 真实分区只读，需走 Magisk 模块叠加。
     # -----------------------------------------------------------------------
     # 开机自启：安装 Magisk service.d 钩子
     #
@@ -254,14 +257,14 @@ if [ -f "$SCRIPT_DIR/meego_daemon.sh" ]; then
     # 等待逻辑本体在 meego_boot.sh 内（--wait-boot），此处只做安装。
     #
     # 【为什么 /system/etc/init/*.rc 不再是主路径】
-    # 本机根本不存在 meego_daemon.rc，且 /system 受 dm-verity 保护不可写 ——
+    # 本机根本不存在 meego_daemon.rc（该 .rc 从未随构建刷入）——
     # 那条路在本设备上从未成立。下面的探测仅作信息展示。
     # -----------------------------------------------------------------------
     HAS_RC=$("$ADB" shell 'test -f /system/etc/init/meego_daemon.rc && echo yes || echo no' 2>/dev/null | tr -d '\r')
     if [ "$HAS_RC" = "yes" ]; then
         echo "  检测到既有 meego_daemon.rc（init 路径可用）"
     else
-        echo "  设备上无 meego_daemon.rc（/system 受 dm-verity 保护，属预期）"
+        echo "  设备上无 meego_daemon.rc（该 .rc 从未随构建刷入，属预期）"
     fi
 
     if [ -f "$SCRIPT_DIR/meego_boot.sh" ]; then

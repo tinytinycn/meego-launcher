@@ -17,22 +17,29 @@ import java.io.File
  *
  * ## 职责边界
  * **真正的自愈由 root 侧 watchdog 完成**（脚本内 `__WATCHDOG` 模式，每 5s
- * 校验主进程存活，连续 3 次确认死亡后用 `setprop ctl.start` 让 init 重新
- * 拉起）。本类只负责在启动器运行时**顺带**把主进程叫醒，省掉那 15s 等待。
+ * 校验主进程存活，连续 3 次确认死亡后**直接重新执行当前那份脚本**
+ * —— 刻意不用 `setprop ctl.start`，因为 init 的 `.rc` 指向只读分区里那份
+ * 永不更新的旧脚本，拉起来等于回退）。本类只负责在启动器运行时**顺带**
+ * 把主进程叫醒，省掉那 15s 等待。
  *
- * ## 为什么不直接拉起
- * 设备上没有 `su` 二进制，App 进程（u0_a209）无法提权，因此
+ * ## 为什么当前是"辅助"而不是"直接拉起"
+ * 本类编写时该设备**没有 `su` 二进制**，App 进程（u0_a209）无法提权，因此
  * `Runtime.exec("setprop ctl.start ...")` 这条路走不通。App 唯一可写之处
  * 是自身私有目录下的 `cmd_queue`，而那是**给守护进程发指令**的单向通道。
  * 所以 App 能做的最有力的事，是发现「watchdog 健在但主进程已死」时投一条
  * `ENSURE_DAEMON`，让 watchdog 跳过宽限期立即补拉。
  *
+ * ⚠️ **该前提已改变**：设备现已安装 Magisk（`/product/bin/su` 可用），
+ * 在 Magisk 中授予本应用 root 后，`su -c` 提权在系统层面已可行，
+ * 「App 自己拉起守护链」成为一条**可选项**。本类**尚未**按新前提改造，
+ * 故现行为仍是辅助式。
+ *
  * ## 为什么读文件而不是扫 /proc
  * 本机 `/proc` 挂载了 `hidepid=2`，普通 uid 看不到其他进程的 `/proc/<pid>`
  * 目录（已实测：root 能看到 watchdog，App 却扫不到）。因此双方改为各自
- * 申报心跳、App 读文件判断：
- *  - `/data/local/tmp/meego_daemon.alive`     —— 主进程每 2s 刷新
- *  - `/data/local/tmp/meego_daemon.watchdog`  —— watchdog 每 5s 刷新
+ * 申报心跳、App 读文件判断（均在 **App 私有目录**，见下方常量）：
+ *  - `files/cmd_queue/daemon.hb`    —— 主进程每 2s 刷新
+ *  - `files/cmd_queue/watchdog.hb`  —— watchdog 每 5s 刷新
  * 两者权限均为 666，内容为 `<pid> <epochSeconds>`，便于 App 直接判新旧。
  */
 object DaemonWatchdogClient {
@@ -74,8 +81,9 @@ object DaemonWatchdogClient {
      *   作为"守卫确实跑过"的唯一可观测点；启动器每次启动最多一条，可忽略）。
      * - 主进程心跳过期、但 watchdog 心跳新鲜 → 投 `ENSURE_DAEMON`，
      *   让 watchdog 立即补拉主进程，而不必等满 15s 宽限期。
-     * - watchdog 心跳也过期 → App 无权提权重启（设备无 su），只能记录，
-     *   该场景交由 init 的开机自启路径兜底。
+     * - watchdog 心跳也过期 → 当前实现无权提权重启（本类编写时设备无 su），
+     *   只能记录；该场景交由 Magisk 开机自启路径兜底。
+     *   （Magisk 已提供 su，改为直接拉起是可行的后续改造项。）
      */
     fun ensureDaemonRunning(context: Context) {
         runCatching {
@@ -88,7 +96,8 @@ object DaemonWatchdogClient {
                 Log.w(
                     TAG,
                     "watchdog absent and main process down; " +
-                        "App cannot restart it (no su). Rely on init boot service."
+                        "App cannot restart it (su not used by this code). " +
+                            "Rely on the Magisk boot hook."
                 )
                 return
             }

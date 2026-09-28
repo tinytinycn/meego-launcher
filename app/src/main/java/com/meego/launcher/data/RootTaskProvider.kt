@@ -25,6 +25,19 @@ class RootTaskProvider(private val context: Context) {
         private const val CACHE_FILE_NAME = "recent_tasks_cache.json"
         private const val APP_TASKS_JSON_NAME = "recent_tasks.json"
         private const val CMD_QUEUE_DIR_NAME = "cmd_queue"
+
+        /**
+         * 守护脚本 awk 解析 `mActivityComponent=pkg/cls` 时，awk 的 `gsub(/[^a-zA-Z0-9._]/,"")`
+         * 会把 `/` 也吃掉，从而**丢失类名**。当包名本身以 `.` 结尾或解析退化时，
+         * 结果就只剩一个前导点（形如 `.`）——此时无法还原真实包名。
+         *
+         * LineageOS 相机正是这种情况（`org.lineageos.aperture`），故此处回落到
+         * 已知值。**集中在此一处**，避免魔改散落在解析与缓存两条路径上。
+         */
+        private fun normalizePackageName(raw: String): String {
+            val name = raw.replace("}", "").replace("{", "").trim()
+            return if (name.startsWith(".")) "org.lineageos.aperture" else name
+        }
     }
 
     private val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
@@ -52,13 +65,7 @@ class RootTaskProvider(private val context: Context) {
                     for (i in 0 until jsonArray.length()) {
                         val obj = jsonArray.getJSONObject(i)
                         val taskId = obj.getInt("taskId")
-                        var pkgName = obj.getString("packageName").replace("}", "").replace("{", "").trim()
-                        if (pkgName.startsWith(".")) {
-                            pkgName = "org.lineageos.aperture"
-                        }
-                        if (pkgName == "android.task.contacts") {
-                            pkgName = "com.android.contacts"
-                        }
+                        val pkgName = normalizePackageName(obj.getString("packageName"))
 
                         val snapPath = obj.optString("snapshotPath", "")
                         var snapshotBitmap: Bitmap? = null
@@ -67,13 +74,25 @@ class RootTaskProvider(private val context: Context) {
 
                         // 1.1 收集全部候选（私有目录优先，规避 Android 16 对
                         //     /data/local/tmp/snapshots 软链的 SELinux 隔离）
+                        //
+                        // 【v1.8.40 新增 ${taskId}_sys.jpg】
+                        // 它由特权守护脚本经 TaskSnapBridge 直读 WMS 的
+                        // TaskSnapshot 产出，是**只含该任务窗口**的真实画面 ——
+                        // 不含状态栏 / 导航栏 / 挖孔留白（实测本机
+                        // contentInsets=[0,105][0,66]），而 _live.png 走
+                        // `screencap -p` 抓的是整块物理屏幕，必然混入这些杂质。
+                        // 放在列表最前：同 mtime 时优先取它（仲裁取 mtime 最大者，
+                        // 同 mtime 时保留先出现者）。而一旦它更新（退后台瞬间生成，
+                        // mtime 必然更新），就会自然压过 _live.png —— 无需改仲裁逻辑。
+                        // 【v1.8.40】/data/local/tmp/snapshots 软链已由守护脚本移除
+                        //     （它曾指向系统快照目录，导致自采帧污染 AOSP 独占目录），
+                        //     故不再作为候选来源。App 私有目录是唯一权威来源。
                         val candidateFiles = listOfNotNull(
+                            File(context.filesDir, "snapshots/${taskId}_sys.jpg"),
                             File(context.filesDir, "snapshots/${taskId}_live.png"),
                             File(context.filesDir, "snapshots/${taskId}_reduced.jpg"),
                             File(context.filesDir, "snapshots/${taskId}.jpg"),
-                            if (snapPath.isNotEmpty()) File(snapPath) else null,
-                            File("/data/local/tmp/snapshots/${taskId}_live.png"),
-                            File("/data/local/tmp/snapshots/${taskId}_reduced.jpg")
+                            if (snapPath.isNotEmpty()) File(snapPath) else null
                         )
 
                         // 1.2 该任务 live 帧是否仍处于启动动画期（provisional）
@@ -359,12 +378,15 @@ class RootTaskProvider(private val context: Context) {
                     ?.takeIf { it.isSettled }
                     ?.bitmap
                 if (snapshotBitmap == null && taskId > 0) {
+                    // 【v1.8.40】与主路径 getRecentTasks 的候选列表保持同构，
+                    // 首位同样是 _sys.jpg（真实任务窗口，无系统栏污染）。
+                    // 冷启动 / 守护进程尚未落盘时，本方法才是唯一通路，
+                    // 若漏了它会出现「刚开机卡片退回整屏截图」的观感倒退。
                     val candidateFiles = listOf(
+                        File(context.filesDir, "snapshots/${taskId}_sys.jpg"),
                         File(context.filesDir, "snapshots/${taskId}_live.png"),
                         File(context.filesDir, "snapshots/${taskId}_reduced.jpg"),
-                        File("/data/local/tmp/snapshots/${taskId}_live.png"),
-                        File("/data/local/tmp/snapshots/${taskId}_reduced.jpg"),
-                        File("/data/local/tmp/snapshots/${taskId}.jpg")
+                        File(context.filesDir, "snapshots/${taskId}.jpg")
                     )
                     // 稳定池优先；为空时才取 provisional live 帧作临时占位
                     val ordered = if (localProvisional) {
@@ -487,8 +509,11 @@ class RootTaskProvider(private val context: Context) {
         try {
             Log.d(TAG, "removeTask requested for taskId=$taskId, pkg=$packageName")
             TaskSnapshotCache.remove(taskId)
-            File("/data/local/tmp/snapshots/${taskId}_live.png").delete()
-            File(context.filesDir, "snapshots/${taskId}_live.png").delete()
+            // 【v1.8.40】软链已移除，清理范围收敛到 App 私有目录。
+            // 守护脚本的 REMOVE / CLEAR_ALL 分支负责系统侧，这里只管自己的缓存。
+            for (name in listOf("_sys.jpg", "_live.png", "_reduced.jpg", ".jpg")) {
+                File(context.filesDir, "snapshots/${taskId}$name").delete()
+            }
 
             // 1. 优先通过应用私有目录命令队列向特权守护发送彻底杀死命令 (无 SELinux 阻碍，零阻塞)
             enqueueCommand("REMOVE $taskId $packageName")

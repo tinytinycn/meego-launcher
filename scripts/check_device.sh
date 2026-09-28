@@ -31,4 +31,80 @@ else
     echo -n "屏幕分辨率: " && "$ADB" shell wm size 2>/dev/null || true
     echo -n "屏幕密度 (DPI): " && "$ADB" shell wm density 2>/dev/null || true
     echo -n "Root 状态: " && ("$ADB" shell id 2>/dev/null || echo "非 Root/不可用")
+
+    # ---------------------------------------------------------------------------
+    # 快照链路健康诊断（v1.8.40 新增）
+    #
+    # 背景：Android 16 把系统快照改为「每用户 UUID 子目录」布局，此前守护脚本
+    # 按扁平路径取帧，导致系统快照同步链路**静默全失效**（ls 无报错、glob 零命中）。
+    # 这类"安静地坏掉"的故障必须能被一条命令看出来，故固化到此。
+    # ---------------------------------------------------------------------------
+    echo ""
+    echo "=== 快照链路诊断 (Task Snapshot) ==="
+
+    SNAP_ROOT="/data/system_ce/0/snapshots"
+    # 复刻守护脚本的子目录探测（flat 布局则退回根目录本身）
+    SNAP_USER_DIR=$("$ADB" shell "for d in $SNAP_ROOT/*/; do [ -d \"\$d\" ] && echo \"\${d%/}\" && break; done" 2>/dev/null | tr -d '\r' | head -1)
+    [ -z "$SNAP_USER_DIR" ] && SNAP_USER_DIR="$SNAP_ROOT"
+
+    if [ "$SNAP_USER_DIR" = "$SNAP_ROOT" ]; then
+        echo "  布局: 扁平（Android 15 及更早的布局，兼容模式）"
+    else
+        echo "  布局: 每用户 UUID 子目录 ✅ (Android 16)"
+        echo "        $SNAP_USER_DIR"
+    fi
+
+    SYS_SNAP_COUNT=$("$ADB" shell "ls $SNAP_USER_DIR/*.jpg 2>/dev/null | wc -l" 2>/dev/null | tr -d '\r ' || echo 0)
+    echo -n "  系统快照张数: $SYS_SNAP_COUNT"
+    if [ "$SYS_SNAP_COUNT" = "0" ]; then
+        echo "  ⚠️ 为 0 —— 同步链路必然失效（检查守护脚本是否在跑）"
+    else
+        echo "  ✅"
+    fi
+
+    # 同步时效：App 私有目录里最新一帧 与 系统侧最新一帧 的 mtime 差
+    APP_SNAP_DIR="/data/user/0/com.meego.launcher/files/snapshots"
+    NEWEST_APP=$("$ADB" shell "ls -t $APP_SNAP_DIR/*.jpg 2>/dev/null | head -1" 2>/dev/null | tr -d '\r')
+    NEWEST_SYS=$("$ADB" shell "ls -t $SNAP_USER_DIR/*.jpg 2>/dev/null | head -1" 2>/dev/null | tr -d '\r')
+    if [ -n "$NEWEST_APP" ] && [ -n "$NEWEST_SYS" ]; then
+        # 直接 stat 完整路径（basename 会被 /data/local/tmp 之类的前缀干扰，
+        # 且在设备侧没有对应 cwd）
+        T_APP=$("$ADB" shell "stat -c %Y '$NEWEST_APP' 2>/dev/null" 2>/dev/null | tr -d '\r' || echo 0)
+        T_SYS=$("$ADB" shell "stat -c %Y '$NEWEST_SYS' 2>/dev/null" 2>/dev/null | tr -d '\r' || echo 0)
+        if [ -n "$T_APP" ] && [ -n "$T_SYS" ] && [ "$T_SYS" -gt 0 ] 2>/dev/null; then
+            LAG=$((T_SYS - T_APP))
+            if [ "$LAG" -gt 0 ]; then
+                echo "  ⚠️ App 侧快照落后系统侧 ${LAG}s —— 同步未生效（守护进程可能已死，见下方心跳）"
+            else
+                echo "  ✅ 快照同步正常（App 侧不落后系统侧）"
+            fi
+        fi
+        echo "    App 最新: $(basename "$NEWEST_APP")"
+        echo "    Sys 最新: $(basename "$NEWEST_SYS")"
+    fi
+
+    # TaskSnapBridge 存在性
+    if "$ADB" shell "test -f /data/local/tmp/meego_daemon_bridge.dex" 2>/dev/null; then
+        echo "  ✅ TaskSnapBridge 已部署"
+    else
+        echo "  ℹ️ TaskSnapBridge 未部署（纯 screencap 降级模式，仍可用）"
+    fi
+
+    # 守护进程心跳（心跳落在 App 私有目录：/data/local/tmp 属 shell_data_file，
+    # App 侧会被 SELinux 拒绝读取）
+    HB=$("$ADB" shell "cat $APP_SNAP_DIR/../cmd_queue/daemon.hb 2>/dev/null" 2>/dev/null | tr -d '\r' || true)
+    NOW=$("$ADB" shell "date +%s" 2>/dev/null | tr -d '\r')
+    if [ -n "$HB" ]; then
+        HB_TS=$(echo "$HB" | awk '{print $2}')
+        if [ -n "$HB_TS" ] && [ -n "$NOW" ]; then
+            AGE=$((NOW - HB_TS))
+            if [ "$AGE" -gt 15 ] 2>/dev/null; then
+                echo "  ⚠️ 守护进程心跳已过期 ${AGE}s —— 主进程已死，Task Snapshot 管线不会更新"
+            else
+                echo "  ✅ 守护进程存活（心跳 ${AGE}s 前）"
+            fi
+        fi
+    else
+        echo "  ⚠️ 无守护进程心跳文件 —— 守护进程从未启动过"
+    fi
 fi

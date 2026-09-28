@@ -1,6 +1,6 @@
 # MeeGo Harmattan 风格 Android 启动器 (MeeGo Launcher) 技术方案
 
-> **版本**：v1.8.39  
+> **版本**：v1.8.40  
 > **文档位置**：`MEEGO_LAUNCHER_TECH_SPEC.md`（项目根目录）  
 > **维护规范**：全程在 DSH 环境中进行自主开发，每次会话针对架构、需求、实现的任何调整，均需即时同步更新此文档。
 
@@ -409,10 +409,11 @@ $$\left|\frac{x}{a}\right|^n + \left|\frac{y}{b}\right|^n = 1 \quad (n = 2.732)$
      - **架构设计**：
        1. **一级内存快照缓存（`TaskSnapshotCache`）**：单例内存高速缓存，手势服务在 `startSwipeOutAnimation` 及 `finishSwipeOut` 动画执行时，将手势滑出的应用实时全真画面（`snapBitmap`）即时写入内存缓存，并绑定 `lastSwipedTaskId` 与 `lastSwipedPackageName`；
        2. **二级特权全真快照（`current_app.png`）**：`RootTaskProvider` 在解析任务列表时，若本地快照尚未落盘，自动比对当前前台任务 ID 或包名，读取特权守护脚本预先捕获的 `/data/local/tmp/current_app.png`；
-       3. **三级守护进程快照保底（Daemon Snapshot Fallback）**：`meego_daemon.sh` 在更新 `recent_tasks.json` 时，若原生快照不存在且当前任务匹配，直接将 `current_app.png` 复制至 `/data/local/tmp/snapshots/${tid}_reduced.jpg` 并赋予 644 权限；
+       3. **三级守护进程快照保底（Daemon Snapshot Fallback）**：`meego_daemon.sh` 在更新 `recent_tasks.json` 时，若原生快照不存在且当前任务匹配，直接将 `current_app.png` 复制至 App 私有目录的快照文件并赋予可读权限；
        4. **异步多阶段重刷（Delayed Task Refreshes）**：`MainActivity.onResume()` 在即时加载（0ms）后，分别在 600ms 与 1500ms 自动触发延时重刷，待系统原生快照写入完毕后无缝替换为系统全高清位图，实现多任务卡片 100% 实时显示真机界面，绝不退化为图标。
    - **两级快照仲裁：provisional 帧作临时占位、绝不覆盖稳定帧（v1.8.38）**：启动动画期快照的仲裁规则已由「一律排除 provisional」修正为「稳定池优先、provisional 仅作临时占位」。完整设计判据、返工教训与真机验证见 §4.10。
    - **划出画面时效性（v1.8.39）**：划出卡片取的是守护进程最后一次抓帧的结果，故「截图及时性」等价于「帧龄」。经实测将稳态刷新节奏由 10 降为 5，帧龄中位数由 3.0s 降至 2.0s；并附「按需抓帧不可行」的否证实验，见 §4.11。
+   - **Task Snapshot 直读管线（v1.8.40）**：多任务卡片画面的像素来源由「`screencap` 抓整块物理屏幕」升级为「**直读 WMS 的 `TaskSnapshot`**」——后者**只含该任务窗口**，不含状态栏、导航栏与挖孔留白（本机实测杂质 105px + 66px），且延迟由 ≈650ms 降至 **275ms**。同时修复了一条**自升级以来静默失效**的系统快照同步链（Android 16 改为每用户 UUID 子目录，扁平路径零命中）。完整权限链、三个踩坑点与真机验证见 §4.12。
    - **多任务网格状态持久化（Recents Columns Persistence & Snapping）**：
      - 将多任务 2×2 / 3×3 布局模式同步纳入 DataStore 持久化存储（`KEY_RECENTS_COLUMNS`）；
      - 双指缩放（Pinch-to-zoom）手势结束时，依据 $\text{pinchScale} \lessgtr 0.83$ 智能平滑吸附到 3×3 或 2×2，并实时持久化，彻底解决在主屏各页面滑动或重启后模式被重置的问题。
@@ -663,6 +664,175 @@ val chosen = pickFreshestFile(stablePool, currentTaskId)   // 稳定池：解析
 首轮测量曾得出「刷新间隔 13s、帧龄 19s」等**明显失真**的结论。根因是排查过程中在设备上遗留了两条 `while :; do screencap -p; done` 诊断循环，它们持续抢占 SurfaceFlinger，导致守护进程的抓帧请求排队甚至饿死。
 
 **教训**：在真机上做性能测量时，任何遗留的压测/诊断循环都会直接污染结果；测量前必须先 `ps` 确认无残留 `screencap` 进程。守护进程本身健康与否，可用心跳文件 `cmd_queue/daemon.hb` 与 `watchdog.hb`（分别每 2s / 5s 刷新）独立判定。
+
+### 4.12 Task Snapshot 直读管线：消灭整屏污染，并修复一条静默失效的同步链（v1.8.40）
+
+> 现象：多任务卡片里的画面**混着状态栏、导航栏和挖孔留白**——一眼就能看出"这不是这个应用的画面"。
+
+#### 4.12.1 根因：screencap 抓的是"整块物理屏幕"，不是"这个任务"
+
+守护脚本此前的全部画面来自 `screencap -p`。它抓的是**整块物理屏幕**，于是每一张卡片里都混进了：
+
+| 杂质 | 本机实测取值 | 来源 |
+|---|---|---|
+| 顶部挖孔留白 | 105 px | 屏幕挖孔（`mContentInsets=[0,105]`） |
+| 底部导航栏 | 66 px | 系统导航栏（`mContentInsets=[0,66]`） |
+
+在纯黑 MeeGo 卡片上，这两条杂质的视觉破坏是**质变**而非量变。
+
+**AOSP 其实早就为每个任务维护了一份只含该任务窗口的真实快照**，由 `TaskSnapshotController` 在任务"变不可见"那一刻抓取。v1.8.40 直接把那份快照的真实像素取出来。
+
+#### 4.12.2 顺带发现的既存 Bug：系统快照同步链自升级以来从未生效
+
+这是本次调研**最重要的产出**，优先级高于新功能本身。
+
+`meego_daemon.sh` 一直按**扁平路径**取系统快照：`$SNAP_DIR/${tid}_reduced.jpg`。而 Android 16 起，AOSP 改为**每用户一个 UUID 子目录**：
+
+```
+/data/system_ce/0/snapshots/8930c050-f26d-495b-9e37-8bfd7d2c5871/689.jpg
+                                                        689_reduced.jpg
+                                                        689.proto
+```
+
+真机实测后果：
+
+```bash
+$ ls /data/system_ce/0/snapshots/*_reduced.jpg
+ls: ... No such file or directory          # 零命中，且不报错
+```
+
+即 `sync_from_system_snapshot()` 与 `update_tasks()` 里的系统快照同步**一条都没生效过**。设备侧证据：App 私有目录里最新的 `_reduced.jpg` 停在 13:36，而系统侧 14:11 的新快照从未同步下来。
+
+> **这意味着 v1.8.38 / v1.8.39 反复调优的"稳态帧龄"（3.0s → 2.0s），建立在一个从未接上系统快照的降级管线上。** 修好本项的收益大于任何新功能。
+
+**为何必须运行时探测、不能按公式推导**：该 UUID 是**随机 v4 并持久化**（存于系统分区的 `persist.identifier`）。已穷举 AOSP 各种 `nameUUIDFromBytes` 形式（`TaskSnapshots-0`、`-displayId`、`user-displayId` 等 8 种）**全部不匹配**——注意其版本号 nibble 为 `4`（随机），而 `nameUUIDFromBytes` 产出的是版本 `3`。故只能在运行时扫描出实际存在的那一个子目录；扫描不到则退回 `$SNAP_DIR` 本身，旧设备行为完全不变。
+
+#### 4.12.3 权限链：为什么必须在特权侧（实测证据）
+
+取快照的唯一入口带有权限校验。由 `framework.jar` 反编译得到的静态数组：
+
+```
+PERMISSIONS_getTaskSnapshotManager = {
+    "android.permission.MANAGE_ACTIVITY_TASKS",   // signature|privileged
+    "android.permission.READ_FRAME_BUFFER",       // signature|recents|role
+}
+```
+
+二者均为 signature 级。**真机实测**（同一 dex，仅 uid 不同）：
+
+| 调用方 uid | 结果 |
+|---|---|
+| `10209`（`untrusted_app`，即启动器自身） | ❌ `SecurityException: Access denied, requires: allOf={MANAGE_ACTIVITY_TASKS, READ_FRAME_BUFFER}` |
+| `0`（adbd root / Magisk su） | ✅ 通过 |
+
+**这印证了现有架构的正确性**：项目早已把 root 能力收敛到 `meego_daemon.sh` 单一特权点，本次**沿用该模式，不新增特权面、不改 sepolicy、不写 `/system`**。
+
+#### 4.12.4 实现：`scripts/TaskSnapBridge.java`
+
+```
+IActivityTaskManager.getTaskSnapshotManager()          ← 反射（@hide）
+ITaskSnapshotManager.getTaskSnapshot(taskId, 0L, res)  ← 反射
+TaskSnapshot.mSnapshot → android.hardware.HardwareBuffer
+Bitmap.wrapHardwareBuffer(hb, ColorSpace)              ← public API，无 hidden 调用
+Bitmap.compress(PNG) → ${tid}_sys.jpg
+```
+
+**像素链路完全不依赖 hidden API**：只有"取快照"那一步走反射，像素桥 `Bitmap.wrapHardwareBuffer` 是 public API（`compileSdk 35` 的 `android.jar` 里即有）。因此可在任意 compileSdk 下用 `javac` + `d8` 现编，**无需提交预编译 dex**（dex 与 ROM 强绑定，提交二进制等于焊死在某次刷机上）。
+
+调用形态（按需、非常驻）：
+
+```bash
+CLASSPATH=/data/local/tmp/meego_daemon_bridge.dex \
+  app_process / TaskSnapBridge <taskId> <resolution> <outPng>
+```
+
+stdout 输出**单行 JSON**（便于 shell 解析），任何失败一律输出 `{"ok":false,"error":"..."}` 并以非 0 退出，**绝不抛栈**——调用方是 shell，必须保证它总能拿到可解析的一行。
+
+**性能（Redmi K40 / 1080x2400 / Android 16 实测）**：
+
+| 阶段 | 耗时 |
+|---|---|
+| binder（取 `TaskSnapshot`） | 9 ms |
+| `wrapHardwareBuffer` | 11 ms |
+| PNG 编码 | 254 ms |
+| **合计** | **275 ms** |
+
+对比 `screencap -p` 的 **≈650ms**：更快，且**像素只含该任务窗口**。
+
+#### 4.12.5 三个必须留档的踩坑点
+
+1. **`resolution` 是第三个参数，且不可传 0**。真实签名为 `getTaskSnapshot(int taskId, long maxSnapshotAgeMillis, int resolution)`。把它当第二个传，会得到一个**极具误导性**的异常：`IllegalArgumentException: Invalidate resolution=0`——错误信息指向"值非法"，而真实原因是"参数位置错了"。合法值 1/2/3 均可。
+2. **`HardwareBuffer.writeToByteBuffer` / `lock` 在 Android 16 上被 hidden-api 屏蔽**，`getMethod` 直接抛 `NoSuchMethodException`，**不可用**；`getDeclaredMethods()` 枚举出来的清单里也确实没有它们。唯一可行的公开通路就是 `Bitmap.wrapHardwareBuffer`。
+3. **不存在 `android.graphics.NamedColorSpace` 类**（写错会得到 `ClassNotFoundException`）。正确形式是 `ColorSpace.get(ColorSpace.Named.SRGB)`，枚举类为 `android.graphics.ColorSpace$Named`。
+
+#### 4.12.6 软链的连带污染与拆除（本次自身发现并修掉）
+
+修正软链指向后**暴露了一个更隐蔽的污染**：`capture_current_screen` 里原本还有一处
+
+```bash
+cp -f "$TMP_PNG" "/data/local/tmp/snapshots/${target_tid}_live.png"
+```
+
+软链一旦指对，这行就会**穿过软链把自采的整屏帧写进 AOSP 独占管理的系统快照目录**。真机实测确实产出了垃圾文件：
+
+```
+/data/system_ce/0/snapshots/8930c050-.../691_live.png    ← root:root，我们的东西
+```
+
+`TaskSnapshotController` 的目录应由系统独占，混入外来文件会污染其 0700 语义，也让 `sync_from_system_snapshot` 的 `*.jpg` glob 与清理逻辑行为不可预期。
+
+**解法：直接拆掉软链** `/data/local/tmp/snapshots`，自采帧只写 `$APP_SNAP_DIR`（App 私有目录）。App 侧候选列表本就以 `filesDir/snapshots/` 为首选来源，软链只是历史兼容残留——移除它**零功能损失**，却彻底断掉了这条写入系统分区的意外路径。App 侧（`RootTaskProvider`）与 `update_tasks` 中对 `/data/local/tmp/snapshots` 的引用一并清理。
+
+#### 4.12.7 三级候选仲裁（App 侧唯一改动）
+
+`RootTaskProvider` 的候选列表插入 `${taskId}_sys.jpg`，**位置在最前**，它自动继承现有全部仲裁语义、零新增逻辑：
+
+| 改动 | 效果 |
+|---|---|
+| 插入候选 | 同 mtime 时优先取它；一旦更新（退后台瞬间生成）即自然压过 `_live.png` |
+| `snapshotIsSettled` | `!name.endsWith("_live.png")` → `_sys.jpg` 自动判为**稳定帧**，不会被 provisional 规则排除 |
+| `captureTimeMs` 取 mtime | 新鲜度仲裁自动生效，无需改判据 |
+
+候选优先级：**`_sys.jpg`（Task Snapshot 直读，仅任务窗口）> `_live.png`（退后台整屏帧）> `_reduced.jpg` / `.jpg`（系统持久化帧）**。
+
+顺带把散落两处的包名魔改收敛为单一函数 `normalizePackageName()`（守护脚本 awk 的 `gsub(/[^a-zA-Z0-9._]/,"")` 会连类名一起吃掉，包名退化时只剩前导点，故回落到已知值），避免魔改散落在解析与缓存两条路径上。
+
+#### 4.12.8 与 §4.11.4「按需抓帧不可行」的关系（务必保留）
+
+**该否证结论依然成立且必须保留**：手指落下后 30~50ms 内，无任何手段能产出干净像素——`screencap` 会被 Overlay 污染，而 TaskSnapshot 在应用**仍可见**时**根本不存在**（这正是 `capture_task_snapshot` 里那道 `gesture_active` 前置守卫的原因）。
+
+Task Snapshot 改善的是**帧龄上界**与**像素纯净度**，**不是**"手势期补抓"。本版**不引入任何 App↔守护进程的手势期按需通道**。
+
+#### 4.12.9 真机端到端验证（Redmi K40 / LineageOS 23.2 / Android 16）
+
+| 验证项 | 结果 |
+|---|---|
+| 系统快照同步恢复 | `690.jpg`（202,187 B）在 14:53 被同步进 App 私有目录——此前该链路零命中 |
+| 退后台自动补采 | 设置 → 时钟 切换后，`691_sys.jpg`（86,535 B）**自动生成**，无需任何手动指令 |
+| 像素纯净度 | 同任务同时刻对比：`691_live.png` 顶部含状态栏、底部含大块导航栏；`691_sys.jpg` 这两处为应用真实背景，**无系统栏** |
+| 分辨率 | `1080x2400`，与原图一致 |
+| `SNAPSHOT` 指令通道 | 经 `cmd_queue` 下发后由守护进程正确执行并落盘 |
+| 属主对齐 | 产物 `u0_a209:u0_a209`，App 可直接读取（root 写入需显式 `chown`，否则 `untrusted_app` 读不到） |
+| 失败路径 | 不存在的 taskId / `resolution=0` / 参数不足 三条均输出合法 JSON 且 `exit=1`，**无临时文件残留** |
+| 污染清除 | 拆除软链后系统快照目录不再出现 `_live.png`；已清理历史垃圾文件 |
+| 零回归 | v1.8.38 provisional 两级仲裁、v1.8.39 稳态节奏、划出手势、删除/一键清理均未触碰 |
+| 构建 | `:app:assembleDebug` 零错误、零新增警告 |
+
+#### 4.12.10 新增诊断能力
+
+`scripts/check_device.sh` 增加**快照链路诊断**段落——此类"安静地坏掉"的故障必须能被一条命令看出来：
+
+```
+=== 快照链路诊断 (Task Snapshot) ===
+  布局: 每用户 UUID 子目录 ✅ (Android 16)
+        /data/system_ce/0/snapshots/8930c050-f26d-495b-9e37-8bfd7d2c5871
+  系统快照张数: 12  ✅
+  ⚠️ App 侧快照落后系统侧 1699s —— 同步未生效（守护进程可能已死，见下方心跳）
+  ✅ TaskSnapBridge 已部署
+  ⚠️ 守护进程心跳已过期 4396s —— 主进程已死，Task Snapshot 管线不会更新
+```
+
+上线首日即以它**当场定位到两个既存故障**：同步链断裂与守护进程已死（因本机 `/system/etc/init/meego_daemon.rc` 不存在、`/data/adb/service.d/` 为空，**当前无开机自启能力**——此为既有状况，非本版引入，另行议题处理）。
 
 ---
 

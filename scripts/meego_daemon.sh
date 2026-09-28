@@ -14,10 +14,55 @@ TASKS_JSON="/data/local/tmp/recent_tasks.json"
 SNAP_DIR="/data/system_ce/0/snapshots"
 LINK_DIR="/data/local/tmp/snapshots"
 
+# 特权侧 Task Snapshot 直读桥（v1.8.40 新增）
+# 由 deploy.sh 用 javac + d8 编译本仓 scripts/TaskSnapBridge.java 得到，
+# 常驻于 root 目录（App uid 加载 dex 会被 "Writable dex file" 策略拒绝，
+# 故此处 root:root 755 恰是所需形态），由本脚本按需以 app_process 调用。
+BRIDGE_DEX="/data/local/tmp/meego_daemon_bridge.dex"
+
 APP_DIR="/data/user/0/com.meego.launcher/files"
 APP_CMD_DIR="$APP_DIR/cmd_queue"
 APP_TASKS_JSON="$APP_DIR/recent_tasks.json"
 APP_SNAP_DIR="$APP_DIR/snapshots"
+
+# ---------------------------------------------------------------------------
+# 0.0 系统快照的真实目录（v1.8.40 修复 Android 16 布局变更）
+# ---------------------------------------------------------------------------
+# 【这是一个已造成实质损害的既存 Bug，非预防性改动】
+#
+# Android 16 起，AOSP TaskSnapshotController 把快照改为**每用户一个 UUID 子目录**：
+#
+#   /data/system_ce/0/snapshots/8930c050-f26d-495b-9e37-8bfd7d2c5871/{689}.jpg
+#                                                        {689}_reduced.jpg
+#                                                        {689}.proto
+#
+# 而本脚本此前一直按**扁平路径** $SNAP_DIR/${tid}_reduced.jpg 取帧。实测后果：
+#
+#   $ ls /data/system_ce/0/snapshots/*_reduced.jpg
+#   ls: ... No such file or directory        ← 零命中
+#
+# 即 sync_from_system_snapshot() / update_tasks() 里的系统快照同步
+# **自升级以来一条都没生效过**。设备侧证据：App 私有目录里最新的
+# _reduced.jpg 停在 13:36，而系统侧 14:11 的新快照从未同步下来。
+# 这意味着 v1.8.38/v1.8.39 反复调优的「稳态帧龄」建立在一个从未接上系统
+# 快照的降级管线上 —— 修好本项的收益大于任何新功能。
+#
+# 【为何必须运行时探测、不能按公式推导】
+# 该 UUID 是**随机 v4 并持久化**（存于 system 分区的 persist.identifier），
+# 无法由 userId/displayId 推导。已穷举 AOSP 各种 nameUUID 形式
+# （TaskSnapshots-0、-displayId、user-displayId 等 8 种）全部不匹配。
+# 故只能在运行时扫描出实际存在的那一个子目录。
+#
+# 【向后兼容】若子目录不存在（仍为扁平布局的系统），退回 $SNAP_DIR 本身，
+# 旧设备行为完全不变。
+SNAP_USER_DIR="$SNAP_DIR"
+for _snap_sub in "$SNAP_DIR"/*/; do
+    if [ -d "$_snap_sub" ]; then
+        SNAP_USER_DIR="${_snap_sub%/}"
+        break
+    fi
+done
+unset _snap_sub
 
 # ---------------------------------------------------------------------------
 # 0.1 稳态快照刷新节奏（v1.8.39）
@@ -257,12 +302,33 @@ ensure_system_settings() {
 ensure_system_settings
 
 # 3. 建立快照软链接并保持权限
-if [ -d "$SNAP_DIR" ]; then
+#
+# 【v1.8.40：链接目标由 $SNAP_DIR 改为 $SNAP_USER_DIR】
+# 此前指向父目录，于是 /data/local/tmp/snapshots/689_reduced.jpg 这类路径
+# 实际不存在（真机实测：No such file or directory）—— 与 UUID 子目录 Bug
+# 同源，两处一并修正。
+#
+# 【但由此暴露一个更隐蔽的污染，本版一并堵死】
+# 链接一旦指对，capture_current_screen 里那两处
+#     cp "$TMP_PNG" "/data/local/tmp/snapshots/${tid}_live.png"
+# 就会**穿过软链写进系统快照目录**。真机实测后果：
+#     /data/system_ce/0/snapshots/8930c050-.../691_live.png   ← root:root, 我们的垃圾
+# 即把自采的整屏帧混进了 AOSP 自己的快照目录。那里应由 TaskSnapshotController
+# 独占管理，混入外来文件会污染其 0700 目录语义，也会让
+# sync_from_system_snapshot 的 `*.jpg` glob 与清理逻辑行为变得不可预期。
+#
+# 解法：**去掉软链**，改为把自采帧只写进 $APP_SNAP_DIR（App 私有目录）。
+# 本项目所有 App 侧候选路径本来就优先读 filesDir/snapshots/（见
+# RootTaskProvider 的 candidateFiles 顺序），软链只是历史兼容残留，
+# 移除它零功能损失，却彻底断掉这条写入系统分区的意外路径。
+if [ -L "$LINK_DIR" ] || [ -e "$LINK_DIR" ]; then
     rm -rf "$LINK_DIR"
-    ln -s "$SNAP_DIR" "$LINK_DIR"
+fi
+if [ -d "$SNAP_USER_DIR" ]; then
     chmod 755 /data/system_ce /data/system_ce/0 2>/dev/null || true
     chmod 755 "$SNAP_DIR" 2>/dev/null || true
-    chmod 644 "$SNAP_DIR"/* 2>/dev/null || true
+    chmod 755 "$SNAP_USER_DIR" 2>/dev/null || true
+    chmod 644 "$SNAP_USER_DIR"/* 2>/dev/null || true
 fi
 
 # 4. 捕获当前屏幕画面到 snapshots/${target_tid}_live.png 与 current_app.png
@@ -302,12 +368,14 @@ capture_current_screen() {
 
     if [ -s "$TMP_PNG" ]; then
         if [ -n "$target_tid" ]; then
-            mkdir -p /data/local/tmp/snapshots
-            cp -f "$TMP_PNG" "/data/local/tmp/snapshots/${target_tid}_live.png" 2>/dev/null || true
-            chmod 666 "/data/local/tmp/snapshots/${target_tid}_live.png" 2>/dev/null || true
-
+            # 【v1.8.40】自采帧只写 App 私有目录。原先还额外往
+            # /data/local/tmp/snapshots/ 写一份，而那个路径曾是通往系统快照目录的
+            # 软链 —— 修正软链指向后，它会把我们的整屏帧写进 AOSP 独占管理的
+            # 目录（真机实测产出过 691_live.png）。该副本本就无人可靠读取
+            # （App 侧候选列表优先读 filesDir），删除零功能损失。
             mkdir -p "$APP_SNAP_DIR" 2>/dev/null || true
             cp -f "$TMP_PNG" "$APP_SNAP_DIR/${target_tid}_live.png" 2>/dev/null || true
+            chown "$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null)" "$APP_SNAP_DIR/${target_tid}_live.png" 2>/dev/null || true
             chmod 666 "$APP_SNAP_DIR/${target_tid}_live.png" 2>/dev/null || true
 
             # provisional 标记：只维护在 App 私有目录（App 只能可靠读取自身 filesDir）
@@ -373,10 +441,7 @@ capture_backgrounding() {
     fi
 
     if [ -s "$bg_tmp" ]; then
-        mkdir -p /data/local/tmp/snapshots 2>/dev/null || true
-        cp -f "$bg_tmp" "/data/local/tmp/snapshots/${bg_tid}_live.png" 2>/dev/null || true
-        chmod 666 "/data/local/tmp/snapshots/${bg_tid}_live.png" 2>/dev/null || true
-
+        # 【v1.8.40】同 capture_current_screen：不再经软链写系统快照目录
         mkdir -p "$APP_SNAP_DIR" 2>/dev/null || true
         cp -f "$bg_tmp" "$APP_SNAP_DIR/${bg_tid}_live.png" 2>/dev/null || true
         chmod 666 "$APP_SNAP_DIR/${bg_tid}_live.png" 2>/dev/null || true
@@ -409,12 +474,22 @@ expire_stale_provisionals() {
 #     周期性地用系统权威快照刷新陈旧的 live 帧。系统快照内容与 mtime 均已实测可靠
 #     （实测某任务 _live.png 老化 3725s 而 _reduced.jpg 仅 0s），此处仅在系统快照
 #     确实更新时同步，避免无谓 I/O。
+#
+# 【v1.8.40 两处修复】
+#  (a) glob 由 "$SNAP_DIR"/*_reduced.jpg 改为 "$SNAP_USER_DIR"/*_reduced.jpg
+#      —— 前者在 Android 16 上零命中（见 0.0 节），本函数此前形同虚设。
+#  (b) 由「只搬 _reduced.jpg」扩展为**同时搬全分辨率 .jpg**。
+#      原实现只同步 reduced（540x1200，实测 28~41KB），而全分辨率
+#      （1080x2400，实测 70~198KB）才是多任务卡片真正该用的那一档 ——
+#      reduced 只是丢失细节的降级产物。此前全分辨率帧从未被搬进 App 目录。
 sync_from_system_snapshot() {
-    for sf in "$SNAP_DIR"/*_reduced.jpg; do
+    [ -d "$SNAP_USER_DIR" ] || return
+    for sf in "$SNAP_USER_DIR"/*.jpg; do
         [ -f "$sf" ] || continue
         b=$(basename "$sf")
         case "$b" in
             *_reduced.jpg) s_tid="${b%_reduced.jpg}" ;;
+            *.jpg)         s_tid="${b%.jpg}" ;;
             *) continue ;;
         esac
         [ -z "$s_tid" ] && continue
@@ -423,9 +498,71 @@ sync_from_system_snapshot() {
         # 仅当 App 私有目录缺失或比系统快照更旧时才同步
         if [ ! -f "$dest" ] || [ "$sf" -nt "$dest" ]; then
             cp -f "$sf" "$dest" 2>/dev/null || true
+            # 属主对齐 App uid，否则 App（untrusted_app）读不到 root 拷贝的文件。
+            # 沿用 ensure_app_dirs 的做法：目录属主即 App uid。
+            chown "$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null)" "$dest" 2>/dev/null || true
             chmod 666 "$dest" 2>/dev/null || true
         fi
     done
+}
+
+# 4.5 真实任务快照直读（v1.8.40 新增，Task Snapshot 管线核心）
+#
+# 【与 screencap 的本质区别 —— 这是本函数存在的全部理由】
+# capture_current_screen 走 `screencap -p`，抓的是**整块物理屏幕**，于是
+# 每一张多任务卡片里都混进了状态栏、导航栏、挖孔留白（实测本机 contentInsets
+# 为 [0,105][0,66]，即顶部 105px 挖孔 + 底部 66px 导航栏），在纯黑 MeeGo
+# 卡片上一眼就能看出「这不是这个应用的画面」。
+#
+# AOSP 为每个任务维护了一份**只含该任务窗口**的真实快照，由
+# TaskSnapshotController 在任务「变不可见」那一刻抓取。本函数通过
+# TaskSnapBridge 走 IActivityTaskManager.getTaskSnapshotManager() 把那份
+# 快照的真实像素取出，绕过整屏污染。
+#
+# 【为何必须在 root 侧（实测结论，勿删本注释）】
+# getTaskSnapshotManager 权限为 allOf={MANAGE_ACTIVITY_TASKS,
+# READ_FRAME_BUFFER}，二者皆 signature 级。实测：
+#   uid=10209（untrusted_app）→ SecurityException: Access denied
+#   uid=0 / adb shell          → 通过
+#
+# 【性能】实测 275ms（binder 9ms + wrap 11ms + PNG 254ms），
+# 对比 screencap -p 的 ≈650ms，且像素只含任务窗口。
+#
+# 【与 §4.11.4「按需抓帧不可行」的关系】
+# 该否证结论依然成立：手势开始后 30~50ms 内无任何手段能产出干净像素。
+# 本函数改善的是**帧龄**与**像素纯净度**，不是手势期补抓，因此
+# 不接受 SNAPSHOT 指令的「手势期突发」用法。
+#
+# 产物：$APP_SNAP_DIR/${tid}_sys.jpg（仅任务窗口，1080x2400）
+# 失败：不留残留文件，返回非 0，由调用方决定是否回退到 screencap。
+SNAPSHOT_RESOLUTION=1
+capture_task_snapshot() {
+    st_tid="$1"
+    [ -z "$st_tid" ] && return 1
+    [ -f "$BRIDGE_DEX" ] || return 1
+
+    # 手势进行中不取：此刻任务仍可见，系统尚未为其抓快照，
+    # 强行调用只会得到 null，白白浪费一次 app_process 冷启动。
+    [ -f /data/local/tmp/gesture_active ] && return 1
+
+    mkdir -p "$APP_SNAP_DIR" 2>/dev/null || true
+    st_out="$APP_SNAP_DIR/${st_tid}_sys.jpg"
+
+    st_json=$(CLASSPATH="$BRIDGE_DEX" app_process / TaskSnapBridge \
+                  "$st_tid" "$SNAPSHOT_RESOLUTION" "$st_out" 2>/dev/null | head -1)
+
+    case "$st_json" in
+        *'"ok":true'*)
+            chown "$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null)" "$st_out" 2>/dev/null || true
+            chmod 666 "$st_out" 2>/dev/null || true
+            return 0
+            ;;
+        *)
+            # 失败时清掉可能存在的半成品，避免 App 把残缺文件当成有效帧
+            rm -f "$st_out" 2>/dev/null || true
+            return 1
+            ;;
+    esac
 }
 
 # 4.1 应用切换后的加密抓帧窗口
@@ -458,7 +595,8 @@ start_settle_window() {
 update_tasks() {
     chmod 755 /data/system_ce /data/system_ce/0 2>/dev/null || true
     chmod 755 "$SNAP_DIR" 2>/dev/null || true
-    chmod 644 "$SNAP_DIR"/* 2>/dev/null || true
+    chmod 755 "$SNAP_USER_DIR" 2>/dev/null || true
+    chmod 644 "$SNAP_USER_DIR"/* 2>/dev/null || true
 
     TMP_FILE="/data/local/tmp/recent_tasks_${MY_PID}_${RANDOM}.tmp"
     echo "[" > "$TMP_FILE"
@@ -491,23 +629,27 @@ update_tasks() {
         [ -z "$tid" ] && continue
 
         # 同步系统真实快照到 App 私有目录并赋予可读权限
+        # 【v1.8.40】路径改指 $SNAP_USER_DIR（Android 16 的 UUID 子目录），
+        # 与 0.0 节 / sync_from_system_snapshot 保持一致，否则此处同样零命中。
         mkdir -p "$APP_SNAP_DIR" 2>/dev/null || true
-        if [ -f "$SNAP_DIR/${tid}_reduced.jpg" ]; then
-            cp -f "$SNAP_DIR/${tid}_reduced.jpg" "$APP_SNAP_DIR/${tid}_reduced.jpg" 2>/dev/null || true
-            chmod 666 "$APP_SNAP_DIR/${tid}_reduced.jpg" 2>/dev/null || true
-        fi
-        if [ -f "$SNAP_DIR/${tid}.jpg" ]; then
-            cp -f "$SNAP_DIR/${tid}.jpg" "$APP_SNAP_DIR/${tid}.jpg" 2>/dev/null || true
-            chmod 666 "$APP_SNAP_DIR/${tid}.jpg" 2>/dev/null || true
-        fi
+        for sys_snap in "$SNAP_USER_DIR/${tid}_reduced.jpg" "$SNAP_USER_DIR/${tid}.jpg"; do
+            [ -f "$sys_snap" ] || continue
+            b=$(basename "$sys_snap")
+            cp -f "$sys_snap" "$APP_SNAP_DIR/$b" 2>/dev/null || true
+            chown "$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null)" "$APP_SNAP_DIR/$b" 2>/dev/null || true
+            chmod 666 "$APP_SNAP_DIR/$b" 2>/dev/null || true
+        done
 
-        snap_path="$APP_SNAP_DIR/${tid}_live.png"
+        # 候选优先级：Task Snapshot 直读帧 > 退后台整屏帧 > 系统 reduced > 系统全分辨率
+        # 【v1.8.40】最末位的 /data/local/tmp/snapshots 回退已移除（软链不再存在，
+        # 见第 3 节）。App 侧 RootTaskProvider 同样以 filesDir 为首选来源。
+        snap_path="$APP_SNAP_DIR/${tid}_sys.jpg"
         if [ ! -f "$snap_path" ]; then
-            snap_path="$APP_SNAP_DIR/${tid}_reduced.jpg"
+            snap_path="$APP_SNAP_DIR/${tid}_live.png"
             if [ ! -f "$snap_path" ]; then
-                snap_path="$APP_SNAP_DIR/${tid}.jpg"
+                snap_path="$APP_SNAP_DIR/${tid}_reduced.jpg"
                 if [ ! -f "$snap_path" ]; then
-                    snap_path="/data/local/tmp/snapshots/${tid}_live.png"
+                    snap_path="$APP_SNAP_DIR/${tid}.jpg"
                 fi
             fi
         fi
@@ -560,14 +702,25 @@ execute_command() {
                 setsid /system/bin/sh -c "nohup \"$DAEMON_SCRIPT\" >/data/local/tmp/daemon.log 2>&1" >/dev/null 2>&1 &
             fi
             ;;
+        SNAPSHOT)
+            # 显式按需导出某任务的真实快照（仅任务窗口，无系统栏污染）。
+            # App 侧目前不主动发这条指令（手势期按需抓帧已被 §4.11.4 否证），
+            # 保留它是为了：1) 部署后自检；2) 将来「多任务屏打开时补齐全部卡片」
+            # 这类**非手势期**的按需补采。
+            if [ -n "$arg" ]; then
+                capture_task_snapshot "$arg"
+            fi
+            ;;
         REMOVE)
             if [ -n "$arg" ]; then
                 tid="$arg"
                 # 1. 彻底从系统 Activity 任务栈中移除
                 am stack remove "$tid" 2>/dev/null || true
                 # 2. 清理系统快照及缓存
-                rm -f "/data/system_ce/0/snapshots/${tid}"* 2>/dev/null || true
-                rm -f "/data/local/tmp/snapshots/${tid}"* 2>/dev/null || true
+                # 【v1.8.40】路径改指 $SNAP_USER_DIR：此前指 $SNAP_DIR（父目录），
+                # 在 Android 16 上等于删了个空目录，系统快照会永久残留并被
+                # sync_from_system_snapshot 反复搬回。
+                rm -f "$SNAP_USER_DIR/${tid}"* 2>/dev/null || true
                 rm -f "$APP_SNAP_DIR/${tid}"* 2>/dev/null || true
                 # 3. 彻底杀死该包名的全部后台进程
                 if [ -n "$pkg" ] && [ "$pkg" != "com.meego.launcher" ] && [ "$pkg" != "com.android.launcher3" ]; then
@@ -603,8 +756,8 @@ execute_command() {
             ' | while read -r tid pkg; do
                 if [ -n "$tid" ]; then
                     am stack remove "$tid" 2>/dev/null || true
-                    rm -f "/data/system_ce/0/snapshots/${tid}"* 2>/dev/null || true
-                    rm -f "/data/local/tmp/snapshots/${tid}"* 2>/dev/null || true
+                    # 【v1.8.40】同 REMOVE 分支：改指 $SNAP_USER_DIR
+                    rm -f "$SNAP_USER_DIR/${tid}"* 2>/dev/null || true
                     rm -f "$APP_SNAP_DIR/${tid}"* 2>/dev/null || true
                 fi
                 if [ -n "$pkg" ] && [ "$pkg" != "com.meego.launcher" ] && [ "$pkg" != "com.android.launcher3" ]; then
@@ -710,6 +863,14 @@ monitor_current_app() {
                     old_pkg=$(echo "$LAST_RESUMED" | cut -d: -f2 | cut -d/ -f1)
                     if [ -n "$old_tid" ] && [ "$old_tid" != "$tid" ]; then
                         capture_backgrounding "$old_tid" "$old_pkg"
+                        # ===== v1.8.40 新增：退后台瞬间取系统权威快照 =====
+                        # AOSP TaskSnapshotController 恰在「任务变不可见」这一刻
+                        # 抓取该任务快照，所以此刻调用 getTaskSnapshot 命中率最高、
+                        # 帧龄最小。产物 _sys.jpg 只含任务窗口，是卡片最该用的一档。
+                        # 与 capture_backgrounding 并列而非取代：后者是整屏
+                        # screencap（含系统栏），在应用刚退后台、系统尚未落盘时
+                        # 仍能立刻给出一帧；二者由 App 侧仲裁层按 mtime 取优。
+                        capture_task_snapshot "$old_tid"
                     fi
                 fi
 
@@ -765,6 +926,13 @@ monitor_current_app() {
                         sleep 0.35
                     fi
                     capture_backgrounding "$old_tid" "$old_pkg"
+                    # 【v1.8.40】同上：退后台瞬间取系统权威快照。
+                    # 这里尤其重要 —— 它是「划出返回启动器」的主路径，
+                    # 也正是用户抱怨「卡片画面是几秒前的旧画面」的那条路径。
+                    # capture_backgrounding 自带 gesture_active 前置守卫，
+                    # 此刻遮罩已淡出，抓到的是应用最终态；随后系统快照落盘，
+                    # _sys.jpg 以更纯净的像素在同一仲裁层里顶掉它。
+                    capture_task_snapshot "$old_tid"
                     update_tasks
                 fi
                 LAST_RESUMED=""

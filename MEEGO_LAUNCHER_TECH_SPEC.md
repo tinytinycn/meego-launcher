@@ -153,6 +153,7 @@ systemProp.https.proxyPort=1087
    - **部署位置**：`push` + `chmod` 到 `/data/local/tmp`；开机自启由 Magisk `service.d` 钩子承担。
    - **设备已安装 Magisk（30.7）**：系统层面已具备「不经 `adb root` 也能取得 root」的能力 —— 实测 `su -c id` → `uid=0(root)`、`context=u:r:magisk:s0`。当前 `deploy.sh` 的前置检查仍是「`adb shell` 必须为 uid 0」并 fail fast，**尚未**接入 `su` 分支；若要支持仅有 Magisk 的 `user` 构建，需在部署脚本中加入该分支。
    - **需要改动 `/system` 内容时**（例如把启动器装成 privapp 以直接持有签名级权限），走 **Magisk 模块叠加（magic mount）**：它在挂载命名空间内叠加文件，**不写真实分区**。真实分区当前以 `ro` 挂载（`/proc/mounts`：`/dev/block/dm-1 / ext4 ro,…`），直接 `remount,rw` 后写真实分区不是受支持路径。
+   - ⚠️ **但「装成 privapp 就能直接拿到那两个签名级权限」这个设想经评估不成立** —— 这两个权限不带 `privileged` 标志，白名单 XML 对它们无效。完整核查、修正后的可行路径与替代方案见 [`docs/PRIVAPP_INPROCESS_TASKSNAPSHOT_EVAL.md`](docs/PRIVAPP_INPROCESS_TASKSNAPSHOT_EVAL.md)。
    - **部署顺序固定为「watchdog 先、主进程后」**：先以双重 `setsid` 预置一个独立 watchdog 并等其落定，再拉起主进程。顺序不可颠倒，原因见 §2.7.1。
 5. **`scripts/screenshot.sh`**：
    - 通过 ADB 执行底层 `exec-out screencap -p` 捕获物理机最新屏幕快照至 `screenshots/` 目录，供 UI 还原度核查。

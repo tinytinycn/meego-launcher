@@ -1139,12 +1139,31 @@ class EdgeSwipeGestureService : AccessibilityService() {
                 }
             }
 
-            // b. 文件仲裁：同池取 mtime 最大者，跳过 provisional 帧
+            // b. 文件仲裁：优先在「已稳定」池中取 mtime 最大者，跳过 provisional 帧
             val files = snapshotCandidates(currentTaskId, curPkg)
-            val nonProvisional = files.filter { !isProvisionalLive(it, currentTaskId) }
-            val pool = if (nonProvisional.isNotEmpty()) nonProvisional else emptyList()
+            val stablePool = files.filter { !isProvisionalLive(it, currentTaskId) }
 
-            val chosen = if (pool.isNotEmpty()) pickFreshestFile(pool, currentTaskId) else null
+            val chosen = pickFreshestFile(stablePool, currentTaskId)
+                // b1. 稳定池里**没有真正可用的文件**（应用仍处于启动动画期，live 帧被标记
+                //     为 provisional，而系统快照尚未落盘）时，改取最新的 provisional 帧作为
+                //     **临时占位**真实展示。
+                //
+                // 关键产品决策修复（v1.8.38）：此前此处直接降级为应用图标，实测导致
+                // **「刚进入应用、立刻边缘划出」时划出卡片只显示应用图标**，而非应用画面。
+                // 但此刻用户正看着这台设备完成启动 —— 我们手里的 provisional 帧
+                // 恰恰就是**他刚刚看到的那个画面**。把一个正在被注视的真实画面替换成
+                // 一个图标，是信息量上的净损失；且此时根本没有别的候选可用。
+                //
+                // 判据必须是「稳定池**解析不出**文件」而非「稳定池**列表**为空」：
+                // 候选列表里通常已含 `${tid}.jpg` / `${tid}_reduced.jpg` 等路径，
+                // 它们在应用刚启动时**并不存在**，列表非空却无一可用。
+                //
+                // 该帧以 `isSettled = false` 写入内存缓存，绝不进入稳定帧权威通道；
+                // 应用稳定后守护进程的退后台采集 / 稳态低频刷新会以更新的 mtime
+                // 在下一次仲裁中自然顶掉它 —— 与 AOSP `TaskThumbnailUiState.SnapshotSplash`
+                // 「splash 仅作临时占位、真实快照到达即替换」的语义一致。
+                ?: pickFreshestFile(files, currentTaskId)
+
             if (chosen != null) {
                 val (file, prov) = chosen
                 val bmp = loadBitmapFromFile(file.absolutePath)
@@ -1154,19 +1173,18 @@ class EdgeSwipeGestureService : AccessibilityService() {
                         captureTimeMs = file.lastModified(),
                         isSettled = !prov
                     )
-                    Log.d(TAG, "Picked freshest snapshot ${file.name} for task $currentTaskId ($curPkg) settled=${!prov}")
+                    if (prov) {
+                        Log.d(TAG, "Using provisional live frame ${file.name} as a real placeholder for task $currentTaskId ($curPkg)")
+                    } else {
+                        Log.d(TAG, "Picked freshest snapshot ${file.name} for task $currentTaskId ($curPkg) settled=true")
+                    }
                     return bmp
                 }
             }
 
-            // c. 全部文件候选均为 provisional（应用仍处于启动动画期）：
-            //    此时任何截图都是误导性的半渲染画面，按产品决策降级为图标占位，
-            //    即返回 null，由调用方渲染应用图标 + 名称。
-            if (files.isNotEmpty() && pool.isEmpty()) {
-                Log.d(TAG, "All snapshot candidates for task $currentTaskId ($curPkg) are provisional; degrade to icon")
-            }
-
-            // d. 严格隔离：若该任务尚无任何快照，坚决不读取其他任务的画面
+            // c. 该任务确实一个可用文件都没有（守护进程尚未抓到第一帧）。
+            //    此时返回 null，由调用方渲染应用图标 + 名称 —— 这才是图标唯一该出场
+            //    的场景：手上一帧都没有，而不是「有帧但嫌它不够稳」。
             Log.w(TAG, "No usable snapshot for task $currentTaskId ($curPkg)")
             null
         } catch (e: Exception) {

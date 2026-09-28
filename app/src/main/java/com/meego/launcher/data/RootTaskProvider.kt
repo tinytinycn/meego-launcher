@@ -83,14 +83,34 @@ class RootTaskProvider(private val context: Context) {
                             false
                         }
 
-                        // 1.3 同池取 mtime 最大者；provisional 的 live 帧不参与仲裁，
-                        //     也不写入内存缓存（防止污染 TaskSnapshotCache 权威版本）
+                        // 1.3 同池取 mtime 最大者。
+                        //
+                        // 关键（v1.8.38）：**稳定池优先，provisional 帧不与之竞争，但绝不丢弃**。
+                        // 先在非 provisional 候选中仲裁出最优帧；只有当该池**为空**（应用仍处于
+                        // 启动动画期、系统快照尚未落盘）时，才退而取最新的 provisional 帧作为
+                        // **临时占位**真实展示。
+                        //
+                        // 此前实现把 provisional 帧从仲裁中整个排除并让 `snapshot` 保持 null，
+                        // 卡片遂降级为纯图标 —— 实测表现为「刚进入应用、立刻边缘划出时，
+                        // 划出卡片与多任务卡片都只显示应用图标」。但此刻用户刚刚亲眼看着这台
+                        // 设备完成启动，他手里的 provisional 帧正是他**刚刚看到的那个画面**，
+                        // 用图标替换它是信息量的净损失。故此处对齐 AOSP
+                        // `TaskThumbnailUiState.SnapshotSplash` 语义：临时占位、真实帧到达即替换。
+                        //
+                        // 时效性保证：provisional 帧以 `isSettled = false` 写入内存缓存，
+                        // 不污染稳定帧权威通道；应用稳定后守护进程的退后台采集 / 稳态低频
+                        // 刷新会以更新的 mtime 在下一次仲裁中自然顶掉它。
                         var bestFile: File? = null
                         var bestTime = Long.MIN_VALUE
-                        for (file in candidateFiles) {
+                        val stableCandidates = if (isProvisional) {
+                            candidateFiles.filterNot { it.name.endsWith("_live.png") }
+                        } else {
+                            candidateFiles
+                        }
+                        // 先在稳定池仲裁
+                        for (file in stableCandidates) {
                             try {
                                 if (!file.exists() || !file.canRead() || file.length() <= 0) continue
-                                if (isProvisional && file.name.endsWith("_live.png")) continue
                                 val t = file.lastModified()
                                 if (t > bestTime) {
                                     bestTime = t
@@ -100,6 +120,21 @@ class RootTaskProvider(private val context: Context) {
                                 // ignore
                             }
                         }
+                        // 稳定池为空时才动用 provisional 帧作临时占位
+                        if (bestFile == null && isProvisional) {
+                            for (file in candidateFiles) {
+                                try {
+                                    if (!file.exists() || !file.canRead() || file.length() <= 0) continue
+                                    val t = file.lastModified()
+                                    if (t > bestTime) {
+                                        bestTime = t
+                                        bestFile = file
+                                    }
+                                } catch (e: Exception) {
+                                    // ignore
+                                }
+                            }
+                        }
 
                         if (bestFile != null) {
                             try {
@@ -107,7 +142,8 @@ class RootTaskProvider(private val context: Context) {
                                 if (bmp != null) {
                                     snapshotBitmap = bmp
                                     snapshotTimeMs = bestTime
-                                    // 系统快照（_reduced.jpg / .jpg）视为稳定帧
+                                    // 系统快照（_reduced.jpg / .jpg）视为稳定帧；
+                                    // provisional live 帧仅作临时占位
                                     snapshotIsSettled = !bestFile.name.endsWith("_live.png")
                                     TaskSnapshotCache.put(
                                         taskId, bmp, null,
@@ -312,8 +348,8 @@ class RootTaskProvider(private val context: Context) {
                 }
 
                 // 尝试从持久化快照目录中读取快照
-                // 注意：仍处于启动动画期的 provisional 帧在此同样不可信（会复活 splash），
-                // 故与主路径保持一致，先排除 provisional 再选帧。
+                // provisional 帧仅作**临时占位**、不进入稳定帧权威通道（见主路径 1.3 的同源决策）：
+                // 应用稳定后守护进程产出的稳定帧会以更新的 mtime 在下一次仲裁中自然顶掉它。
                 val localProvisional = try {
                     File(context.filesDir, "snapshots/${taskId}_live.provisional").exists()
                 } catch (e: Exception) {
@@ -330,9 +366,16 @@ class RootTaskProvider(private val context: Context) {
                         File("/data/local/tmp/snapshots/${taskId}_reduced.jpg"),
                         File("/data/local/tmp/snapshots/${taskId}.jpg")
                     )
-                    for (file in candidateFiles) {
+                    // 稳定池优先；为空时才取 provisional live 帧作临时占位
+                    val ordered = if (localProvisional) {
+                        candidateFiles.filterNot { it.name.endsWith("_live.png") } + candidateFiles.filter { it.name.endsWith("_live.png") }
+                    } else {
+                        candidateFiles
+                    }
+                    for (file in ordered) {
                         if (file.exists() && file.canRead()) {
-                            if (localProvisional && file.name.endsWith("_live.png")) continue
+                            // 稳定池已取到帧后，provisional live 帧不再参与
+                            if (localProvisional && file.name.endsWith("_live.png") && snapshotBitmap != null) continue
                             try {
                                 snapshotBitmap = BitmapFactory.decodeFile(file.absolutePath)
                                 if (snapshotBitmap != null) {

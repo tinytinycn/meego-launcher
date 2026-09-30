@@ -140,33 +140,110 @@ class EdgeSwipeGestureService : AccessibilityService() {
     override fun onAccessibilityEvent(event: android.view.accessibility.AccessibilityEvent?) {
         if (event == null) return
         if (event.eventType == android.view.accessibility.AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
-            val pkg = event.packageName?.toString() ?: return
-            // v1.8.45：任何窗口状态变化都触发一次**现查**式重算。
+            // v1.8.45/v1.8.47：任何窗口状态变化都触发一次**现查**式重算。
             //
-            // 【关键：事件只作「何时去查」，不作「是什么」】
-            // 绝不能把「收到 SystemUI 事件」直接等同于「通知栏正在显示」——
-            // 真机实测收起动画期间 SystemUI 会补发自己的窗口事件，
-            // 那样做会把标记留在错误的 true 上（详见 [refreshSystemOverlayState]）。
-            // 无论事件来自谁，一律现查当前窗口状态，由 [querySystemOverlayShowing]
-            // 给出唯一结论。
+            // 【贯穿两次修复的同一条原则：事件只作「何时去查」，不作「是什么」】
+            // ① v1.8.45：绝不能把「收到 SystemUI 事件」等同于「通知栏正在显示」——
+            //    收起动画期间 SystemUI 会补发自己的窗口事件（见 [refreshSystemOverlayState]）。
+            // ② v1.8.47：更不能把「事件包名 ≠ 本应用」等同于「用户进入了第三方应用」——
+            //    解锁瞬间锁屏前的应用会补发迟到事件（见 [refreshForegroundState]）。
+            // 两次都是「事件只描述变化、不描述现状」，故结论一律现查窗口列表得出。
             refreshSystemOverlayState()
-            if (pkg != packageName) {
-                // 进入了第三方应用（例如系统设置 com.android.settings），确保手势触发区处于激活状态
-                updateInLauncher(false)
-                if (LaunchOriginTracker.currentPackageName != pkg) {
-                    LaunchOriginTracker.currentPackageName = pkg
-                    // 关键：包名发生变更，之前的 taskId 必然失效！立即清空，杜绝跨应用残留！
-                    LaunchOriginTracker.currentTaskId = null
-                    updateCurrentTaskIdForPackage(pkg)
-                }
-            } else if (event.className?.toString()?.contains("MainActivity") == true) {
-                // 仅当真正回到桌面 MainActivity 且不在手势拖拽中时才隐藏触发区
-                if (!isDraggingCard) {
-                    updateInLauncher(true)
-                    LaunchOriginTracker.reset()
-                }
+            refreshForegroundState()
+        }
+    }
+
+    /**
+     * 依「当前持有焦点的**应用窗口**」重算前台身份，并同步触发区显隐（v1.8.47 新增）。
+     *
+     * 【为何必须现查，而不能采信事件的 packageName —— 真机实测的缺陷】
+     * 缺陷现象：**锁屏后解锁回到桌面，第一次边缘侧滑必然会划出一张陈旧应用卡片**
+     * （且该应用其实并不在后台，多任务屏也没有它的卡片）。
+     *
+     * 真机日志（Redmi K40 / LineageOS 23.2 / Android 16）：
+     * ```
+     * WINSTATE pkg=com.android.settings cls=...SettingsHomepageActivity inLauncher=false
+     * ```
+     * 根因：解锁瞬间，**锁屏前那个应用**（此处为系统设置）会补发一个迟到的
+     * 窗口状态事件。而旧实现把「事件包名 ≠ 本应用」**直接等同于
+     * 「用户进入了第三方应用」**，于是：
+     *   1. `updateInLauncher(false)` —— 触发区在**桌面之上**被设为可见；
+     *   2. `LaunchOriginTracker.currentPackageName` 被写成那个陈旧应用 ——
+     *      划出动画拿它去找快照（任务早已不存在）→ 降级为该应用的**图标**。
+     * 两者相乘即用户所见「第一次侧滑必然划出某个应用的图标卡片」。
+     *
+     * 【修法】结论只由 [queryFocusedApplicationWindow] 现查得出：
+     * 焦点应用窗口是**本桌面** → 在桌面内；是**别的应用** → 在应用内。
+     * 那个迟到的陈旧事件再触发一次重算，也只会**再次得到「在桌面内」**，
+     * 因而无法把状态带偏。
+     *
+     * 【无焦点应用窗口时保持现状】锁屏、下拉面板等系统界面显示时，焦点窗口
+     * 不是应用窗口（`TYPE_SYSTEM`），此时**不擅自改动**前台身份 ——
+     * 那类界面的手势禁用由 [refreshSystemOverlayState] 独立负责，职责不重叠。
+     */
+    private fun refreshForegroundState() {
+        val focused = queryFocusedApplicationWindow() ?: return
+        val (pkg, cls) = focused
+
+        if (pkg == packageName) {
+            // 焦点应用窗口就是本桌面
+            if (!isDraggingCard) {
+                updateInLauncher(true)
+                LaunchOriginTracker.reset()
+            }
+            return
+        }
+
+        // 焦点应用窗口是别的应用 → 用户确实离开了桌面
+        updateInLauncher(false)
+        // 系统浮层宿主（Quickstep 后台卡片等）不参与「划出来源应用」追踪，
+        // 否则会把 launcher3/systemui 记成用户的应用，污染划出卡片。
+        if (isSystemOverlayWindow(pkg, cls)) return
+        if (LaunchOriginTracker.currentPackageName != pkg) {
+            LaunchOriginTracker.currentPackageName = pkg
+            // 关键：包名发生变更，之前的 taskId 必然失效！立即清空，杜绝跨应用残留！
+            LaunchOriginTracker.currentTaskId = null
+            updateCurrentTaskIdForPackage(pkg)
+        }
+    }
+
+    /**
+     * 现查「当前持有焦点的**应用窗口**」（`TYPE_APPLICATION`）及其根包名/类名。
+     *
+     * 只认 `TYPE_APPLICATION`：桌面的手势遮罩层是 `TYPE_ACCESSIBILITY_OVERLAY`、
+     * 下拉面板与锁屏是 `TYPE_SYSTEM`、输入法是 `TYPE_INPUT_METHOD`，
+     * 它们都**不是**「用户正身处的应用」，必须排除。
+     *
+     * 无焦点应用窗口时返回 null（调用方据此保持现状，不误判）。
+     *
+     * 【为何取 `root.packageName` 而非窗口类名 —— 一条实测教训】
+     * 真机实测：本桌面窗口的 `className` 是 `android.widget.FrameLayout`
+     * （**根 View 的类名**，不是 Activity 类名），据此根本无法识别是哪个界面；
+     * 而 `root.packageName` 始终可靠（实测 `rootPkg=com.meego.launcher`）。
+     * 曾经误用「类名含 MainActivity」作为判据，结果该判据**恒为 false**，
+     * 使修复失效 —— 故此处明确以包名为准。
+     */
+    private fun queryFocusedApplicationWindow(): Pair<String, String?>? {
+        val windows = try {
+            windowsOnAllDisplays
+        } catch (e: Exception) {
+            return null
+        } ?: return null
+
+        for (i in 0 until windows.size()) {
+            val list = windows.valueAt(i) ?: continue
+            for (w in list) {
+                if (w == null || !w.isActive || !w.isFocused) continue
+                if (w.type != AccessibilityWindowInfo.TYPE_APPLICATION) continue
+                val rootPkg = try {
+                    w.root?.packageName?.toString()
+                } catch (e: Exception) {
+                    null
+                } ?: continue
+                return rootPkg to w.classNameOrNull()
             }
         }
+        return null
     }
 
     private fun updateCurrentTaskIdForPackage(pkg: String) {

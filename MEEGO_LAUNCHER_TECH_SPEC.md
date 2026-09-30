@@ -487,6 +487,49 @@ $$\left|\frac{x}{a}\right|^n + \left|\frac{y}{b}\right|^n = 1 \quad (n = 2.732)$
     - **XML 踩坑留档**：说明性注释写在 `<accessibility-service>` 属性列表**内部**时，
       AAPT2 报「元素类型必须后跟属性规范 ">"」。已把说明移到根元素**之外**的注释块。
 
+#### 4.5.1 锁屏解锁后「第一次侧滑必划出陈旧应用卡片」修复（v1.8.47）
+
+**缺陷现象**：锁屏后解锁回到桌面，**第一次**手势侧边滑动**必然**划出一张应用卡片
+（图标恰是锁屏前用过的那个应用），而该应用其实**并不在后台**，多任务屏也没有它的卡片。
+
+**根因（真机日志取证）**：解锁瞬间，**锁屏前那个应用**会补发一个**迟到的**
+`TYPE_WINDOW_STATE_CHANGED` 事件：
+
+```
+WINSTATE pkg=com.android.settings cls=...SettingsHomepageActivity inLauncher=false
+```
+
+而旧实现把「事件 `packageName` ≠ 本应用」**直接等同于「用户进入了第三方应用」**，于是：
+
+1. `updateInLauncher(false)` —— 触发区在**桌面之上**被置为可见；
+2. `LaunchOriginTracker.currentPackageName` 被写成那个陈旧应用 —— 划出动画拿它去找快照
+   （任务早已不存在）→ 降级为该应用的**图标**。
+
+两者相乘即用户所见「第一次侧滑必然划出一张陈旧应用图标卡片」。
+
+**修法（与 §4.5 同一原则）**：新增 `refreshForegroundState()`，
+把「事件只作**何时去查**，不作**是什么**」贯彻到前台身份：
+任何窗口事件都不再采信其 `packageName`，一律由 `queryFocusedApplicationWindow()`
+现查**持有焦点的 `TYPE_APPLICATION` 窗口**得出结论 ——
+焦点应用窗口是**本桌面** → 在桌面内；是**别的应用** → 在应用内。
+那个迟到的陈旧事件再触发重算，也只会**再次得到「在桌面内」**，无法带偏状态。
+
+**两条实测教训（均已写入代码注释，避免重走）**：
+
+| 教训 | 说明 |
+|---|---|
+| **窗口 `className` 不是 Activity 类名** | 本桌面窗口的 `className` 实测为 `android.widget.FrameLayout`（**根 View 的类名**）。首版修复用「类名含 `MainActivity`」判断桌面，结果该判据**恒为 false**、修复失效。必须以 `root.packageName` 为准。 |
+| **只认 `TYPE_APPLICATION`** | 桌面手势遮罩层是 `TYPE_ACCESSIBILITY_OVERLAY`、下拉面板/锁屏是 `TYPE_SYSTEM`、输入法是 `TYPE_INPUT_METHOD`，三者都要排除；无焦点应用窗口时**保持现状**（锁屏期间不擅自改判）。 |
+
+**真机验证（Redmi K40 / LineageOS 23.2 / Android 16，全部通过）**：
+① **锁屏 → 解锁到桌面 → 第一次侧滑** → `inLauncher=true`、触发区 `GONE`、
+`Edge drag` 计数 **0**，焦点保持本桌面（侧滑改为执行桌面自身的切屏，符合预期）；
+② **应用内**（解锁后在 Via 中）侧滑 → 正确取到 `844_sys.jpg for task 844 (mark.via)`，
+即**卡片对应当前真实前台应用**，无陈旧串扰；
+③ **通知栏**与**系统后台卡片**仍正确禁用侧滑（`Edge drag` 计数均为 0）；
+④ **连续 3 轮**锁屏/解锁后状态稳定为 `inLauncher=true`，`systemOverlay=true` 残留 **0** 次；
+⑤ 多任务屏无幽灵卡片（与 §4.15 修复共同生效）；⑥ crash buffer **零记录**。
+
 ### 4.6 系统栏隐藏与端到端沉浸（System Bar Hiding）
 
 **当前实现**：由 `MainActivity` 经 `WindowInsetsControllerCompat` 统一处理，服务与视图层不再持有任何遮罩窗口。

@@ -314,7 +314,7 @@ bash scripts/check_device.sh
 
 ---
 
-## 🧭 当前实现状态（v1.8.46 实测，2026-09-30）
+## 🧭 当前实现状态（v1.8.47 实测，2026-09-30）
 
 > 本节由**逐行通读全部 20 个 Kotlin 源文件**核对得出。README 与技术规格文档中若出现与本节冲突的表述，**以本节与代码为准**。
 
@@ -329,7 +329,7 @@ bash scripts/check_device.sh
 | Task Snapshot 常驻取帧 | `scripts/TaskSnapService.java` | 对齐 Quickstep：`TaskSnapshotManager.takeTaskSnapshot` / `getTaskSnapshot`；**只含该任务窗口**，无状态栏/导航栏/挖孔留白；单帧 **11~42ms**（旧一次性桥 ~1.35s） |
 | 双指无级缩放 2×2 ⇄ 3×3 | `MultitaskingScreen.kt` | 阈值 `0.5f`、弹簧 `spring(0.96f, 450f)`、捏合灵敏度 `680f` |
 | 长按编辑 + 删除角标 + 一键清空 | `MultitaskingScreen.kt` | 消失 150ms → 补位 `spring(0.95f, 300f)` |
-| 全局边缘划回（含双层揭示） | `EdgeSwipeGestureService.kt` | 触发区 28.dp、**滑出阈值 1/3 屏**、震动越线即刻触发（35ms）；**通知栏下拉面板与系统后台卡片（Quickstep）打开时自动禁用手势** |
+| 全局边缘划回（含双层揭示） | `EdgeSwipeGestureService.kt` | 触发区 28.dp、**滑出阈值 1/3 屏**、震动越线即刻触发（35ms）；**通知栏下拉面板与系统后台卡片（Quickstep）打开时自动禁用手势**；**前台身份现查焦点窗口**（不再采信事件包名，已修锁屏解锁后首次侧滑划出陈旧应用卡片，v1.8.47） |
 | 来源感知回溯 | `model/Models.kt` | `lastOrigin`（回哪一页）**与** `currentScreenIndex`（动画如何表现）刻意分离 |
 | 桌面缩放中心锚定 | `EdgeSwipeGestureService.kt` | pivot 钉物理屏幕中心，漂移由 (+51,+156)px 降到 (+0.0,+45.3)px |
 | 图标形状统一（超椭圆） | `util/AppIconRenderer.kt` | 绕开 `AdaptiveIconDrawable.draw()` 的系统圆形 mask；图层整体 `scale(1.5f)` 对齐 AOSP |

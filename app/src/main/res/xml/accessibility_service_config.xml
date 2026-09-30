@@ -4,5 +4,13 @@
     android:accessibilityEventTypes="typeWindowStateChanged"
     android:accessibilityFeedbackType="feedbackGeneric"
     android:notificationTimeout="100"
-    android:canRetrieveWindowContent="false"
+    android:canRetrieveWindowContent="true"
     android:settingsActivity=".MainActivity" />
+<!-- v1.8.45 说明（置于根元素之外，避开属性列表内注释的解析差异）：
+     canRetrieveWindowContent 由 false 改为 true。
+     getWindowsOnAllDisplays() 要求 canRetrieveWindowContent 与
+     FLAG_RETRIEVE_INTERACTIVE_WINDOWS 同时具备才返回窗口，否则恒返回空列表；
+     而判断「通知栏 / 系统后台卡片是否正在显示」必须读取窗口的焦点与
+     根节点类名（AccessibilityWindowInfo 的公开 API 没有 isVisible 与
+     getClassName，只能取自 root）。
+     本服务仅读取窗口元数据与类名判断窗口身份，从不解析窗口内容。 -->

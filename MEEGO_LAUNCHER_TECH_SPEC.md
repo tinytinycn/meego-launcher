@@ -441,6 +441,44 @@ $$\left|\frac{x}{a}\right|^n + \left|\frac{y}{b}\right|^n = 1 \quad (n = 2.732)$
      - 将多任务 2×2 / 3×3 布局模式同步纳入 DataStore 持久化存储（`KEY_RECENTS_COLUMNS`）；
       - 双指缩放（Pinch-to-zoom）手势结束时，依据 🔀 **`animProgress.value < 0.5f`** 智能平滑吸附到 3×3（`p = 0`）或 2×2（`p = 1`），吸附弹簧为 `spring(dampingRatio = 0.96f, stiffness = 450f)`，并经 `onColumnsChanged` 实时持久化到 DataStore。（**原文档记为阈值 `0.83`，与代码不符**，本次已校准。捏合灵敏度常量 `680f`：双指间距需变化 680px 才走完整个 `p ∈ [0,1]`，较早期的 260px 更平缓细致。）
 
+  - **系统浮层下禁用手势（v1.8.45 新增，真机实测通过）**：
+    - **需求**：通知栏下拉面板展开时、以及经底部手势条上滑进入**系统后台卡片（Quickstep）**时，均**不允许**侧滑划出应用界面。
+    - **实现**：触发区显隐收敛为**唯一出口** `applyTriggerVisibility()`，判据由二元扩为**三元**：
+      `visible = !isInLauncher && isGestureEnabledByUser && !lastSystemOverlayShowing`。
+      落指时另有**第二道防线**（`createEdgeTouchListener` 内当场复核标志），
+      杜绝「浮层刚展开、触发区 GONE 尚未生效」那一帧的竞态。
+    - **判据来源：现查焦点窗口（不是事件顺序）—— 首版真机实测出缺陷后修正**：
+      首版把标记绑在 `TYPE_WINDOW_STATE_CHANGED` 的先后顺序上，真机实测「下拉 → 收起」即暴露
+      `false` 后 **378ms 又被置回 `true`**：收起动画期间 SystemUI 会**再补发自己的**窗口事件，
+      而「收到 SystemUI 事件」≠「面板正在显示」（面板收起后窗口仍存在，只是不可见），
+      于是标记被永久留在错误的 `true` 上 —— **「收起通知栏后边缘划回永久失灵」**。
+      现改为：**事件只作「何时去查」，绝不作为「是什么」的结论** ——
+      任何窗口事件一律触发 `refreshSystemOverlayState()`，由 `querySystemOverlayShowing()`
+      **现查当前焦点窗口**给出唯一结论。收起后焦点已交还应用，现查即得 `false`，
+      迟到的那个 SystemUI 事件再触发重算也只会**再次得到 `false`**。
+    - **必须同时改两项配置，否则该 API 恒返回空（静默失效）**：
+      AOSP 规定 `getWindowsOnAllDisplays()` 需**同时**具备 `canRetrieveWindowContent`
+      **与** `FLAG_RETRIEVE_INTERACTIVE_WINDOWS`，否则**返回空列表**（javadoc 原文）。
+      故 `res/xml/accessibility_service_config.xml` 的 `canRetrieveWindowContent`
+      由 `false` 改为 `true`，并在 `onServiceConnected` 置位该 flag。
+      不改则判据**编译通过、运行不报错、功能却不生效** —— 即「安静地坏掉」。
+    - **判据按「窗口身份」而非「包名」，且必须排除输入法**：
+      SystemUI 同时托管下拉面板与 **IME 输入法窗口**，弹键盘时焦点同样切到 SystemUI；
+      若按包名判定，**打字时边缘划回会被误禁用** —— 而这恰是最需要划回换界面的场景。
+      故以类名 `NotificationShadeWindowView` / `RecentsActivity` / `QuickstepActivity` 为主判据，
+      宿主包仅作补充并**显式排除**类名含 `InputMethod` 的窗口。
+    - **为何用焦点而非可见性**：`AccessibilityWindowInfo` 的**公开** API 只有
+      `isActive` / `isFocused` / `title` / `type` / `root`，**没有** `isVisible` 与
+      `getClassName`（属 system 私有），类名只能取自 `root`；而其 javadoc 明确
+      「只返回用户能交互的窗口，被模态面板盖住的不返回」，故**焦点窗口即当前真正的顶层界面**。
+    - **真机实测（Redmi K40 / LineageOS 23.2 / Android 16，全部通过）**：
+      下拉通知栏 → 判定 `pkg=com.android.systemui` 成立、触发区 `GONE`，侧滑**只收起面板不划出**；
+      收起 → 恢复 `VISIBLE` 且**无回跳**；系统后台卡片 → `pkg=com.android.launcher3` 成立、
+      侧滑**被拦截**；**应用内正常侧滑仍可用**；**输入法弹出时侧滑仍可用**（无误禁用）；
+      连续 3 轮循环后状态稳定，crash buffer 零记录。
+    - **XML 踩坑留档**：说明性注释写在 `<accessibility-service>` 属性列表**内部**时，
+      AAPT2 报「元素类型必须后跟属性规范 ">"」。已把说明移到根元素**之外**的注释块。
+
 ### 4.6 系统栏隐藏与端到端沉浸（System Bar Hiding）
 
 **当前实现**：由 `MainActivity` 经 `WindowInsetsControllerCompat` 统一处理，服务与视图层不再持有任何遮罩窗口。

@@ -25,7 +25,10 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.ViewOutlineProvider
 import android.view.WindowManager
+import android.accessibilityservice.AccessibilityServiceInfo
+import android.util.SparseArray
 import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityWindowInfo
 import android.view.animation.DecelerateInterpolator
 import android.view.animation.OvershootInterpolator
 import android.widget.FrameLayout
@@ -73,6 +76,39 @@ class EdgeSwipeGestureService : AccessibilityService() {
          */
         private const val SWIPE_OUT_THRESHOLD_RATIO = 1f / 3f
 
+        /**
+         * 需要禁用手势的**系统浮层窗口类名**特征串（`AccessibilityEvent.className`）。
+         *
+         * ① [SHADE_VIEW_CLASS] 通知栏 / 快捷设置下拉面板的窗口
+         *    （SystemUI `NotificationShadeWindowView`）
+         * ② [RECENTS_VIEW_CLASS] 系统后台卡片（Quickstep / Recents）
+         *
+         * 【为何按「类名」而非「包名」判定 —— 一条真实的误伤】
+         * SystemUI 进程**同时**托管下拉面板与 **IME 输入法窗口**。用户点输入框
+         * 弹键盘时，焦点同样会切到 SystemUI（`InputMethodManager` 的
+         * `InputMethodWindow`），此时若只按包名判定，**打字时边缘划回会被误禁用**
+         * —— 而打字恰恰是最需要边缘划回去「换个界面」的场景。故必须用类名区分。
+         *
+         * 【为何不能只按类名 —— 系统 Quickstep 宿主包是可配的】
+         * Quickstep 宿主包由 `config_recentsComponentName` 决定（LineageOS 默认
+         * `com.android.launcher3`），不同 ROM / 用户桌面可能不同。类名
+         * `RecentsActivity` / `QuickstepActivity` 才是跨宿主稳定的特征，
+         * 故类名判据优先、宿主包仅作补充。
+         *
+         * 【判据为何只在窗口状态**变化**时求值，而非轮询窗口存在性】
+         * 下拉面板与 IME 窗口**都是常驻存在**的（收起/收键盘后窗口仍在），
+         * 用「列表里有没有它」当判据会**永久禁用**手势。故只在收到
+         * [android.view.accessibility.AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED]
+         * ——即窗口**真的**获得了输入焦点——时求值。
+         */
+        private const val SHADE_VIEW_CLASS = "NotificationShadeWindowView"
+        private const val RECENTS_VIEW_CLASS = "RecentsActivity"
+        private const val RECENTS_VIEW_CLASS_ALT = "QuickstepActivity"
+
+        /** 类名不可得时的补充判据用宿主包（见 [isSystemOverlayWindow] 的说明）。 */
+        private const val SYSTEM_UI_PKG = "com.android.systemui"
+        private const val LAUNCHER_PKG = "com.android.launcher3"
+
         @Volatile
         private var instance: EdgeSwipeGestureService? = null
         @Volatile
@@ -105,6 +141,15 @@ class EdgeSwipeGestureService : AccessibilityService() {
         if (event == null) return
         if (event.eventType == android.view.accessibility.AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
             val pkg = event.packageName?.toString() ?: return
+            // v1.8.45：任何窗口状态变化都触发一次**现查**式重算。
+            //
+            // 【关键：事件只作「何时去查」，不作「是什么」】
+            // 绝不能把「收到 SystemUI 事件」直接等同于「通知栏正在显示」——
+            // 真机实测收起动画期间 SystemUI 会补发自己的窗口事件，
+            // 那样做会把标记留在错误的 true 上（详见 [refreshSystemOverlayState]）。
+            // 无论事件来自谁，一律现查当前窗口状态，由 [querySystemOverlayShowing]
+            // 给出唯一结论。
+            refreshSystemOverlayState()
             if (pkg != packageName) {
                 // 进入了第三方应用（例如系统设置 com.android.settings），确保手势触发区处于激活状态
                 updateInLauncher(false)
@@ -150,6 +195,20 @@ class EdgeSwipeGestureService : AccessibilityService() {
         super.onServiceConnected()
         isAccessibilityConnected = true
         Log.d(TAG, "EdgeSwipeGestureService onServiceConnected via AccessibilityService")
+        // v1.8.45：置位 FLAG_RETRIEVE_INTERACTIVE_WINDOWS。
+        //
+        // 【为何必须显式置位】本服务 `canRetrieveWindowContent="false"`
+        // （见 res/xml/accessibility_service_config.xml），而 AOSP 规定
+        // `getWindowsOnAllDisplays()` 必须**同时**具备 `canRetrieveWindowContent`
+        // **与** 本标志位，否则**恒返回空列表**。不置位则 [querySystemOverlayShowing]
+        // 永远查不到任何窗口，浮层判据会**静默失效**（编译通过、运行不报错，
+        // 但手势再也不会被禁用）—— 正是最需要避免的「安静地坏掉」。
+        //
+        // 【安全性】该标志位只允许服务读取**窗口的元数据与节点结构**，
+        // 本服务不取窗口内容、不做界面解析，仅用类名判断窗口身份，隐私影响可忽略。
+        serviceInfo = serviceInfo.apply {
+            flags = flags or AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
+        }
         mainHandler.post {
             removeViews()
             createTriggerViews()
@@ -169,17 +228,181 @@ class EdgeSwipeGestureService : AccessibilityService() {
     private var isGestureEnabledByUser = true
     private var isInLauncher = true
 
+    /**
+     * 上一次「系统浮层（通知栏下拉面板 / 系统后台卡片）是否正在显示」的结论。
+     *
+     * 它是**触发区显隐的第 3 个必要条件**（见 [applyTriggerVisibility]），
+     * 唯一由 [setSystemOverlayShowing] 改写，改写来源是无障碍窗口状态变化事件
+     * （见 [onAccessibilityEvent]）。之所以缓存成字段而非每次现查：
+     * AOSP 的 [AccessibilityService.getWindows] 文档明确要求
+     * `canRetrieveWindowContent` + `FLAG_RETRIEVE_INTERACTIVE_WINDOWS` 双重声明，
+     * 否则**返回空列表**；本服务 `canRetrieveWindowContent="false"`（见
+     * `res/xml/accessibility_service_config.xml`），现查永远查不到东西。
+     * 故只能走事件驱动，这也是本字段存在的原因。
+     */
+    private var lastSystemOverlayShowing = false
+
     fun updateInLauncher(inLauncher: Boolean) {
         isInLauncher = inLauncher
         if (inLauncher) {
             LaunchOriginTracker.reset()
         }
         mainHandler.post {
-            val visibility = if (inLauncher || !isGestureEnabledByUser) View.GONE else View.VISIBLE
-            leftTriggerView?.visibility = visibility
-            rightTriggerView?.visibility = visibility
-            Log.d(TAG, "updateInLauncher: inLauncher=$inLauncher, isGestureEnabledByUser=$isGestureEnabledByUser, trigger visibility=$visibility")
+            applyTriggerVisibility()
         }
+    }
+
+    /**
+     * 边缘触发区的统一可见性判据（v1.8.45）。
+     *
+     * 触发区**仅在「用户身处某个应用、且没有系统浮层盖在上面」时**才可见：
+     * 1. 不在启动器内（`!isInLauncher`）—— 桌面内本来由 [HomeScreen] 自己处理切屏手势；
+     * 2. 用户开关已打开（`isGestureEnabledByUser`）；
+     * 3. **通知栏下拉面板与系统 Quickstep 后台卡片**都没有显示
+     *    （见 [isSystemOverlayShowing]）—— v1.8.45 新增的第 3 条。
+     *
+     * 把三态收敛到**唯一**的可见性出口是本次改动的关键：v1.8.44 之前
+     * 触发区的显隐散落在 [updateInLauncher] 与 [applyGestureEnabled] 两处各自
+     * 计算 `visibility`，而新加的「系统浮层」判据只在其中一处被更新时才会重算
+     * —— 即**通知栏收起后触发区不会自己回来**。收敛后，
+     * 任何一次系统窗口变化都会经由同一出口重算，不存在「某条路径忘了恢复」。
+     */
+    private fun applyTriggerVisibility() {
+        val visible = !isInLauncher && isGestureEnabledByUser && !lastSystemOverlayShowing
+        val visibility = if (visible) View.VISIBLE else View.GONE
+        leftTriggerView?.visibility = visibility
+        rightTriggerView?.visibility = visibility
+        Log.d(
+            TAG,
+            "applyTriggerVisibility: inLauncher=$isInLauncher, " +
+                "isGestureEnabledByUser=$isGestureEnabledByUser, " +
+                "systemOverlay=$lastSystemOverlayShowing, trigger visibility=$visibility"
+        )
+    }
+
+    /**
+     * 判定某个窗口是否属于「不该被划出手势介入」的系统浮层。
+     *
+     * 只看**类名**（见 [SHADE_VIEW_CLASS] / [RECENTS_VIEW_CLASS] 的取舍说明），
+     * **不看包名** —— 否则 SystemUI 的输入法窗口会连累打字时的边缘划回。
+     *
+     * 【为何不看窗口可见性】
+     * 可见性由 [querySystemOverlayShowing] 统一把关；本方法只回答「这个窗口
+     * **是不是**系统浮层」这一**身份**问题，保持单一职责。
+     */
+    private fun isSystemOverlayWindow(pkg: String, cls: String?): Boolean {
+        if (cls == null) return false
+        if (cls.contains(SHADE_VIEW_CLASS)) return true
+        if (cls.contains(RECENTS_VIEW_CLASS) || cls.contains(RECENTS_VIEW_CLASS_ALT)) return true
+        // 补充判据：类名不可得（部分 ROM 裁剪）时退回宿主包，但必须**排除输入法**，
+        // 否则打字时会被误禁用。输入法窗口类名含 InputMethod。
+        if (cls.contains("InputMethod", ignoreCase = true)) return false
+        return pkg == SYSTEM_UI_PKG || pkg == LAUNCHER_PKG
+    }
+
+    /**
+     * 依据**当前**窗口状态重算浮层标记，并同步触发区显隐（v1.8.45 真机修正）。
+     *
+     * 【为何不能只靠事件推导 —— 真机实测出的真实缺陷】
+     * 首版把 `lastSystemOverlayShowing` 直接绑在 `TYPE_WINDOW_STATE_CHANGED`
+     * 的先后顺序上。真机（Redmi K40 / LineageOS 23.2 / Android 16）实测
+     * 「下拉 → 收起」这一条路径，日志为：
+     * ```
+     * system overlay showing: false      ← 面板交还焦点，标记清零（正确）
+     * system overlay showing: true       ← 378ms 后又被置回 true（错误）
+     * ```
+     * 根因：收起动画期间 SystemUI 会**再补发一次自己的**窗口状态事件，
+     * 而首版把「收到 SystemUI 事件」直接等同于「面板正在显示」。
+     * 二者并不等价 —— 面板收起后其窗口**仍然存在**（只是不可见），
+     * 故「事件到达」≠「面板展开」。于是标记被永久留在错误的 true 上，
+     * 表现为「收起通知栏后边缘划回依旧失灵，且再也不自己恢复」。
+     *
+     * 【修法：事件只作「何时去查」，绝不作为「是什么」的结论】
+     * 事件仍用于触发重算，但结论一律由 [querySystemOverlayShowing]
+     * **现查当前窗口**得出。收起动画结束时面板窗口 `isVisible` 已转 false，
+     * 现查即得 false；那个迟到的 SystemUI 事件再触发一次重算，也只会
+     * **再次得到 false**，标记因此无法被留在错误的 true 上。
+     */
+    private fun refreshSystemOverlayState() {
+        setSystemOverlayShowing(querySystemOverlayShowing())
+    }
+
+    /**
+     * 现查「此刻是否有系统浮层正在显示」。
+     *
+     * 判据是「**当前持有输入焦点的窗口是不是系统浮层**」。
+     *
+     * 【为何用焦点而非可见性】`AccessibilityWindowInfo` 的**公开** API 只有
+     * `isActive` / `isFocused` / `title` / `type` / `root`，**没有** `isVisible`
+     * 与 `className`（`WindowInfo` 里那两个字段是 system 私有，SDK 不可见）。
+     * 而焦点恰是更可靠的信号：面板展开时 SystemUI
+     * `applyFocusableFlag()` 会移除 `FLAG_NOT_FOCUSABLE`（**夺焦点**），
+     * 收起时焦点必然交还应用（已在本机日志中验证该事件确实到达）。
+     *
+     * 【为何只看焦点窗口】`getWindowsOnAllDisplays()` 的 javadoc 明确说明它
+     * 只返回「用户能与之交互」的窗口：被模态面板盖住的窗口**不会**被返回，
+     * 焦点窗口则**一定**在其中。故焦点窗口即当前真正的顶层界面，无误判空间。
+     *
+     * 查不到任何窗口时**保守返回 false**（不误禁手势）：
+     * 宁可漏禁一次，也好过把核心功能永久关掉。
+     */
+    private fun querySystemOverlayShowing(): Boolean {
+        val windows = try {
+            windowsOnAllDisplays
+        } catch (e: Exception) {
+            Log.w(TAG, "windowsOnAllDisplays failed, assume no overlay: ${e.message}")
+            return false
+        } ?: return false
+
+        // SparseArray 无 iterator()，须按下标遍历
+        for (i in 0 until windows.size()) {
+            val list = windows.valueAt(i) ?: continue
+            for (w in list) {
+                if (w == null || !w.isActive) continue
+                val rootPkg = try {
+                    w.root?.packageName?.toString()
+                } catch (e: Exception) {
+                    null
+                }
+                val isOverlay = isSystemOverlayWindow(rootPkg.orEmpty(), w.classNameOrNull())
+                // 焦点窗口 = 用户此刻真正面对的界面；非焦点窗口不参与判定
+                if (isOverlay && w.isFocused) {
+                    Log.d(TAG, "system overlay focused: cls=${w.classNameOrNull()} pkg=$rootPkg")
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    /**
+     * 取窗口类名。
+     *
+     * `AccessibilityWindowInfo` 公开 API 无 `getClassName()`，只能从
+     * `getRoot()`（即窗口的 View 树根节点）取 `className` —— 展开的
+     * 下拉面板根节点即 `NotificationShadeWindowView`。
+     *
+     * `getRoot()` 需要 `canRetrieveWindowContent`（见
+     * `res/xml/accessibility_service_config.xml`），取不到时**返回 null**
+     * 而非抛异常，保证无权限时优雅降级到 [isSystemOverlayWindow] 的包名补充判据。
+     */
+    private fun AccessibilityWindowInfo.classNameOrNull(): String? = try {
+        root?.className?.toString()
+    } catch (e: Exception) {
+        null
+    }
+
+    /**
+     * 系统浮层显隐的唯一状态出口（v1.8.45）。
+     *
+     * 只在**状态真的翻转**时才重算触发区显隐，避免无障碍事件风暴
+     * （面板动画期间 SystemUI 会连发大量窗口事件）引发高频重算。
+     */
+    private fun setSystemOverlayShowing(showing: Boolean) {
+        if (lastSystemOverlayShowing == showing) return
+        Log.d(TAG, "system overlay showing: $showing")
+        lastSystemOverlayShowing = showing
+        mainHandler.post { applyTriggerVisibility() }
     }
 
     fun applyGestureEnabled(enabled: Boolean) {
@@ -188,6 +411,7 @@ class EdgeSwipeGestureService : AccessibilityService() {
         mainHandler.post {
             if (!enabled) {
                 postDismissOverlay()
+                // 关闭开关：清空系统手势排除区，彻底释放边缘触控
                 leftTriggerView?.visibility = View.GONE
                 rightTriggerView?.visibility = View.GONE
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -201,10 +425,11 @@ class EdgeSwipeGestureService : AccessibilityService() {
                 if (cardOverlayLayout == null) {
                     createCardOverlay()
                 }
-                val visibility = if (isInLauncher) View.GONE else View.VISIBLE
-                leftTriggerView?.visibility = visibility
-                rightTriggerView?.visibility = visibility
-                if (visibility == View.VISIBLE && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                // 统一走唯一出口，使「重新开启」也能正确尊重系统浮层判据
+                applyTriggerVisibility()
+                if (leftTriggerView?.visibility == View.VISIBLE &&
+                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
+                ) {
                     leftTriggerView?.let { v ->
                         v.post {
                             if (v.width > 0 && v.height > 0) {
@@ -531,6 +756,13 @@ class EdgeSwipeGestureService : AccessibilityService() {
 
         return View.OnTouchListener { v, event ->
             if (isInLauncher || !isGestureEnabledByUser) {
+                return@OnTouchListener false
+            }
+            // v1.8.45 第二道防线：浮层刚展开、触发区 GONE 尚未生效的那一帧，
+            // 落指时也当场复核一次状态，保证「通知栏/后台卡片打开期间侧滑」在任何时序下
+            // 都不会划出卡片。
+            if (event.actionMasked == MotionEvent.ACTION_DOWN && lastSystemOverlayShowing) {
+                Log.d(TAG, "Edge touch ignored: system overlay (shade/recents) is showing")
                 return@OnTouchListener false
             }
             val params = if (isLeft) leftParams else rightParams

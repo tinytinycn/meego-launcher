@@ -257,11 +257,23 @@ data class RecentTask(
      * 该快照被**抓取**的时刻（epoch ms）。渲染层可据此判断画面是否已过期，
      * 避免长期展示陈旧帧。仅作观测用途，不参与 data class 相等性比较之外的逻辑。
      */
-    val snapshotTimeMs: Long = 0L
+    val snapshotTimeMs: Long = 0L,
     // 【v1.8.44】原有的 `snapshotIsSettled` 已删除。
     // 它区分「系统稳定帧」与「启动动画期的临时占位帧」，而那一档画面来自
     // `screencap -p` 的整屏帧。常驻 Task Snapshot 服务上线后，帧只有两种来源：
     //   · 可见任务 → takeTaskSnapshot 实时取当前画面（启动动画期也是真实画面）；
     //   · 后台任务 → getTaskSnapshot 取「变不可见」那一刻的最终态。
     // 两者都是真实帧，不再存在「半渲染过渡帧」，故该标志无意义。
+    /**
+     * 【v1.8.46 新增】该卡片是否为「**并非真实后台任务**」的合成项。
+     *
+     * 仅 [com.meego.launcher.data.RootTaskProvider] 的 UsageStats 降级路径会产生
+     * true —— 那种卡片**只表示「这个应用最近被用过」，并不代表它此刻真的有任务在后台**。
+     *
+     * 之所以要有这个标志：合成卡片曾被写进持久化缓存，于是**首次启动 /
+     * 清理全部后台卡片之后**，系统侧明明一个任务都没有，多任务屏却会显示出一整排
+     * （实测 20 张）图标降级卡片，看上去像「20 个应用都在后台」—— 实为幻觉。
+     * 带上标志后，合成卡片**不允许**进缓存，也**不允许**从缓存复活。
+     */
+    val isSynthetic: Boolean = false
 )

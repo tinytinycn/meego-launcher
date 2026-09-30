@@ -1,7 +1,6 @@
 package com.meego.launcher.data
 
 import android.app.ActivityManager
-import android.app.usage.UsageStatsManager
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
@@ -25,6 +24,18 @@ class RootTaskProvider(private val context: Context) {
         private const val CACHE_FILE_NAME = "recent_tasks_cache.json"
         private const val APP_TASKS_JSON_NAME = "recent_tasks.json"
         private const val CMD_QUEUE_DIR_NAME = "cmd_queue"
+
+        /**
+         * 合成（UsageStats 降级）任务 ID 的起始编号。
+         *
+         * 取 20000 是刻意远离真实 taskId 的小整数区间（实测真机 taskId 在
+         * 700 上下，且 `dumpsys activity recents` 给出的 `Task{#id}` 亦为小整数），
+         * 使「按 ID 区间即可识别合成项」这一判据在实践中可靠。
+         *
+         * 该判据是**合成项**与 [loadFromLocalCache] 之间的**契约**：
+         * 凡是 ID ≥ 本值的卡片都不是真实后台任务，不得落盘、不得复活。
+         */
+        private const val SYNTHETIC_TASK_ID_BASE = 20000
 
         /**
          * 守护脚本 awk 解析 `mActivityComponent=pkg/cls` 时，awk 的 `gsub(/[^a-zA-Z0-9._]/,"")`
@@ -200,13 +211,24 @@ class RootTaskProvider(private val context: Context) {
             return@withContext cachedTasks
         }
 
-        // 3. 本地缓存亦为空（如刚清除数据）：从 UsageStatsManager 读取最近使用应用
-        val usageTasks = loadFromUsageStats()
-        if (usageTasks.isNotEmpty()) {
-            Log.d(TAG, "Loaded ${usageTasks.size} tasks from UsageStatsManager fallback")
-            saveToLocalCache(usageTasks)
-            return@withContext usageTasks
-        }
+        // 3. 【v1.8.46 关键修复】此前的 UsageStatsManager 降级已**整体移除**。
+        //
+        // 【缺陷现象】启动器首次打开、或多任务屏「一键清理全部」之后，系统侧真实
+        // 后台任务为 0，多任务屏却显示 20 张图标降级卡片，像「20 个应用都在后台」。
+        //
+        // 【根因】UsageStats 返回的是「最近 7 天用过哪些应用」，与「此刻有没有
+        // 后台任务」**毫无关系**。把它当作 recents 任务的降级源，等于**凭空捏造
+        // 任务**：卡片带的是合成 taskId（20000+）、无快照、只能降级成图标 ——
+        // 三个特征恰好对应用户看到的「图标样式的卡片」。
+        //
+        // 【为何不能保留它作为「开机初期兜底」】开机初期守护进程确实可能还没写出
+        // JSON，但那时**正确显示就是空的**。用「最近用过」冒充「正在后台」，
+        // 属于会误导用户的行为 —— 宁可少显示，不可显示假的。故直接删除该级，
+        // 空列表就是诚实答案。
+        //
+        // 【删除后仍需保证开机可用】真正的开机保障是第 2 级的持久化缓存
+        // （只存真实任务），以及守护进程开机自启（Magisk service.d 钩子）。
+        // 两者都不产生幻觉。
 
         // 4. 最终兜底：从系统 AppTasks 获取
         try {
@@ -256,8 +278,35 @@ class RootTaskProvider(private val context: Context) {
     private fun saveToLocalCache(tasks: List<RecentTask>) {
         if (tasks.isEmpty()) return
         try {
+            // 【v1.8.46 关键修复】合成卡片（UsageStats 降级项）**一律不落盘**。
+            //
+            // 【缺陷现象】启动器首次打开、或在多任务屏「一键清理全部」之后，
+            // 系统侧真实后台任务为 0，多任务屏却显示 20 张图标降级卡片。
+            //
+            // 【根因（真机取证）】缓存文件里是 taskId=20000..20019 的合成项：
+            //   /data/user/0/com.meego.launcher/files/recent_tasks_cache.json
+            // 而同一时刻 `dumpsys activity recents` 只有 3 个真实任务、守护进程
+            // 落盘的 recent_tasks.json 为 []。即：守护进程正确地报告「无任务」，
+            // 但 App 侧先回落到 UsageStats 生成 20 张合成卡片，又**把它们写进缓存**，
+            // 于是**下一次启动**缓存命中、合成卡片被当作真实任务复活 —— 表现为
+            // 「幽灵卡片永不消失」，且与真实后台状态完全脱钩。
+            //
+            // 【为何不能靠「过滤合成项」就完事】仅在读取时过滤不够：只要还写着，
+            // 缓存就会一直被合成项占位，真实任务反而挤不进去（缓存被污染）。
+            // 故必须在**写入侧**就拒绝。
+            val persistable = tasks.filterNot { it.isSynthetic }
+            if (persistable.isEmpty()) {
+                // 无真实任务可落盘 —— 主动把缓存清空，
+                // 否则上一轮遗留的合成卡片会在下次启动时复活。
+                // 「一键清理全部」后必须真正归零，这是本修复的关键一半。
+                if (cacheFile.exists()) {
+                    cacheFile.writeText("[]")
+                    Log.d(TAG, "No real tasks; cleared recents cache (dropping synthetic entries)")
+                }
+                return
+            }
             val array = JSONArray()
-            for (task in tasks) {
+            for (task in persistable) {
                 val obj = JSONObject()
                 obj.put("taskId", task.taskId)
                 obj.put("packageName", task.packageName)
@@ -282,6 +331,19 @@ class RootTaskProvider(private val context: Context) {
                 val taskId = obj.optInt("taskId", -1)
                 val pkgName = obj.optString("packageName", "")
                 if (pkgName.isEmpty() || pkgName == context.packageName) continue
+
+                // 【v1.8.46 关键修复】读回时**主动丢弃**合成项。
+                //
+                // 历史上 saveToLocalCache 未做过滤，UsageStats 降级生成的
+                // taskId=20000+ 卡片已被写进用户设备上的缓存文件（真机实测）。
+                // 仅修写入侧无法自愈**存量**脏数据，故读取侧也必须按同一判据拦一道：
+                // 合成 ID 段（[SYNTHETIC_TASK_ID_BASE] 起）是 UsageStats 降级路径
+                // 独占的编号空间，真实系统任务的 taskId 绝不会落在这个区间。
+                // 这样升级后首次读取即自动清退，无需用户手动清数据。
+                if (taskId >= SYNTHETIC_TASK_ID_BASE) {
+                    Log.w(TAG, "Dropping synthetic cached entry taskId=$taskId pkg=$pkgName")
+                    continue
+                }
 
                 val label = try {
                     val appInfo = packageManager.getApplicationInfo(pkgName, 0)
@@ -355,59 +417,6 @@ class RootTaskProvider(private val context: Context) {
         } catch (e: Exception) {
             Log.w(TAG, "Failed to remove from local cache", e)
         }
-    }
-
-    private fun loadFromUsageStats(): List<RecentTask> {
-        val tasks = mutableListOf<RecentTask>()
-        try {
-            val usageStatsManager = context.getSystemService(Context.USAGE_STATS_SERVICE) as? UsageStatsManager
-                ?: return tasks
-            val endTime = System.currentTimeMillis()
-            val beginTime = endTime - 1000L * 60 * 60 * 24 * 7 // 最近7天
-            val stats = usageStatsManager.queryUsageStats(UsageStatsManager.INTERVAL_DAILY, beginTime, endTime)
-            if (!stats.isNullOrEmpty()) {
-                val ownPkg = context.packageName
-                val sorted = stats
-                    .filter {
-                        it.lastTimeUsed > 0 &&
-                                it.packageName != ownPkg &&
-                                it.packageName != "com.android.launcher3" &&
-                                it.packageName != "com.android.systemui" &&
-                                packageManager.getLaunchIntentForPackage(it.packageName) != null
-                    }
-                    .sortedByDescending { it.lastTimeUsed }
-                    .distinctBy { it.packageName }
-                    .take(20)
-
-                var syntheticId = 20000
-                for (stat in sorted) {
-                    val pkgName = stat.packageName
-                    val label = try {
-                        val appInfo = packageManager.getApplicationInfo(pkgName, 0)
-                        packageManager.getApplicationLabel(appInfo).toString()
-                    } catch (e: Exception) {
-                        pkgName
-                    }
-                    val icon = try {
-                        packageManager.getApplicationIcon(pkgName)
-                    } catch (e: Exception) {
-                        null
-                    }
-                    tasks.add(
-                        RecentTask(
-                            taskId = syntheticId++,
-                            packageName = pkgName,
-                            label = label,
-                            icon = icon,
-                            snapshot = null
-                        )
-                    )
-                }
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "UsageStats fallback error", e)
-        }
-        return tasks
     }
 
     suspend fun removeTask(taskId: Int, packageName: String): Boolean = withContext(Dispatchers.IO) {

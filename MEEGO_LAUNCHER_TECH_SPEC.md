@@ -234,7 +234,7 @@ App 被重装/清数据后 `/data/user/0/<pkg>/files` 会被删除，而旧脚�
 | **异步流驱动** | Kotlin Coroutines + StateFlow / Flow | 高性能响应式状态流，无缝驱动事件聚合与图标装载 |
 | **配置持久化** | Jetpack DataStore Preferences | 响应式持久化存储启动器配置（如网格 4/5 列模式、手势灵敏度） |
 | **依赖注入** | 手工轻量级 DI 或 Hilt | 保证启动速度极快，启动器（Launcher）对冷启动耗时有极致严苛要求（< 300ms） |
-| **系统交互能力** | `LauncherApps` + `NotificationListenerService` + `UsageStatsManager` | 遵循 Android 原生标准接口，兼顾安全与权限最小化 |
+| **系统交互能力** | `LauncherApps` + Root 特权守护链（`dumpsys activity recents` / TaskSnapshot） | 遵循 Android 原生标准接口，兼顾安全与权限最小化。**注意：`UsageStatsManager` 已于 v1.8.46 从任务源中删除**（它回答的是「最近用过」而非「在后台」，用作 recents 源会捏造卡片，见 §4.15） |
 | **后台实时快照与任务调度** | Root / `ActivityTaskManager` 特权调用 + `am task` 管道 | 突破 Android 原生沙盒隔离，1:1 还原 MeeGo 后台多任务真实卡片预览，支持低延迟切回与任务销毁 |
 | **全局边缘划回手势** | `AccessibilityService` / Root 特权 Overlay 悬浮手势条 | 跨任意第三方应用捕获屏幕上半区左右边缘划入，实现切出应用返回对应启动源 |
 
@@ -270,7 +270,7 @@ test-meego-launcher/
         ├── data/
         │   ├── AppRepository.kt        (140)    应用列表装载 + 20 个测试图标注入
         │   ├── LauncherPreferences.kt (70)     DataStore Preferences（meego_settings）
-        │   └── RootTaskProvider.kt    (565)    任务列表四级降级 + 单一快照来源 + 指令下发 + 任务增删切
+        │   └── RootTaskProvider.kt             任务列表**两级**来源（守护 JSON → 本地缓存）+ 单一快照来源 + 指令下发 + 任务增删切
         ├── service/
         │   └── EdgeSwipeGestureService.kt (1186) 无障碍边缘划回服务（全局最大文件）
         ├── receiver/BootReceiver.kt   (39)     开机/换包广播预热
@@ -338,6 +338,14 @@ $$\left|\frac{x}{a}\right|^n + \left|\frac{y}{b}\right|^n = 1 \quad (n = 2.732)$
   - 真正实现诺基亚 N9 标志性的“当前后台界面所见即所得”效果，动态捕捉浏览器网页、聊天消息、播放器卡片的实时状态。
   - 画面**唯一来源**为常驻特权服务产出的 `snapshots/<taskId>_sys.jpg`；完整原理、权限链与实测数据见 **§4.10**。
   - **降级策略**：常驻服务未运行时无新帧，卡片显示应用图标 + 深色底板（不再回退整屏截图 —— 整屏帧必然混入状态栏/导航栏，观感上「这不是这个应用的画面」）。**Root 是本项目的硬前提**（见 §4.10.2），不存在无 Root 可用形态。
+  - **任务列表来源（v1.8.46 修正，务必勿再引入 UsageStats）**：
+    真实任务来源**只有**两级 ——
+    ① 守护进程落盘的 `recent_tasks.json`（权威、来自 `dumpsys activity recents`）；
+    ② 本地持久化缓存 `recent_tasks_cache.json`（开机初期守护进程未就绪时的保底，**只存真实任务**）；
+    两级皆无则诚实显示空态「无正在运行的应用」。
+    **绝不可再把 `UsageStatsManager` 当降级源**（v1.8.1 引入、v1.8.46 删除）：
+    它回答的是「最近 7 天用过哪些应用」，与「此刻有没有后台任务」**毫无关系**，
+    把它当 recents 源等于**凭空捏造任务**，详见 §4.15。
 - **双指缩放无级切换与卡片上下堆叠展开动画（Continuous Pinch-to-Zoom & Stack-and-Expand Cascade Deck）**：
   - **交互手势与无级插值**：
     - 支持在多任务屏幕上使用双指张开（Spread）或捏合（Pinch）进行动态缩放。
@@ -1065,6 +1073,61 @@ Magisk 官方为「开机跑一个脚本」提供了现成钩子：
 
 - **`recents_columns` 有存储通路但未暴露 UI**：`LauncherPreferences` 中该 key 完整可用（双指缩放会经 `onColumnsChanged` 写入），但 `SettingsScreen` 未提供对应设置项。
 - **`ScreenCaptureHelper` 仍在使用**：它负责抓**桌面自身**（Grid / Recents 页）的快照，用于边缘划出时的底层揭示动画 —— 与「应用任务快照」是两条完全不同的链路，勿混淆。
+
+### 4.15 幽灵后台卡片修复：删除 UsageStats 伪任务源（v1.8.46）
+
+**缺陷现象**：启动器**首次打开**、或在多任务屏**「一键清理全部」之后**，系统侧真实后台任务为 0（或多任务屏已清空），
+但多任务屏仍显示**一整排图标样式的卡片（实测 20 张）**，看上去像「20 个应用都在后台」——而这些应用**实际并没有被打开**。
+
+**根因（真机取证，非推断）**：`RootTaskProvider.getRecentTasks()` 的任务源降级链中，
+第 3 级为 `loadFromUsageStats()` —— 用 `UsageStatsManager.queryUsageStats(INTERVAL_DAILY, 近 7 天)`
+取「最近用过的应用」，生成**合成卡片**（`taskId` 从 `20000` 起递增、`snapshot = null`、只能降级为图标）。
+
+它有两个致命问题：
+
+1. **语义完全错误**：UsageStats 回答的是「最近 7 天用过哪些应用」，
+   与「此刻有没有后台任务」**毫无关系**。把它当 recents 源，等于**凭空捏造任务**。
+   「图标样式 + 20 个 + 从没打开过」三个特征与用户观感精确对应。
+2. **污染持久化缓存**：`saveToLocalCache()` 未做过滤，把合成卡片也写进了
+   `files/recent_tasks_cache.json`。真机取证：
+   ```json
+   [{"taskId":20000,"packageName":"com.android.settings",...}, ..., {"taskId":20019,...}]
+   ```
+   而**同一时刻** `dumpsys activity recents` 只有 3 个真实任务、守护进程落盘的
+   `recent_tasks.json` 为 `[]`。于是**下一次启动**缓存命中，合成卡片被当作真实任务
+   **复活** —— 表现为「幽灵卡片永不消失」，且与真实后台状态完全脱钩。
+
+**修复（三处，缺一不可）**：
+
+| 位置 | 改动 | 作用 |
+|---|---|---|
+| `getRecentTasks()` | **整体删除** UsageStats 降级级 | 断掉捏造源头 |
+| `saveToLocalCache()` | 过滤 `isSynthetic`，无真实任务时写入 `[]` | 阻止污染缓存，并让「清理全部」真正归零 |
+| `loadFromLocalCache()` | 丢弃 `taskId >= SYNTHETIC_TASK_ID_BASE(20000)` 的条目 | **自愈存量脏数据**，用户无需手动清数据 |
+
+`RecentTask` 新增 `isSynthetic` 字段（默认 `false`）承载该语义；
+`SYNTHETIC_TASK_ID_BASE` 常量成为「合成项」与缓存层之间的显式契约。
+
+**为何不保留它作「开机初期兜底」**：开机初期守护进程确实可能尚未写出 JSON，
+但那时**正确显示就是空的**。用「最近用过」冒充「正在后台」属误导用户的行为 ——
+宁可少显示，不可显示假的。开机可用性由第 2 级持久化缓存（只存真实任务）
+与守护进程开机自启（§4.11）共同保障，两者都不产生幻觉。
+
+**真机验证（Redmi K40 / LineageOS 23.2 / Android 16，全部通过）**：
+
+| 场景 | 结果 |
+|---|---|
+| 首次打开（无缓存、无任务） | 显示空态「无正在运行的应用」，**零卡片**；日志 `UsageStats` 出现次数 = **0** |
+| 「一键清理全部」后 | 空态，缓存写为 `[]` |
+| 清理后冷启动 | 空态，缓存仍 `[]`（幽灵卡片未复活） |
+| 打开 2 个真实应用 | 恰好 2 张卡片（设置 / 通讯录），**渲染真实应用界面快照**，与 `dumpsys activity recents` 一致 |
+| 存量脏缓存（20000+） | 升级后首次读取即自动丢弃并清空，**无需手动清数据** |
+| crash buffer | **零记录** |
+
+**留档教训**：一个「降级兜底」如果**换错了语义**（把「用过」当「在后台」），
+它就不再是兜底，而是**主动制造错误数据**；再叠加「把兜底结果写进持久化缓存」，
+错误便会被固化并跨重启放大。教训：**兜底源必须与真实源回答同一个问题**，
+且**兜底产物不得污染为真实数据准备的持久层**。
 
 ## 5. DSH 全程自主开发实施路线图
 

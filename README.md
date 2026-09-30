@@ -314,7 +314,7 @@ bash scripts/check_device.sh
 
 ---
 
-## 🧭 当前实现状态（v1.8.45 实测，2026-09-28）
+## 🧭 当前实现状态（v1.8.46 实测，2026-09-30）
 
 > 本节由**逐行通读全部 20 个 Kotlin 源文件**核对得出。README 与技术规格文档中若出现与本节冲突的表述，**以本节与代码为准**。
 
@@ -325,7 +325,7 @@ bash scripts/check_device.sh
 | 三屏无限循环穿梭 | `HomeScreen.kt` | 30000 页 Pager、起点 15001、`floorMod(page,3)`；边缘 36.dp 起手，跨屏判定「距离 12% **或** 速度 400f」 |
 | 应用网格 4/5 列动态切换 | `AppGridScreen.kt` + DataStore | 图标 `62.dp`(4列) / `52.dp`(5列) |
 | MeeGo 设置中心 | `SettingsScreen.kt` | `grid_columns` / `edge_swipe` / `immersive_ui` 三项（`recents_columns` 有存储通路但未暴露 UI） |
-| 多任务真实快照卡片 | `RootTaskProvider.kt` + `EdgeSwipeGestureService.kt` | 四级任务源降级 + **单一快照来源 `_sys.jpg`** |
+| 多任务真实快照卡片 | `RootTaskProvider.kt` + `EdgeSwipeGestureService.kt` | **仅真实任务**（守护 JSON → 本地缓存两级）+ **单一快照来源 `_sys.jpg`**；无任务时显示空态，**不再用 UsageStats 捏造卡片**（v1.8.46） |
 | Task Snapshot 常驻取帧 | `scripts/TaskSnapService.java` | 对齐 Quickstep：`TaskSnapshotManager.takeTaskSnapshot` / `getTaskSnapshot`；**只含该任务窗口**，无状态栏/导航栏/挖孔留白；单帧 **11~42ms**（旧一次性桥 ~1.35s） |
 | 双指无级缩放 2×2 ⇄ 3×3 | `MultitaskingScreen.kt` | 阈值 `0.5f`、弹簧 `spring(0.96f, 450f)`、捏合灵敏度 `680f` |
 | 长按编辑 + 删除角标 + 一键清空 | `MultitaskingScreen.kt` | 消失 150ms → 补位 `spring(0.95f, 300f)` |
